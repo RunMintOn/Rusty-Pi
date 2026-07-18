@@ -211,7 +211,13 @@ impl Agent {
                 }).collect();
 
             let has_tool_calls = !tool_calls.is_empty();
-            let stop_reason = if has_tool_calls { StopReason::ToolUse } else { response.stop_reason };
+            let stop_reason = if has_tool_calls && response.stop_reason == StopReason::Stop {
+                // Only override Stop → ToolUse. Length/Error/Aborted responses should not execute tools
+                // even when they contain tool call blocks.
+                StopReason::ToolUse
+            } else {
+                response.stop_reason
+            };
 
             let response = crate::ai::types::AssistantMessage {
                 stop_reason,
@@ -233,12 +239,19 @@ impl Agent {
                         );
                     }
 
+                    let mut any_terminate = false;
                     for call in &tool_calls {
-                        let tool_result = self
+                        let (tool_result, terminate) = self
                             .execute_tool(&call.id, &call.name, call.arguments.clone())
                             .await
                             .with_context(|| format!("Tool '{}' execution failed", call.name))?;
                         self.session.add_message(tool_result);
+                        if terminate {
+                            any_terminate = true;
+                        }
+                    }
+                    if any_terminate {
+                        return Ok(());
                     }
                 }
             }
@@ -247,12 +260,13 @@ impl Agent {
         anyhow::bail!("Agent loop exited without producing a final response")
     }
 
+    /// Execute a tool and return (AgentMessage, terminate_flag).
     async fn execute_tool(
         &self,
         tool_call_id: &str,
         tool_name: &str,
         args: serde_json::Value,
-    ) -> Result<AgentMessage> {
+    ) -> Result<(AgentMessage, bool)> {
         let tool = self
             .tools
             .iter()
@@ -278,14 +292,14 @@ impl Agent {
             })
             .collect();
 
-        Ok(AgentMessage::ToolResult(ToolResultMessage {
+        Ok((AgentMessage::ToolResult(ToolResultMessage {
             tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
             content,
             details: Some(serde_json::json!({})),
             is_error: false,
             timestamp: now,
-        }))
+        }), result.terminate))
     }
 }
 
@@ -350,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn agent_handles_tool_call_and_result() {
         let mock = MockProvider::new(vec![
-            MockStep::ToolCall { id: "tc_1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "hello"}) },
+            MockStep::ToolCall { id: "tc_1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "hello"}), stop_reason: None },
             MockStep::Text("Done!".into()),
         ]);
         let mut agent = Agent::new(Box::new(mock), make_model());
@@ -387,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn agent_with_bash_tool() {
         let mock = MockProvider::new(vec![
-            MockStep::ToolCall { id: "tc_bash".into(), name: "bash".into(), arguments: serde_json::json!({"command": "echo bash-works"}) },
+            MockStep::ToolCall { id: "tc_bash".into(), name: "bash".into(), arguments: serde_json::json!({"command": "echo bash-works"}), stop_reason: None },
             MockStep::Text("Done".into()),
         ]);
         let mut agent = Agent::new(Box::new(mock), make_model());
@@ -410,8 +424,8 @@ mod tests {
     #[tokio::test]
     async fn agent_multiple_rounds() {
         let mock = MockProvider::new(vec![
-            MockStep::ToolCall { id: "tc_1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "first"}) },
-            MockStep::ToolCall { id: "tc_2".into(), name: "echo".into(), arguments: serde_json::json!({"text": "second"}) },
+            MockStep::ToolCall { id: "tc_1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "first"}), stop_reason: None },
+            MockStep::ToolCall { id: "tc_2".into(), name: "echo".into(), arguments: serde_json::json!({"text": "second"}), stop_reason: None },
             MockStep::Text("All done".into()),
         ]);
         let mut agent = Agent::new(Box::new(mock), make_model());
@@ -435,5 +449,78 @@ mod tests {
         agent.run("Hi").await.unwrap();
         let val = received.lock().unwrap().clone();
         assert!(val.contains("hello"), "Expected 'hello' in stream: {}", val);
+    }
+
+    #[tokio::test]
+    async fn agent_does_not_execute_tool_calls_from_length_truncated_response() {
+        // When the provider returns tool calls with StopReason::Length,
+        // the agent should NOT execute those tool calls.
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "should-not-run"}),
+                stop_reason: Some(StopReason::Length),
+            },
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(EchoTool));
+        agent.run("Run echo").await.unwrap();
+        let msgs = agent.messages();
+        // Only 2 messages: user + assistant (no tool result)
+        assert_eq!(msgs.len(), 2, "Expected no tool result for length-truncated response");
+        match msgs.last().unwrap() {
+            AgentMessage::Assistant(a) => {
+                assert_eq!(a.stop_reason, StopReason::Length);
+            }
+            _ => panic!("Expected assistant message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_terminate_flag_stops_loop() {
+        // A tool that signals termination should stop the agent loop after its round.
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_1".into(),
+                name: "terminator".into(),
+                arguments: serde_json::json!({}),
+                stop_reason: None,
+            },
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(TerminatorTool));
+        agent.run("Terminate").await.unwrap();
+        let msgs = agent.messages();
+        // user + assistant + tool_result = 3 messages (no second round)
+        assert_eq!(msgs.len(), 3, "Should stop after terminated tool");
+    }
+
+    struct TerminatorTool;
+
+    impl Tool for TerminatorTool {
+        fn name(&self) -> &str { "terminator" }
+        fn description(&self) -> &str { "Terminates the loop" }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+    }
+
+    #[async_trait]
+    impl AgentTool for TerminatorTool {
+        fn label(&self) -> &str { "terminator" }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+        ) -> anyhow::Result<AgentToolResult> {
+            Ok(AgentToolResult {
+                content: vec![Content::Text { text: "done".into() }],
+                terminate: true,
+                ..Default::default()
+            })
+        }
     }
 }

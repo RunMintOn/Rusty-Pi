@@ -20,7 +20,7 @@
 
 use crate::ai::providers::{Model, ProviderApi, StreamReceiver};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
-use crate::ai::types::{AgentMessage, StopReason, Tool};
+use crate::ai::types::{AgentMessage, AssistantMessage, StopReason, Tool};
 use async_trait::async_trait;
 use std::sync::Mutex;
 
@@ -30,7 +30,14 @@ pub enum MockStep {
     /// Emit the given text as word-by-word deltas, then signal `Done`.
     Text(String),
     /// Emit a single tool call, then signal `Done`.
-    ToolCall { id: String, name: String, arguments: serde_json::Value },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+        /// Custom stop reason for the Done event (default: Stop).
+        /// Use `Some(StopReason::Length)` to simulate length-truncated responses.
+        stop_reason: Option<StopReason>,
+    },
     /// Signal an error immediately.
     Error(String),
 }
@@ -84,9 +91,27 @@ impl ProviderApi for MockProvider {
                     let msg = acc.build();
                     let _ = tx.send(StreamEvent::Done { message: msg }).await;
                 }
-                MockStep::ToolCall { id, name, arguments } => {
+                MockStep::ToolCall { id, name, arguments, stop_reason } => {
                     let _ = tx.send(StreamEvent::ToolCall { id, name: name.clone(), arguments: arguments.clone() }).await;
-                    let acc = MessageAccumulator::new("mock", "mock", "mock");
+                    let mut acc = MessageAccumulator::new("mock", "mock", "mock");
+                    if let Some(reason) = stop_reason {
+                        use crate::ai::stream::StreamEvent;
+                        acc.push(StreamEvent::Done {
+                            message: AssistantMessage {
+                                content: vec![],
+                                api: "mock".into(),
+                                provider: "mock".into(),
+                                model: "mock".into(),
+                                usage: None,
+                                stop_reason: reason,
+                                error_message: None,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as i64,
+                            },
+                        });
+                    }
                     let msg = acc.build();
                     let _ = tx.send(StreamEvent::Done { message: msg }).await;
                 }

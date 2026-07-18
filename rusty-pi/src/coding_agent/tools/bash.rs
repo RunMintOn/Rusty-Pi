@@ -484,4 +484,19 @@ mod tests {
         // First line "short" is part of the last lines kept, so it should be there or truncated
     }
 
+    #[tokio::test]
+    async fn bash_cwd_not_found() {
+        let tool = BashTool::new("/nonexistent/path/that/does/not/exist".into());
+        let result = tool
+            .execute("c9", serde_json::json!({"command": "echo hi"}), None)
+            .await;
+        assert!(result.is_err(), "Should error when cwd does not exist");
+        let err = result.unwrap_err().to_string();
+        // The error should mention the directory or no such file
+        assert!(
+            err.contains("No such file") || err.contains("nicht gefunden") || err.contains("nonexistent") || err.contains("path"),
+            "Expected error mentioning directory issue, got: {}",
+            err
+        );
+    }
 }
