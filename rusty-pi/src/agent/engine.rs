@@ -3,12 +3,14 @@
 use crate::agent::session::Session;
 use crate::agent::types::AgentTool;
 use crate::ai::providers::{Model, ProviderApi};
-use crate::ai::stream::StreamEvent;
+use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{
-    AgentMessage, AssistantContent, Content, MessageContent, StopReason, TextOrImageContent, Tool,
-    ToolResultMessage, UserMessage,
+    AgentMessage, AgentToolCall, AssistantContent, Content, MessageContent, StopReason,
+    TextOrImageContent, Tool, ToolResultMessage, UserMessage,
 };
 use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Configuration for the agent.
@@ -30,6 +32,9 @@ impl Default for AgentConfig {
 /// Callback for streaming text deltas.
 pub type TextCallback = Box<dyn FnMut(&str) + Send>;
 
+/// Shared abort flag for signalling Ctrl+C / cancellation.
+pub type AbortFlag = Arc<AtomicBool>;
+
 /// The agent that orchestrates the LLM → tool → LLM loop.
 pub struct Agent {
     session: Session,
@@ -39,6 +44,8 @@ pub struct Agent {
     config: AgentConfig,
     /// Optional callback for streaming text deltas.
     on_text: Option<TextCallback>,
+    /// Shared flag: when true, the agent should abort the current round.
+    abort: AbortFlag,
 }
 
 impl Agent {
@@ -53,6 +60,7 @@ impl Agent {
             model,
             config: AgentConfig::default(),
             on_text: None,
+            abort: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -62,11 +70,28 @@ impl Agent {
     }
 
     /// Register a callback for streaming text deltas.
+    /// Register a callback for streaming text deltas.
     pub fn on_text<F>(&mut self, callback: F)
     where
         F: FnMut(&str) + Send + 'static,
     {
         self.on_text = Some(Box::new(callback));
+    }
+
+    /// Signal the agent to abort the current round.
+    /// The next tick of the stream loop will notice and return `StopReason::Aborted`.
+    pub fn abort(&self) {
+        self.abort.store(true, Ordering::SeqCst);
+    }
+
+    /// Replace the abort flag (used to share a flag between REPL and agent).
+    pub fn set_abort_flag(&mut self, flag: AbortFlag) {
+        self.abort = flag;
+    }
+
+    /// Get a reference to the abort flag (for sharing with the REPL).
+    pub fn abort_flag(&self) -> AbortFlag {
+        self.abort.clone()
     }
 
     pub fn add_tool(&mut self, tool: Box<dyn AgentTool>) {
@@ -120,62 +145,72 @@ impl Agent {
                 .await
                 .with_context(|| format!("LLM call failed at round {}", round))?;
 
-            // Collect stream events into an AssistantMessage
-            let mut content_buf: Vec<(String, String, serde_json::Value)> = Vec::new();
-            let mut text_buf = String::new();
-            let mut stop_reason = StopReason::Stop;
-            let mut error_msg = None;
+            // Accumulate stream events into an AssistantMessage
+            let mut acc = MessageAccumulator::new(
+                self.model.api,
+                self.model.id,
+                self.model.id,
+            );
+
+            // Check for abort BEFORE starting the stream loop
+            if self.abort.load(Ordering::SeqCst) {
+                let msg = crate::ai::types::AssistantMessage {
+                    content: vec![],
+                    api: self.model.api.to_string(),
+                    provider: self.model.id.to_string(),
+                    model: self.model.id.to_string(),
+                    usage: None,
+                    stop_reason: StopReason::Aborted,
+                    error_message: Some("Aborted by user".into()),
+                    timestamp: Self::now_ms(),
+                };
+                self.session.add_message(AgentMessage::Assistant(msg));
+                return Ok(());
+            }
 
             while let Some(event) = rx.recv().await {
-                match event {
-                    StreamEvent::TextDelta { delta } => {
-                        text_buf.push_str(&delta);
-                        if let Some(ref mut cb) = self.on_text {
-                            cb(&delta);
-                        }
-                    }
-                    StreamEvent::ToolCall { id, name, arguments } => {
-                        content_buf.push((id, name, arguments));
-                    }
-                    StreamEvent::Done { message } => {
-                        stop_reason = message.stop_reason;
-                        error_msg = message.error_message;
-                        break;
-                    }
-                    StreamEvent::Error { reason, message } => {
-                        stop_reason = reason;
-                        error_msg = Some(message);
-                        break;
-                    }
+                // Fire streaming callback for text deltas
+                if let StreamEvent::TextDelta { ref delta } = event
+                    && let Some(ref mut cb) = self.on_text {
+                        cb(delta);
+                }
+
+                let is_terminal = matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                acc.push(event);
+                if is_terminal {
+                    break;
                 }
             }
 
-            // Build assistant content
-            let mut content: Vec<AssistantContent> = Vec::new();
-            if !text_buf.is_empty() {
-                content.push(AssistantContent::Text { text: text_buf });
-            }
-            for (id, name, arguments) in &content_buf {
-                content.push(AssistantContent::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                });
+            // Check for abort AFTER the stream loop (user hit Ctrl+C during streaming)
+            if self.abort.load(Ordering::SeqCst) {
+                // Override response with aborted status
+                let msg = crate::ai::types::AssistantMessage {
+                    content: vec![],
+                    api: self.model.api.to_string(),
+                    provider: self.model.id.to_string(),
+                    model: self.model.id.to_string(),
+                    usage: None,
+                    stop_reason: StopReason::Aborted,
+                    error_message: Some("Aborted by user".into()),
+                    timestamp: Self::now_ms(),
+                };
+                self.session.add_message(AgentMessage::Assistant(msg));
+                return Ok(());
             }
 
-            let response = crate::ai::types::AssistantMessage {
-                content,
-                api: self.model.api.to_string(),
-                provider: self.model.id.to_string(),
-                model: self.model.id.to_string(),
-                usage: None,
-                stop_reason,
-                error_message: error_msg,
-                timestamp: Self::now_ms(),
-            };
+            let response = acc.build();
 
-            // Determine if we need to execute tools
-            let has_tool_calls = !content_buf.is_empty();
+            // Extract tool calls as AgentToolCall structs
+            let tool_calls: Vec<AgentToolCall> = response.content.iter()
+                .filter_map(|c| match c {
+                    AssistantContent::ToolCall { id, name, arguments } => {
+                        Some(AgentToolCall { id: id.clone(), name: name.clone(), arguments: arguments.clone() })
+                    }
+                    _ => None,
+                }).collect();
+
+            let has_tool_calls = !tool_calls.is_empty();
             let stop_reason = if has_tool_calls { StopReason::ToolUse } else { response.stop_reason };
 
             let response = crate::ai::types::AssistantMessage {
@@ -198,11 +233,11 @@ impl Agent {
                         );
                     }
 
-                    for (tool_call_id, tool_name, args) in &content_buf {
+                    for call in &tool_calls {
                         let tool_result = self
-                            .execute_tool(tool_call_id, tool_name, args.clone())
+                            .execute_tool(&call.id, &call.name, call.arguments.clone())
                             .await
-                            .with_context(|| format!("Tool '{}' execution failed", tool_name))?;
+                            .with_context(|| format!("Tool '{}' execution failed", call.name))?;
                         self.session.add_message(tool_result);
                     }
                 }

@@ -93,7 +93,12 @@ async fn main() -> anyhow::Result<()> {
 
     let (provider, model) = build_provider(&cli.provider, cli.model.as_deref())?;
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-    let bash_tool = BashTool::new(cwd.clone());
+    let mut bash_tool = BashTool::new(cwd.clone());
+    bash_tool.on_output(|chunk| {
+        use std::io::Write;
+        let _ = write!(std::io::stdout(), "{}", chunk);
+        let _ = std::io::stdout().flush();
+    });
     let read_tool = ReadTool::new(cwd.clone());
     let write_tool = WriteTool::new(cwd.clone());
     let edit_tool = EditTool::new(cwd);

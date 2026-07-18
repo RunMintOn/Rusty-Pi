@@ -8,19 +8,26 @@ pub mod openai_codex;
 use crate::ai::stream::StreamEvent;
 use crate::ai::types::Tool;
 
-/// A registered LLM provider.
+/// A registered LLM provider with its metadata and available models.
 #[derive(Debug, Clone)]
 pub struct Provider {
+    /// Unique provider identifier (e.g. `"deepseek"`, `"openai-codex"`).
     pub id: &'static str,
+    /// Human-readable display name.
     pub name: &'static str,
+    /// Base URL for the provider's API.
     pub base_url: &'static str,
+    /// List of models this provider offers.
     pub models: Vec<Model>,
 }
 
 /// A model exposed by a provider.
 #[derive(Debug, Clone)]
 pub struct Model {
+    /// Model identifier, used in API requests (e.g. `"deepseek-v4-pro"`).
     pub id: &'static str,
+    /// API family this model uses (e.g. `"openai-completions"`,
+    /// `"openai-codex-responses"`).
     pub api: &'static str,
 }
 

@@ -51,6 +51,16 @@ Default labels configured (not actively used — solo project). See `docs/agents
 
 Single-context repo. See `docs/agents/domain.md`.
 
+## Multi-Agent Collaboration
+
+本仓库可能同时有多个 agent 在工作。你可能会遇到：
+
+- **文件在你两次工作之间被修改** — 别的 agent 正在处理相邻的 ticket。重新读取文件，理解当前状态，然后决定你的改动如何适应。
+- **你依赖的代码发生了变化** — 如果别的 agent 重构了你准备改的模块，先读新代码，调整你的方案，而不是回退别人的改动。
+- **测试覆盖率在变化** — 每次跑 `cargo test` 时应看到最全的通过状态。如果别的 agent 引入了测试失败，不要不管——停下来看看是不是你的改动暴露了它的问题。
+
+基本原则：**把其他 agent 视为协作完成任务的人类同事**。它们做的改动和你的一样有效。遇到变化，先读、再适应、不抱怨、不重写。
+
 ## Commit
 
 - 不要提交除非用户要求。

@@ -1,5 +1,27 @@
 //! DeepSeek LLM provider — OpenAI-compatible completions API.
 
+//!
+//! # Authentication
+//!
+//! The provider reads the API key from the `DEEPSEEK_API_KEY` environment variable.
+//!
+//! # Usage
+//!
+//! ```rust,no_run
+//! use rusty_pi::ai::providers::deepseek::DeepSeekProvider;
+//! use rusty_pi::ai::providers::ProviderApi;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let provider = DeepSeekProvider::from_env().expect("DEEPSEEK_API_KEY not set");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Streaming
+//!
+//! Uses OpenAI-compatible SSE streaming (`data:` lines) to emit tokens as they arrive.
+//! Tool calls are parsed from the `tool_calls` delta field in each SSE chunk.
+
 use crate::ai::providers::{Model, ProviderApi, StreamReceiver};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{AgentMessage, AssistantContent, AssistantMessage, StopReason, Tool};
@@ -10,22 +32,33 @@ use reqwest::Client;
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
+/// Models supported by the DeepSeek provider.
 pub const DEEPSEEK_MODELS: &[Model] = &[
     Model { id: "deepseek-v4-flash", api: "openai-completions" },
     Model { id: "deepseek-v4-pro", api: "openai-completions" },
 ];
 
+/// Provider for the DeepSeek API (OpenAI-compatible chat completions endpoint).
+///
+/// Reads the API key from `DEEPSEEK_API_KEY` at construction time.
+/// Supports streaming SSE responses and tool calls via the standard
+/// OpenAI chat completions wire format.
 pub struct DeepSeekProvider {
     api_key: String,
     base_url: String,
 }
 
 impl DeepSeekProvider {
+    /// Create a provider from the `DEEPSEEK_API_KEY` environment variable.
+    /// Returns `None` if the variable is not set.
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var(DEEPSEEK_API_KEY_ENV).ok()?;
         Some(Self::new(api_key))
     }
 
+    /// Create a new DeepSeek provider with the given API key.
+    ///
+    /// Uses the default base URL (`https://api.deepseek.com`).
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
@@ -33,11 +66,17 @@ impl DeepSeekProvider {
         }
     }
 
+    /// Override the base URL (for proxies or self-hosted endpoints).
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
         self
     }
 
+    /// Convert agent messages to the OpenAI chat completions wire format.
+    ///
+    /// Handles `role: "user"`, `role: "assistant"` (with optional `tool_calls`),
+    /// and `role: "tool"` messages. Assistant messages without text content are
+    /// skipped as no-ops.
     fn build_messages(messages: &[AgentMessage]) -> Vec<serde_json::Value> {
         messages.iter().filter_map(|msg| match msg {
             AgentMessage::User(u) => {

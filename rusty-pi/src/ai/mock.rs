@@ -1,4 +1,22 @@
 //! Mock provider for testing.
+//!
+//! Provides a `MockProvider` that returns preset responses instead of calling
+//! a real LLM. Used to test the agent loop and tool execution without network
+//! access.
+//!
+//! # Behaviour contract
+//!
+//! * Each call to [`ProviderApi::stream`] consumes one step from the sequence
+//!   (first in, first out). When the sequence is exhausted, the last step is
+//!   repeated.
+//! * `Text` steps emit the text as word-by-word [`StreamEvent::TextDelta`]
+//!   events and finish with `Done`.
+//! * `ToolCall` steps emit a single [`StreamEvent::ToolCall`] event and finish
+//!   with `Done` with `StopReason::Stop` (the agent engine overrides this to
+//!   `ToolUse` when tool calls are present).
+//! * `Error` steps emit [`StreamEvent::Error`] and terminate.
+//! * All fields (`api`, `provider`, `model`) in the emitted `Done` message
+//!   are set to `"mock"`.
 
 use crate::ai::providers::{Model, ProviderApi, StreamReceiver};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
@@ -6,22 +24,34 @@ use crate::ai::types::{AgentMessage, StopReason, Tool};
 use async_trait::async_trait;
 use std::sync::Mutex;
 
+/// A single step in a mock provider response sequence.
 #[derive(Debug, Clone)]
 pub enum MockStep {
+    /// Emit the given text as word-by-word deltas, then signal `Done`.
     Text(String),
+    /// Emit a single tool call, then signal `Done`.
     ToolCall { id: String, name: String, arguments: serde_json::Value },
+    /// Signal an error immediately.
     Error(String),
 }
 
+/// Mock LLM provider that returns preset response sequences.
+///
+/// Each call to [`ProviderApi::stream`] consumes one step from the sequence.
+/// Thread-safe via internal mutability (`Mutex`).
 pub struct MockProvider {
     steps: Mutex<Vec<MockStep>>,
 }
 
 impl MockProvider {
+    /// Create a provider that returns the given sequence of steps.
     pub fn new(steps: Vec<MockStep>) -> Self {
         Self { steps: Mutex::new(steps) }
     }
 
+    /// Create a provider that returns a single text response.
+    ///
+    /// Shorthand for `MockProvider::new(vec![MockStep::Text(text.to_string())])`.
     pub fn text(text: &str) -> Self {
         Self::new(vec![MockStep::Text(text.to_string())])
     }

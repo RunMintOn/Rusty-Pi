@@ -9,8 +9,13 @@ use crate::coding_agent::tools::truncate::{truncate_tail, DEFAULT_MAX_BYTES, DEF
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::time::Duration;
+
+/// Callback for streaming bash output chunks as they arrive.
+type OutputCallback = Box<dyn FnMut(&str) + Send>;
 
 /// Parameters for the bash tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -50,12 +55,23 @@ fn kill_process(pid: Option<u32>) {
 pub struct BashTool {
     /// Working directory for command execution.
     cwd: String,
+    /// Optional callback for streaming output as it arrives.
+    output_cb: Mutex<Option<OutputCallback>>,
 }
 
 impl BashTool {
     /// Create a new bash tool that executes commands in `cwd`.
     pub fn new(cwd: String) -> Self {
-        Self { cwd }
+        Self { cwd, output_cb: Mutex::new(None) }
+    }
+
+    /// Register a callback invoked for each chunk of stdout/stderr as it arrives.
+    /// The callback receives the raw text (may include partial lines).
+    pub fn on_output<F>(&mut self, callback: F)
+    where
+        F: FnMut(&str) + Send + 'static,
+    {
+        self.output_cb.lock().unwrap().replace(Box::new(callback));
     }
 }
 
@@ -144,81 +160,113 @@ impl AgentTool for BashTool {
                 });
             }
 
-        // Build a future for waiting on the abort signal
-        let abort_future = async move {
-            if let Some(mut rx) = signal {
-                let _ = rx.changed().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
+        // Take stdout/stderr pipes for streaming reads
+        let stdout = child.stdout.take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
-        // Wait with timeout and abort support
+        let mut stdout_reader = tokio::io::BufReader::new(stdout);
+        let mut stderr_reader = tokio::io::BufReader::new(stderr);
+        let mut full_output = String::new();
+
+        // Read lines from both pipes concurrently, streaming via callback
+        let mut stdout_line = String::new();
+        let mut stderr_line = String::new();
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut timed_out = false;
+
         let timeout_dur = bash_params
             .timeout
             .filter(|&t| t > 0)
             .map(Duration::from_secs);
 
-        let output = if let Some(dur) = timeout_dur {
-            // With timeout
-            tokio::select! {
-                result = child.wait_with_output() => {
-                    match result {
-                        Ok(out) => out,
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                _ = abort_future => {
+        while !stdout_done || !stderr_done {
+            // Check abort signal
+            if let Some(ref rx) = signal
+                && *rx.borrow() {
                     kill_process(pid);
+                    let _ = child.wait().await;
                     return Ok(AgentToolResult {
                         content: vec![Content::Text { text: "Command aborted".into() }],
                         details: serde_json::json!({"aborted": true}),
                         ..Default::default()
                     });
                 }
-                _ = tokio::time::sleep(dur) => {
-                    kill_process(pid);
-                    return Ok(AgentToolResult {
-                        content: vec![Content::Text {
-                            text: format!("Command timed out after {} seconds", bash_params.timeout.unwrap()),
-                        }],
-                        details: serde_json::json!({"timed_out": true, "timeout": bash_params.timeout}),
-                        ..Default::default()
-                    });
-                }
-            }
-        } else {
-            // Without timeout
+
             tokio::select! {
-                result = child.wait_with_output() => {
-                    match result {
-                        Ok(out) => out,
-                        Err(e) => return Err(e.into()),
+                result = async {
+                    if stdout_done { return Ok(0usize); }
+                    stdout_reader.read_line(&mut stdout_line).await
+                } => {
+                    let n = result?;
+                    if n == 0 {
+                        stdout_done = true;
+                    } else {
+                        if let Some(ref mut cb) = *self.output_cb.lock().unwrap() {
+                            cb(&stdout_line);
+                        }
+                        full_output.push_str(&stdout_line);
+                        stdout_line.clear();
                     }
                 }
-                _ = abort_future => {
+                result = async {
+                    if stderr_done { return Ok(0usize); }
+                    stderr_reader.read_line(&mut stderr_line).await
+                } => {
+                    let n = result?;
+                    if n == 0 {
+                        stderr_done = true;
+                    } else {
+                        if let Some(ref mut cb) = *self.output_cb.lock().unwrap() {
+                            cb(&stderr_line);
+                        }
+                        full_output.push_str(&stderr_line);
+                        stderr_line.clear();
+                    }
+                }
+                _ = async {
+                    if let Some(mut rx) = signal.clone() {
+                        let _ = rx.changed().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
                     kill_process(pid);
+                    let _ = child.wait().await;
                     return Ok(AgentToolResult {
                         content: vec![Content::Text { text: "Command aborted".into() }],
                         details: serde_json::json!({"aborted": true}),
                         ..Default::default()
                     });
                 }
+                _ = async {
+                    if let Some(dur) = timeout_dur {
+                        tokio::time::sleep(dur).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    timed_out = true;
+                    kill_process(pid);
+                    let _ = child.wait().await;
+                }
             }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        let mut full_output = String::new();
-        if !stdout.is_empty() {
-            full_output.push_str(&stdout);
         }
-        if !stderr.is_empty() {
-            if !full_output.is_empty() {
-                full_output.push('\n');
-            }
-            full_output.push_str(&stderr);
+
+        // Wait for process to fully exit
+        let exit_status = child.wait().await?;
+        let exit_code = exit_status.code();
+
+        if timed_out {
+            return Ok(AgentToolResult {
+                content: vec![Content::Text {
+                    text: format!("Command timed out after {} seconds", bash_params.timeout.unwrap_or(0)),
+                }],
+                details: serde_json::json!({"timed_out": true, "timeout": bash_params.timeout}),
+                ..Default::default()
+            });
         }
 
         // Apply truncation
@@ -245,8 +293,6 @@ impl AgentTool for BashTool {
                 ));
             }
         }
-
-        let exit_code = output.status.code();
 
         if let Some(code) = exit_code
             && code != 0 {
