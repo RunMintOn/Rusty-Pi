@@ -5,6 +5,7 @@
 
 pub mod bash;
 pub mod edit;
+pub mod mime;
 pub mod read;
 pub mod truncate;
 pub mod write;

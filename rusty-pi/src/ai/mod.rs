@@ -2,6 +2,7 @@
 //!
 //! Mirrors the structure of `@earendil-works/pi-ai`.
 
+pub mod auth;
 pub mod types;
 pub mod providers;
 pub mod mock;
