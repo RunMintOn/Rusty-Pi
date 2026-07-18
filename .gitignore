@@ -4,3 +4,4 @@ reference/earendil-works-pi/node_modules/
 *.swp
 *.swo
 .DS_Store
+reference/

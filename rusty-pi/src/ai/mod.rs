@@ -5,6 +5,7 @@
 pub mod types;
 pub mod providers;
 pub mod mock;
+pub mod stream;
 
 // Re-exports for convenience.
 pub use types::*;

@@ -1,26 +1,19 @@
 //! REPL — Read-Eval-Print Loop for interactive chat.
-//!
-//! Mirrors a minimal subset of the original `@earendil-works/pi-coding-agent`
-//! CLI interface. Supports interactive REPL mode and single-shot prompt mode.
 
 use crate::agent::engine::Agent;
 use crate::agent::types::AgentTool;
 use crate::ai::providers::{Model, ProviderApi};
-use crate::ai::types::{AgentMessage, AssistantContent, StopReason};
+use crate::ai::types::{AgentMessage, StopReason};
 use anyhow::Result;
 use std::io::{self, BufRead, Write};
+use std::sync::{Arc, Mutex};
 
 /// Run configuration for the CLI.
 pub struct RunConfig {
-    /// Prompt for single-shot mode. If None, enters REPL.
     pub prompt: Option<String>,
-    /// System prompt.
     pub system_prompt: String,
-    /// Provider instance.
     pub provider: Box<dyn ProviderApi>,
-    /// Model to use.
     pub model: Model,
-    /// Tools to register.
     pub tools: Vec<Box<dyn AgentTool>>,
 }
 
@@ -39,17 +32,27 @@ pub async fn run(config: RunConfig) -> Result<()> {
     }
 }
 
-/// Single-shot mode: run one prompt and exit.
 async fn run_single_shot(agent: &mut Agent, prompt: &str) -> Result<()> {
+    let buf = Arc::new(Mutex::new(String::new()));
+    let buf_cb = buf.clone();
+    agent.on_text(move |delta| {
+        print!("{}", delta);
+        let _ = io::stdout().flush();
+        buf_cb.lock().unwrap().push_str(delta);
+    });
+
     agent.run(prompt).await?;
-    let msgs = agent.messages();
-    print_messages(&msgs.into_iter().cloned().collect::<Vec<_>>());
+
+    let output = buf.lock().unwrap().clone();
+    if !output.ends_with('\n') && !output.is_empty() {
+        println!();
+    }
+
     Ok(())
 }
 
-/// REPL mode: interactive chat loop.
 async fn run_repl(agent: &mut Agent) -> Result<()> {
-    println!("rusty-pi REPL (type '/exit' to quit, '/clear' to reset)\n");
+    println!("rusty-pi REPL (type '/exit' to quit)\n");
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -61,7 +64,6 @@ async fn run_repl(agent: &mut Agent) -> Result<()> {
         let mut line = String::new();
         let bytes_read = stdin.lock().read_line(&mut line)?;
         if bytes_read == 0 {
-            // EOF
             println!();
             break;
         }
@@ -75,82 +77,37 @@ async fn run_repl(agent: &mut Agent) -> Result<()> {
             break;
         }
 
-        if line == "/clear" {
-            // Reset conversation by recreating the agent
-            // For now, this is a no-op since we can't easily reset Agent's messages
-            // without recreating it. This will be properly implemented with session support.
-            println!("[Conversation reset not yet implemented in MVP]");
-            continue;
-        }
+        // Use Arc<Mutex> for the streaming callback
+        let text_output = Arc::new(Mutex::new(String::new()));
+        let to = text_output.clone();
+        agent.on_text(move |delta| {
+            print!("{}", delta);
+            let _ = io::stdout().flush();
+            to.lock().unwrap().push_str(delta);
+        });
 
-        // Run the prompt through the agent
         match agent.run(&line).await {
             Ok(()) => {
-                // Print the last assistant message
                 let msgs = agent.messages();
-                if let Some(AgentMessage::Assistant(a)) = msgs.last() {
-                    for content in &a.content {
-                        match content {
-                            AssistantContent::Text { text } => println!("{}", text),
-                            AssistantContent::Thinking { thinking } => {
-                                println!("[thinking] {}", thinking)
-                            }
-                            AssistantContent::ToolCall { name, arguments, .. } => {
-                                println!("[tool call: {}]\n{}", name, serde_json::to_string_pretty(arguments).unwrap_or_default());
-                            }
+                if let Some(AgentMessage::Assistant(a)) = msgs.last()
+                    && a.stop_reason == StopReason::Error
+                        && let Some(err) = &a.error_message {
+                            eprintln!("\n[error] {}", err);
                         }
-                    }
-                    if a.stop_reason == StopReason::Error
-                        && let Some(err) = &a.error_message
-                    {
-                        eprintln!("[error] {}", err);
-                    }
-                }
             }
             Err(e) => {
-                eprintln!("[error] {}", e);
+                eprintln!("\n[error] {}", e);
             }
         }
 
+        {
+            let output = text_output.lock().unwrap();
+            if !output.ends_with('\n') && !output.is_empty() {
+                println!();
+            }
+        }
         println!();
     }
 
     Ok(())
-}
-
-/// Print the reason for an assistant message's stop.
-fn stop_reason_display(reason: &StopReason) -> &'static str {
-    match reason {
-        StopReason::Stop => "stop",
-        StopReason::Length => "length",
-        StopReason::ToolUse => "tool_use",
-        StopReason::Error => "error",
-        StopReason::Aborted => "aborted",
-    }
-}
-
-/// Print a list of messages to stdout.
-fn print_messages(msgs: &[AgentMessage]) {
-    for msg in msgs {
-        match msg {
-            AgentMessage::User(u) => {
-                println!("[user] {:?}", u.content);
-            }
-            AgentMessage::Assistant(a) => {
-                println!("[assistant] {}", stop_reason_display(&a.stop_reason));
-                for content in &a.content {
-                    match content {
-                        AssistantContent::Text { text } => println!("  {}", text),
-                        AssistantContent::Thinking { thinking } => println!("  [thinking] {}", thinking),
-                        AssistantContent::ToolCall { name, arguments, .. } => {
-                            println!("  [tool: {}] {}", name, arguments);
-                        }
-                    }
-                }
-            }
-            AgentMessage::ToolResult(tr) => {
-                println!("[tool result: {}] ({} blocks)", tr.tool_name, tr.content.len());
-            }
-        }
-    }
 }

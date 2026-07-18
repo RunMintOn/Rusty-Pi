@@ -1,51 +1,56 @@
 //! LLM provider implementations.
 //!
 //! Mirrors `@earendil-works/pi-ai/src/providers/`.
-//!
-//! Each provider module exports a factory function that returns a configured provider.
-//! Providers are registered in the provider registry and discovered at startup via
-//! environment variables or configuration.
 
 pub mod deepseek;
 pub mod openai_codex;
 
-use crate::ai::types::{AgentMessage, AssistantMessage, Tool};
-use async_trait::async_trait;
+use crate::ai::stream::StreamEvent;
+use crate::ai::types::Tool;
 
 /// A registered LLM provider.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Provider {
-    /// Provider identifier (e.g., "deepseek", "openai-codex").
     pub id: &'static str,
-    /// Human-readable name.
     pub name: &'static str,
-    /// Base URL for API requests.
     pub base_url: &'static str,
-    /// Available models for this provider.
     pub models: Vec<Model>,
 }
 
 /// A model exposed by a provider.
 #[derive(Debug, Clone)]
 pub struct Model {
-    /// Model identifier (e.g., "deepseek-v4-pro").
     pub id: &'static str,
-    /// API type used to call this model.
     pub api: &'static str,
 }
+
+/// Size of the stream event channel buffer.
+const STREAM_CHANNEL_SIZE: usize = 256;
+
+/// A sender for streaming LLM response events.
+pub type StreamSender = tokio::sync::mpsc::Sender<StreamEvent>;
+
+/// A receiver for streaming LLM response events.
+pub type StreamReceiver = tokio::sync::mpsc::Receiver<StreamEvent>;
 
 /// A provider that can stream LLM responses.
 ///
 /// Mirrors the stream functions in the original `@earendil-works/pi-ai` package.
-/// Each API implementation (e.g., openai-completions, openai-codex-responses)
-/// implements this trait.
-#[async_trait]
+/// Instead of returning a single `AssistantMessage`, providers send `StreamEvent`s
+/// through a channel and return the receiver.
+#[async_trait::async_trait]
 pub trait ProviderApi: Send + Sync {
     /// Stream a completion from the LLM.
+    /// Returns a receiver that yields `StreamEvent`s.
     async fn stream(
         &self,
         model: &Model,
-        messages: &[AgentMessage],
+        messages: &[crate::ai::types::AgentMessage],
         tools: &[&dyn Tool],
-    ) -> anyhow::Result<AssistantMessage>;
+    ) -> anyhow::Result<StreamReceiver>;
+
+    /// Create a channel for sending stream events.
+    fn channel() -> (StreamSender, StreamReceiver) where Self: Sized {
+        tokio::sync::mpsc::channel(STREAM_CHANNEL_SIZE)
+    }
 }
