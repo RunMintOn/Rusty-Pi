@@ -49,6 +49,19 @@ rusty-pi/
 
 使用 tokio（Rust 异步生态事实标准，匹配原版 Node.js async/await 模型）。
 
+### Prompt Templates & Skills
+
+`src/coding_agent/` 下四个模块镜像原版 `packages/coding-agent/src/core/`：
+
+| 模块 | 原版文件 | 功能 |
+|---|---|---|
+| `prompt_templates.rs` | `prompt-templates.ts` | Markdown 模板加载、frontmatter 解析、bash 风格参数替换 |
+| `skills.rs` | `skills.ts` | Agent Skills 发现、验证、XML 格式化 |
+| `system_prompt.rs` | `system-prompt.ts` | System prompt 构建（tools/guidelines/skills/context） |
+| `prompt_session.rs` | —（薄层封装） | 封装 agent + 展开逻辑，入口点为 REPL 和未来其他模式 |
+
+加载优先级：global（`~/.pi/agent/`）→ project（`$CWD/.pi/`）→ 显式 `--prompt-path` / `--skill-path`。
+
 ### Tool 系统
 
 镜像原版三层架构：
@@ -138,9 +151,12 @@ MockProvider → agent loop → bash tool (real) → result → MockProvider
 |---|---|---|
 | Agent loop | MockProvider 模拟 LLM 响应，验证完整 roundtrip | `faux provider` |
 | Bash tool | 真实 subprocess 执行，验证 stdout/exit code/truncation | `tools.test.ts` |
-| Session 数据模型 | 纯单元测试，无需 mock | `session.test.ts` |
+| Session 数据模型 + JSONL 持久化 | 纯单元测试 + tempfile 文件测试 | `session.test.ts` + `storage.test.ts` |
 | AI provider trait | 测试 MockProvider 自身行为 | - |
 | Message 类型 | 纯单元测试，验证序列化/反序列化 | `messages.test.ts` |
+| Prompt Templates | 纯函数 + tempfile 文件测试 | `prompt-templates.test.ts` |
+| Skills | 纯函数 + tempfile 文件测试 | `skills.test.ts` |
+| System Prompt | 纯字符串测试 | `system-prompt.test.ts` |
 
 ### 什么是好测试
 
@@ -152,7 +168,7 @@ MockProvider → agent loop → bash tool (real) → result → MockProvider
 
 - 交互式 TUI（interactive mode + theme 系统）
 - 扩展系统（动态加载 extension）
-- JSONL session 持久化（先内存 session）
+- ~~JSONL session 持久化（先内存 session）~~ ✅ 已完成
 - 非 bash 工具（read、write、edit、grep、find、ls）
 - 除 Codex 和 DeepSeek 外的其他 LLM providers（Anthropic、Google、Bedrock、Mistral 等）
 - Orchestrator（IPC 编排器）

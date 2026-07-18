@@ -6,7 +6,7 @@
 cd rusty-pi && cargo test && cargo clippy
 ```
 
-71 tests，全部本地 mock，不碰任何在线 API。
+200 tests，全部本地 mock，不碰任何在线 API。
 
 ## Available Tools
 
@@ -28,6 +28,53 @@ cd rusty-pi && cargo test && cargo clippy
 3. 实现 `AgentTool` trait（`label`/`execute`，可选 `prepare_arguments`/`execution_mode`）
 4. 在 `tools/mod.rs` 声明 `pub mod your_tool;`
 5. 在 `main.rs` 注册：`let tool = YourTool::new(cwd);` → 加入 `tools: vec![...]`
+
+## Prompt Templates & Skills 系统
+
+Prompt templates 和 skills 是两种用户可配置的资源，通过 `--prompt-path` / `--skill-path` 加载，
+或从 `~/.pi/agent/prompts/` / `~/.pi/agent/skills/` 自动发现（`RUSTY_PI_AGENT_DIR` 可覆盖家目录位置）。
+
+### Prompt Templates
+
+`src/coding_agent/prompt_templates.rs` — 从 Markdown 文件加载 `/templateName args` 模板。
+支持 bash 风格参数替换（`$1`, `$@`, `${N:-default}`, `${@:N:L}`）。
+
+模板文件放在 `prompts/` 目录下，文件名（不含 `.md`）即模板名。
+Frontmatter 支持 `description` 和 `argument-hint`。
+
+### Skills
+
+`src/coding_agent/skills.rs` — 遵循 [Agent Skills 规范](https://agentskills.io) 发现和格式化技能。
+
+发现规则：
+1. SKILL.md 作为 skill 根节点，不递归
+2. 根目录下的 `.md` 文件
+3. 递归子目录找 SKILL.md
+
+Skill frontmatter：
+- `name`（必填，或父目录名兜底）：小写字母、数字、连字符，最长 64 字符
+- `description`（必填）：最长 1024 字符
+- `disable-model-invocation`（可选）：为 `true` 时不注入 system prompt
+
+### System Prompt 构建
+
+`src/coding_agent/system_prompt.rs` — 构建完整 system prompt。
+拼接 tools 列表、guidelines、pi 文档引用、skills XML、project context 文件。
+`custom_prompt` 可跳过默认模板直接使用自定义文本。
+
+### PromptSession
+
+`src/coding_agent/prompt_session.rs` — 薄 session 层，封装 agent + 展开逻辑。
+
+## Session 模块
+
+会话存储位于 `src/agent/session/`。三层架构：`SessionStorage` trait（抽象后端）← `InMemorySessionStorage` / `JsonlSessionStorage`（具体实现）← `Session`（业务逻辑 API）。详见 `docs/adr/003-session-storage-architecture.md`。
+
+**JSONL 文件格式（v3）**：第一行为 JSON session header（`type: "session"`, `version: 3`, `id`, `timestamp`, `cwd`），后续每行一个 JSON 编码的 `SessionTreeEntry`。文件末尾最近的 entry 决定 `leaf_id`。
+
+### Session 入口 JSON 序列化陷阱
+
+`SessionTreeEntry` 枚举使用 `#[serde(tag = "type")]`。所有内层 struct 的 `entry_type` 字段必须加 `#[serde(skip)]` 且 `EntryTypeTag` 必须实现 `Default`，否则反序列化时报 `duplicate field \`type\``。见 `types.rs` 中的实际用法。
 
 ## 测试陷阱
 

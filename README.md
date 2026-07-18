@@ -26,6 +26,8 @@ cargo run -- "用中文说你好"
 |---|---|---|
 | `-p, --provider` | mock / deepseek / codex | mock |
 | `-m, --model` | 模型 ID | provider 默认 |
+| `-P, --prompt-path` | Prompt 模板文件或目录（可重复） | — |
+| `-S, --skill-path` | Skill 文件或目录（可重复） | — |
 | `[PROMPT]` | 省略则进入 REPL | — |
 
 ## 测试
@@ -35,6 +37,6 @@ cargo test
 cargo clippy
 ```
 
-所有测试本地运行、不碰网络。
+所有测试本地运行、不碰网络。当前 200 个测试。
 
 详细维护说明见 [MAINTENANCE.md](./MAINTENANCE.md)。完整规格见 [SPEC.md](./SPEC.md)。
