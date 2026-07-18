@@ -70,7 +70,6 @@ impl Agent {
     }
 
     /// Register a callback for streaming text deltas.
-    /// Register a callback for streaming text deltas.
     pub fn on_text<F>(&mut self, callback: F)
     where
         F: FnMut(&str) + Send + 'static,
