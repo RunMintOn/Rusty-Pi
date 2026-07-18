@@ -179,9 +179,8 @@ async fn run_repl(session: &mut PromptSession) -> Result<()> {
     let mut reader = RustylineReader::new(rl);
 
     let registry = default_registry();
-    let formatter = OutputFormatter::new();
 
-    run_repl_with(session, &registry, &mut reader, &formatter, &hist_path).await
+    run_repl_with(session, &registry, &mut reader, &hist_path).await
 }
 
 /// Core REPL loop, parameterized over reader and registry for testability.
@@ -189,7 +188,6 @@ async fn run_repl_with(
     session: &mut PromptSession,
     registry: &CommandRegistry,
     reader: &mut dyn LineReader,
-    _formatter: &OutputFormatter,
     history_path: &PathBuf,
 ) -> Result<()> {
     let meta = session.session().get_metadata().await;
@@ -222,14 +220,7 @@ async fn run_repl_with(
 
         reader.add_history_entry(&trimmed);
 
-        // Handle /help before dispatch: HelpCommand is registered only so it
-        // appears in the listing; the actual help text comes from the registry.
-        if trimmed == "/help" || trimmed.starts_with("/help ") {
-            print!("{}", registry.help_text());
-            continue;
-        }
-
-        // Try command dispatch
+        // Try command dispatch (dispatch handles /help internally)
         match registry.dispatch(&trimmed, session)? {
             DispatchOutcome::Exit => break,
             DispatchOutcome::Handled => continue,
@@ -247,7 +238,8 @@ async fn run_repl_with(
                 && a.stop_reason == StopReason::Error
                 && let Some(err) = &a.error_message
             {
-                eprintln!("[error] {}", err);
+                let fmt = OutputFormatter::new();
+                eprintln!("{}", fmt.error(err));
             }
         }
         println!();
@@ -286,11 +278,10 @@ mod tests {
     async fn repl_with_exit_command() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec!["/exit".into()]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
 
@@ -302,11 +293,10 @@ mod tests {
     async fn repl_with_quit_command() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec!["/quit".into()]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
     }
@@ -315,11 +305,10 @@ mod tests {
     async fn repl_with_help_command() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec!["/help".into(), "/exit".into()]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
     }
@@ -328,11 +317,10 @@ mod tests {
     async fn repl_with_unknown_command() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec!["/unknown".into(), "/exit".into()]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
     }
@@ -341,14 +329,13 @@ mod tests {
     async fn repl_with_regular_prompt_then_exit() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec![
             "hello agent".into(),
             "/exit".into(),
         ]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
 
@@ -360,7 +347,6 @@ mod tests {
     async fn repl_with_empty_lines_skips() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec![
             "".into(),
             "  ".into(),
@@ -368,7 +354,7 @@ mod tests {
         ]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
 
@@ -381,11 +367,10 @@ mod tests {
     async fn repl_eof_triggers_exit() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec![]); // empty → immediate EOF
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
     }
@@ -394,7 +379,6 @@ mod tests {
     async fn repl_multiple_prompts() {
         let mut session = mock_session();
         let registry = default_registry();
-        let formatter = OutputFormatter::new();
         let mut reader = MockLineReader::new(vec![
             "first".into(),
             "second".into(),
@@ -402,7 +386,7 @@ mod tests {
         ]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
-        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+        run_repl_with(&mut session, &registry, &mut reader, &hist)
             .await
             .unwrap();
 

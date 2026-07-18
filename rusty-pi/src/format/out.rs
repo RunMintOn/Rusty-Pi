@@ -3,7 +3,7 @@
 //! All formatting functions return `String` so they can be tested by asserting
 //! on the returned text without writing to a real terminal.
 
-use sparcli::{Alert, Badge, KeyValue, Renderable, Table, Theme};
+use sparcli::{Alert, Badge, KeyValue, Renderable, Table};
 
 /// Summary of session state for display purposes.
 ///
@@ -29,16 +29,12 @@ pub struct SessionSummary {
 /// Uses [`sparcli`] components internally. Every public method returns a
 /// `String` — never writes directly to stdout — so callers decide where to
 /// send the output and tests can assert on the content.
-pub struct OutputFormatter {
-    theme: sparcli::Theme,
-}
+pub struct OutputFormatter;
 
 impl OutputFormatter {
-    /// Create a new formatter with default theme.
+    /// Create a new formatter.
     pub fn new() -> Self {
-        Self {
-            theme: Theme::default(),
-        }
+        Self
     }
 
     /// Format session information as a key-value list.
@@ -58,11 +54,11 @@ impl OutputFormatter {
             .add("Messages", info.msg_count.to_string())
             .add("CWD", info.cwd.as_str())
             .print_to(&mut buf)
-            .unwrap();
+            .expect("write to in-memory buffer");
         String::from_utf8_lossy(&buf).to_string()
     }
 
-        /// Format a session list as a table (for `/list-sessions`).
+    /// Format a session list as a table (for `/list-sessions`).
     ///
     /// Each summary should have columns ordered as: session id, model, messages, created.
     pub fn session_list(&self, sessions: &[SessionSummary]) -> String {
@@ -83,7 +79,7 @@ impl OutputFormatter {
         table
             .striped(true)
             .print_to(&mut buf)
-            .unwrap();
+            .expect("write to in-memory buffer");
         String::from_utf8_lossy(&buf).to_string()
     }
 
@@ -92,15 +88,20 @@ impl OutputFormatter {
         let mut buf = Vec::new();
         Badge::new(name)
             .print_to(&mut buf)
-            .unwrap();
+            .expect("write to in-memory buffer");
         use std::io::Write;
         let _ = write!(buf, " {}", args);
         String::from_utf8_lossy(&buf).to_string()
     }
 
-    /// Format a tool end line (separator + duration).
+    /// Format a tool end line (tool name + separator + duration).
     pub fn tool_end(&self, name: &str, duration_ms: u64) -> String {
-        format!("─── {}.{:01}s ───\n", duration_ms / 1000, (duration_ms % 1000) / 100)
+        format!(
+            "─── {}: {}.{:01}s ───\n",
+            name,
+            duration_ms / 1000,
+            (duration_ms % 1000) / 100
+        )
     }
 
     /// Format a tool error as a red alert.
@@ -108,7 +109,7 @@ impl OutputFormatter {
         let mut buf = Vec::new();
         Alert::error(format!("[{}] {}", tool, error))
             .print_to(&mut buf)
-            .unwrap();
+            .expect("write to in-memory buffer");
         String::from_utf8_lossy(&buf).to_string()
     }
 
@@ -127,7 +128,7 @@ impl OutputFormatter {
         let mut buf = Vec::new();
         Alert::warning("Aborted by user")
             .print_to(&mut buf)
-            .unwrap();
+            .expect("write to in-memory buffer");
         String::from_utf8_lossy(&buf).to_string()
     }
 
@@ -136,7 +137,7 @@ impl OutputFormatter {
         let mut buf = Vec::new();
         Alert::error(msg)
             .print_to(&mut buf)
-            .unwrap();
+            .expect("write to in-memory buffer");
         String::from_utf8_lossy(&buf).to_string()
     }
 }
@@ -228,6 +229,7 @@ mod tests {
         let out = fmt.tool_end("bash", 1500);
         assert!(out.contains("1.5s"), "tool_end should contain formatted duration");
         assert!(out.contains("───"), "tool_end should have separator");
+        assert!(out.contains("bash"), "tool_end should contain tool name");
     }
 
     #[test]
@@ -243,6 +245,7 @@ mod tests {
         let fmt = OutputFormatter::new();
         let out = fmt.tool_end("read", 0);
         assert!(out.contains("0.0s"));
+        assert!(out.contains("read"));
     }
 
     #[test]

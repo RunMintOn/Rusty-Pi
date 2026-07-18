@@ -17,6 +17,7 @@ use rusty_pi::coding_agent::prompt_session::PromptSession;
 use rusty_pi::coding_agent::system_prompt::ContextFile;
 use rusty_pi::agent::session::types::iso_timestamp;
 use rusty_pi::coding_agent::repl::{self, RunConfig};
+use rusty_pi::format::OutputFormatter;
 use rusty_pi::coding_agent::tools::bash::BashTool;
 use rusty_pi::coding_agent::tools::edit::EditTool;
 use rusty_pi::coding_agent::tools::read::ReadTool;
@@ -110,10 +111,10 @@ fn build_provider(name: &str, model_id: Option<&str>) -> anyhow::Result<(Box<dyn
         )),
         "deepseek" => {
             let provider = DeepSeekProvider::from_env().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DEEPSEEK_API_KEY environment variable not set.\n\
-                     Get your API key at https://platform.deepseek.com/api-keys"
-                )
+                let fmt = OutputFormatter::new();
+                anyhow::anyhow!("{}", fmt.error(
+                    "DEEPSEEK_API_KEY not set. Get your key at https://platform.deepseek.com/api-keys"
+                ))
             })?;
 
             let model_id = model_id.unwrap_or("deepseek-v4-flash");
@@ -121,21 +122,22 @@ fn build_provider(name: &str, model_id: Option<&str>) -> anyhow::Result<(Box<dyn
                 .iter()
                 .find(|m| m.id == model_id)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
+                    let fmt = OutputFormatter::new();
+                    let available: Vec<&str> = DEEPSEEK_MODELS.iter().map(|m| m.id).collect();
+                    anyhow::anyhow!("{}", fmt.error(&format!(
                         "Unknown DeepSeek model '{}'. Available: {:?}",
-                        model_id,
-                        DEEPSEEK_MODELS.iter().map(|m| m.id).collect::<Vec<_>>()
-                    )
+                        model_id, available
+                    )))
                 })?;
 
             Ok((Box::new(provider), model.clone()))
         }
         "codex" => {
             let provider = OpenAICodexProvider::from_env().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "OPENAI_CODEX_TOKEN environment variable not set.\n\
-                     Get your ChatGPT access token from the browser devtools."
-                )
+                let fmt = OutputFormatter::new();
+                anyhow::anyhow!("{}", fmt.error(
+                    "OPENAI_CODEX_TOKEN not set. Get your ChatGPT access token from browser devtools."
+                ))
             })?;
 
             let model_id = model_id.unwrap_or("gpt-5.6-sol");
@@ -143,16 +145,22 @@ fn build_provider(name: &str, model_id: Option<&str>) -> anyhow::Result<(Box<dyn
                 .iter()
                 .find(|m| m.id == model_id)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
+                    let fmt = OutputFormatter::new();
+                    let available: Vec<&str> = OPENAI_CODEX_MODELS.iter().map(|m| m.id).collect();
+                    anyhow::anyhow!("{}", fmt.error(&format!(
                         "Unknown Codex model '{}'. Available: {:?}",
-                        model_id,
-                        OPENAI_CODEX_MODELS.iter().map(|m| m.id).collect::<Vec<_>>()
-                    )
+                        model_id, available
+                    )))
                 })?;
 
             Ok((Box::new(provider), model.clone()))
         }
-        other => anyhow::bail!("Unknown provider '{}'. Supported: mock, deepseek, codex", other),
+        other => {
+            let fmt = OutputFormatter::new();
+            anyhow::bail!("{}", fmt.error(&format!(
+                "Unknown provider '{}'. Supported: mock, deepseek, codex", other
+            )))
+        }
     }
 }
 
@@ -253,7 +261,10 @@ async fn main() -> anyhow::Result<()> {
             // Size check (> 1MB → warn and skip)
             if let Ok(meta) = std::fs::metadata(&resolved) {
                 if meta.len() > 1_048_576 {
-                    eprintln!("[warning] Context file '{}' is > 1MB, skipping", p.display());
+                    let fmt = OutputFormatter::new();
+                    eprintln!("{}", fmt.error(&format!(
+                        "Context file '{}' is > 1MB, skipping", p.display()
+                    )));
                     return None;
                 }
             }
@@ -265,7 +276,10 @@ async fn main() -> anyhow::Result<()> {
                     })
                 }
                 Err(e) => {
-                    eprintln!("[warning] Cannot read context file '{}': {}", p.display(), e);
+                    let fmt = OutputFormatter::new();
+                    eprintln!("{}", fmt.error(&format!(
+                        "Cannot read context file '{}': {}", p.display(), e
+                    )));
                     None
                 }
             }
@@ -356,10 +370,11 @@ async fn create_or_resume_session(
                 // Try to find by prefix in sessions directory
                 let sessions_dir = agent_dir.join("sessions");
                 if !sessions_dir.exists() {
-                    anyhow::bail!(
+                    let fmt = OutputFormatter::new();
+                    anyhow::bail!("{}", fmt.error(&format!(
                         "No session found matching '{}'. Sessions directory does not exist.",
                         path_or_prefix
-                    );
+                    )));
                 }
                 let mut matches: Vec<PathBuf> = Vec::new();
                 let mut read_dir = tokio::fs::read_dir(&sessions_dir).await?;
@@ -372,19 +387,23 @@ async fn create_or_resume_session(
                     }
                 }
                 match matches.len() {
-                    0 => anyhow::bail!(
-                        "No session found matching '{}' in {}",
-                        path_or_prefix,
-                        sessions_dir.display()
-                    ),
+                    0 => {
+                        let fmt = OutputFormatter::new();
+                        anyhow::bail!("{}", fmt.error(&format!(
+                            "No session found matching '{}' in {}",
+                            path_or_prefix,
+                            sessions_dir.display()
+                        )));
+                    },
                     1 => matches.into_iter().next().unwrap(),
                     _ => {
                         let paths: Vec<String> = matches.iter().map(|p| p.to_string_lossy().to_string()).collect();
-                        anyhow::bail!(
+                        let fmt = OutputFormatter::new();
+                        anyhow::bail!("{}", fmt.error(&format!(
                             "Multiple sessions match '{}': {}. Use a more specific prefix.",
                             path_or_prefix,
                             paths.join(", ")
-                        );
+                        )));
                     }
                 }
             };

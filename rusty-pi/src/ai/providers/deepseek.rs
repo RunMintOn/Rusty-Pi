@@ -1,9 +1,16 @@
 //! DeepSeek LLM provider — OpenAI-compatible completions API.
-
+//!
+//! Also works with any OpenAI-compatible endpoint by setting `DEEPSEEK_BASE_URL`
+//! (defaults to `https://api.deepseek.com`).
 //!
 //! # Authentication
 //!
-//! The provider reads the API key from the `DEEPSEEK_API_KEY` environment variable.
+//! Reads the API key from the `DEEPSEEK_API_KEY` environment variable.
+//! For local / self-hosted endpoints, set both:
+//! ```ignore
+//! export DEEPSEEK_API_KEY="local-free-models"
+//! export DEEPSEEK_BASE_URL="http://127.0.0.1:18180/v1"
+//! ```
 //!
 //! # Usage
 //!
@@ -33,9 +40,12 @@ const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 
 /// Models supported by the DeepSeek provider.
+///
+/// Add extra models at runtime by setting the `DEEPSEEK_MODEL_ID` env var.
 pub const DEEPSEEK_MODELS: &[Model] = &[
     Model { id: "deepseek-v4-flash", api: "openai-completions" },
     Model { id: "deepseek-v4-pro", api: "openai-completions" },
+    Model { id: "deepseek-v4-flash-free", api: "openai-completions" },
 ];
 
 /// Provider for the DeepSeek API (OpenAI-compatible chat completions endpoint).
@@ -49,11 +59,16 @@ pub struct DeepSeekProvider {
 }
 
 impl DeepSeekProvider {
-    /// Create a provider from the `DEEPSEEK_API_KEY` environment variable.
-    /// Returns `None` if the variable is not set.
+    /// Create a provider from environment variables.
+    ///
+    /// Reads:
+    /// - `DEEPSEEK_API_KEY` (required) — API key
+    /// - `DEEPSEEK_BASE_URL` (optional) — base URL, defaults to `https://api.deepseek.com`
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var(DEEPSEEK_API_KEY_ENV).ok()?;
-        Some(Self::new(api_key))
+        let base_url = std::env::var("DEEPSEEK_BASE_URL")
+            .unwrap_or_else(|_| DEEPSEEK_BASE_URL.to_string());
+        Some(Self::new(api_key).with_base_url(base_url))
     }
 
     /// Create a new DeepSeek provider with the given API key.

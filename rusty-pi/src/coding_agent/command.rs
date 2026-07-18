@@ -5,6 +5,45 @@
 
 use anyhow::Result;
 use crate::coding_agent::prompt_session::PromptSession;
+use crate::format::OutputFormatter;
+use std::sync::OnceLock;
+
+/// Run an async future to completion in a dedicated blocking runtime.
+///
+/// Tokio does not allow entering ANY runtime from within an existing runtime
+/// context. This function works around that by:
+///
+/// 1. Initializing a separate `tokio::Runtime` on a fresh thread (the
+///    `OnceLock` init thread has no tokio context).
+/// 2. Running the future on yet another fresh thread via `std::thread::scope`,
+///    which also has no tokio context, so `Runtime::block_on` succeeds.
+///
+/// The scope also lets the future borrow non-`'static` references (e.g. `&Session`).
+fn block_on<'a, F, T>(f: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'a,
+    T: 'a + Send,
+{
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    // Initialize on a fresh thread — `Runtime::new()` panics if called from
+    // within another runtime.
+    RT.get_or_init(|| {
+        std::thread::spawn(|| {
+            tokio::runtime::Runtime::new()
+                .expect("failed to create blocking runtime")
+        })
+        .join()
+        .expect("blocking runtime init thread panicked")
+    });
+    let rt = RT.get().expect("blocking runtime not initialized");
+    // Run on a scoped thread — it has no tokio context, so `rt.block_on` can
+    // freely enter the separate runtime.
+    std::thread::scope(|s| {
+        s.spawn(|| rt.block_on(f))
+            .join()
+            .expect("blocking future panicked")
+    })
+}
 
 /// Outcome of dispatching a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +128,12 @@ impl CommandRegistry {
             .map(|s| s.split_whitespace().collect())
             .unwrap_or_default();
 
+        // Handle /help directly so it works even when HelpCommand is a stub
+        if cmd_name == "help" {
+            print!("{}", self.help_text());
+            return Ok(DispatchOutcome::Handled);
+        }
+
         // Look for exact match
         for cmd in &self.commands {
             if cmd.name() == cmd_name {
@@ -97,7 +142,11 @@ impl CommandRegistry {
         }
 
         // Unknown command — still mark as handled so we don't send it to the agent
-        eprintln!("[error] Unknown command '/{}'. Type '/help' for available commands.", cmd_name);
+        let fmt = OutputFormatter::new();
+        eprintln!(
+            "{}",
+            fmt.error(&format!("Unknown command '/{}'. Type '/help' for available commands.", cmd_name))
+        );
         Ok(DispatchOutcome::Handled)
     }
 
@@ -127,6 +176,10 @@ impl Default for CommandRegistry {
 // ── Built-in commands ────────────────────────────────────────────────────
 
 /// `/help` — list available commands.
+///
+/// This command is registered so it appears in `/help` listing.
+/// The actual help output is produced by [`CommandRegistry::dispatch`]
+/// when it matches `cmd_name == "help"`.
 pub struct HelpCommand;
 
 impl Command for HelpCommand {
@@ -139,8 +192,8 @@ impl Command for HelpCommand {
     }
 
     fn execute(&self, _args: &[&str], _session: &mut PromptSession) -> Result<DispatchOutcome> {
-        // This is a placeholder — the REPL handles `/help` before dispatch.
-        // This command exists so `/help` appears in the registry listing.
+        // dispatch() handles /help before reaching this stub.
+        // This execute() exists only to make the command appear in the registry listing.
         Ok(DispatchOutcome::Handled)
     }
 }
@@ -356,7 +409,7 @@ mod ticket21_tests {
 
 use crate::agent::session::types::SessionTreeEntry;
 use crate::ai::types::{AgentMessage, AssistantContent, MessageContent};
-use crate::format::{OutputFormatter, SessionInfo, SessionSummary};
+use crate::format::{SessionInfo, SessionSummary};
 
 /// `/session` — display current session information.
 pub struct SessionCommand;
@@ -371,11 +424,10 @@ impl Command for SessionCommand {
     }
 
     fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
-        let rt = tokio::runtime::Handle::current();
         let s = session.session();
-        let meta = rt.block_on(s.get_metadata());
-        let (total, _user, _assistant, _tool) = rt.block_on(s.count_messages());
-        let model = rt.block_on(s.derive_model()).unwrap_or_default();
+        let meta = block_on(s.get_metadata());
+        let (total, _user, _assistant, _tool) = block_on(s.count_messages());
+        let model = block_on(s.derive_model()).unwrap_or_default();
 
         let info = SessionInfo {
             id: meta.id,
@@ -403,20 +455,30 @@ impl Command for TreeCommand {
     }
 
     fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
-        let rt = tokio::runtime::Handle::current();
         let s = session.session();
-        let entries = rt.block_on(s.get_branch(None))
-            .map_err(|e| anyhow::anyhow!("Failed to get session branch: {}", e))?;
+        let entries = block_on(s.get_entries());
 
         if entries.is_empty() {
             println!("(empty session)");
             return Ok(DispatchOutcome::Handled);
         }
 
-        // Simple indented tree output
+        // Build parent → children map
+        use std::collections::{HashMap, HashSet};
+        let all_ids: HashSet<&str> = entries.iter().map(|e| e.id()).collect();
+        let mut children: HashMap<Option<String>, Vec<&SessionTreeEntry>> = HashMap::new();
         for entry in &entries {
-            let indent = "  ".to_string();
-            let label = match entry {
+            let pid = entry.parent_id().map(|s| s.to_string());
+            children.entry(pid).or_default().push(entry);
+        }
+
+        // Find roots: entries whose parent_id is None or points outside the set
+        let roots: Vec<&SessionTreeEntry> = entries.iter()
+            .filter(|e| e.parent_id().map_or(true, |pid| !all_ids.contains(pid)))
+            .collect();
+
+        fn label_for_entry(entry: &SessionTreeEntry) -> String {
+            match entry {
                 SessionTreeEntry::Message(m) => {
                     match &m.message {
                         AgentMessage::User(u) => {
@@ -444,9 +506,40 @@ impl Command for TreeCommand {
                     }
                 },
                 _ => format!("{:?}", entry.entry_type()),
-            };
-            println!("{}{}", indent, label);
+            }
         }
+
+        fn render_children(
+            out: &mut String,
+            parent_id: &str,
+            children: &HashMap<Option<String>, Vec<&SessionTreeEntry>>,
+            prefix: &str,
+        ) {
+            let kid_key = Some(parent_id.to_string());
+            if let Some(kids) = children.get(&kid_key) {
+                let total = kids.len();
+                for (i, kid) in kids.iter().enumerate() {
+                    let is_last = i == total - 1;
+                    let connector = if is_last { "└── " } else { "├── " };
+                    let continuation = if is_last { "    " } else { "│   " };
+                    let full_prefix = format!("{}{}", prefix, connector);
+                    let next_prefix = format!("{}{}", prefix, continuation);
+                    out.push_str(&format!("{}{}\n", full_prefix, label_for_entry(kid)));
+                    render_children(out, kid.id(), children, &next_prefix);
+                }
+            }
+        }
+
+        let mut output = String::new();
+        let total_roots = roots.len();
+        for (i, root) in roots.iter().enumerate() {
+            let is_last = i == total_roots - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            let prefix = if is_last { "    " } else { "│   " };
+            output.push_str(&format!("{}{}\n", connector, label_for_entry(root)));
+            render_children(&mut output, root.id(), &children, prefix);
+        }
+        print!("{}", output);
         Ok(DispatchOutcome::Handled)
     }
 }
@@ -464,6 +557,10 @@ impl Command for ListSessionsCommand {
     }
 
     fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
+        use crate::agent::session::storage::SessionStorage;
+        use crate::agent::session::jsonl::JsonlSessionStorage;
+        use crate::ai::types::AgentMessage;
+
         let sessions_dir = session.agent_dir().join("sessions");
 
         if !sessions_dir.exists() {
@@ -475,28 +572,38 @@ impl Command for ListSessionsCommand {
         let dir_entries = match std::fs::read_dir(&sessions_dir) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[error] Cannot read sessions directory: {}", e);
+                let fmt = OutputFormatter::new();
+                eprintln!("{}", fmt.error(&format!("Cannot read sessions directory: {}", e)));
                 return Ok(DispatchOutcome::Handled);
             }
         };
 
-        let rt = tokio::runtime::Handle::current();
         for entry in dir_entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            // Try to open and read header
             let path_str = path.to_string_lossy().to_string();
-            use crate::agent::session::storage::SessionStorage;
-            if let Ok(storage) = rt.block_on(
-                crate::agent::session::jsonl::JsonlSessionStorage::open(path_str)
-            ) {
-                let meta = rt.block_on(storage.get_metadata());
+            if let Ok(storage) = block_on(JsonlSessionStorage::open(path_str)) {
+                let meta = block_on(storage.get_metadata());
+                // Derive model and count from session entries
+                let entries = block_on(storage.get_entries());
+                let mut msg_count = 0;
+                let mut model = String::new();
+                for e in entries.iter().rev() {
+                    if let SessionTreeEntry::Message(m) = e {
+                        msg_count += 1;
+                        if model.is_empty() {
+                            if let AgentMessage::Assistant(a) = &m.message {
+                                model = a.model.clone();
+                            }
+                        }
+                    }
+                }
                 summaries.push(SessionSummary {
                     id: meta.id,
-                    model: String::new(),
-                    msg_count: 0,
+                    model,
+                    msg_count,
                     created: meta.created_at,
                 });
             }
