@@ -1,5 +1,13 @@
 # Maintenance
 
+## Provider 配置
+
+优先级：环境变量 → 存储凭据（`~/.config/pi-codex-credentials.json`）→ OAuth 交互登录
+
+- 默认 provider：OpenAI Codex
+- 切换 DeepSeek：`--provider deepseek` + `DEEPSEEK_API_KEY`
+- 跳过 OAuth 直接使用 token：`OPENAI_CODEX_TOKEN`
+
 ## Build & Test
 
 ```bash
@@ -7,6 +15,16 @@ cd rusty-pi && cargo test && cargo clippy
 ```
 
 200 tests，全部本地 mock，不碰任何在线 API。
+
+特定模块测试：
+
+```bash
+cargo test openai_codex
+cargo test deepseek
+cargo test bash
+```
+
+- bash timeout 测试会打印 kill 日志，无害
 
 ## Available Tools
 
@@ -76,7 +94,18 @@ Skill frontmatter：
 
 `SessionTreeEntry` 枚举使用 `#[serde(tag = "type")]`。所有内层 struct 的 `entry_type` 字段必须加 `#[serde(skip)]` 且 `EntryTypeTag` 必须实现 `Default`，否则反序列化时报 `duplicate field \`type\``。见 `types.rs` 中的实际用法。
 
-## 测试陷阱
+## 参考代码位置
+
+原版 TypeScript 参考代码仅存在于**基础仓库** `pi-rust/reference/earendil-works-pi/`，不在 worktree 中。通过 Git worktree 切换到 ticket 分支后，`reference/` 目录不存在，访问需用基础仓库的绝对路径。
+
+## 已知陷阱
+
+| 陷阱 | 现象 | 原因 |
+|---|---|---|
+| `reference/` 在 worktree 中不存在 | `ls reference/` 报错 | 参考代码只在基础仓库 |
+| test filter 返回 0 测试 | 完整路径过滤不匹配 | 用模块名短名 `cargo test openai_codex` |
+| bash timeout 测试日志中有 kill 输出 | 测试打印 `kill: no such process` | 无害，测试预期行为 |
+| `Content` 没有 `Display` | 不能 `result.content[0].to_string()` | 必须模式匹配 |
 
 ### `Content` 没有 `Display`
 

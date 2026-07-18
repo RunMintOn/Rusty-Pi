@@ -10,16 +10,12 @@ use sha2::Digest;
 // ---------------------------------------------------------------------------
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-#[allow(dead_code)]
-const AUTH_BASE_URL: &str = "https://auth.openai.com";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const DEVICE_CODE_TIMEOUT_SECS: u64 = 15 * 60;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const MIN_POLL_INTERVAL_MS: u64 = 1000;
-#[allow(dead_code)]
-const POLL_INCREMENT_MS: u64 = 5000;
 
 /// Credential file path derived from home directory.
 fn credentials_path() -> Option<std::path::PathBuf> {
@@ -110,16 +106,6 @@ fn base64_url_encode(data: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 // Device code polling
 // ---------------------------------------------------------------------------
-
-/// Polling result from the device code flow.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum DevicePollResult {
-    Pending,
-    Completed { authorization_code: String, code_verifier: String },
-    Failed(String),
-    SlowDown,
-}
 
 /// Poll the device auth endpoint until the user authenticates.
 async fn poll_device_auth(
@@ -245,7 +231,7 @@ async fn exchange_code(
 }
 
 /// Refresh an access token using the refresh token.
-async fn refresh_token(refresh: &str) -> anyhow::Result<CodexCredential> {
+pub async fn refresh_token(refresh: &str) -> anyhow::Result<CodexCredential> {
     let client = reqwest::Client::new();
     let resp = client
         .post(TOKEN_URL)
@@ -453,16 +439,16 @@ async fn wait_for_callback(
                     // Check state
                     let state = uri.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
                     if let Some(ref s) = state && s != expected_state {
-                        let _ = respond(&mut stream, 400, "State mismatch").await;
+                        respond(&mut stream, 400, "State mismatch").await?;
                         continue;
                     }
 
                     if let Some(code) = uri.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string()) {
-                        let _ = respond(&mut stream, 200, "✓ Authentication complete. You can close this window.").await;
+                        respond(&mut stream, 200, "✓ Authentication complete. You can close this window.").await?;
                         return anyhow::Result::Ok(code);
                     }
                 }
-                let _ = respond(&mut stream, 400, "Missing authorization code").await;
+                respond(&mut stream, 400, "Missing authorization code").await?;
                 anyhow::bail!("Missing authorization code in callback");
             }
         } => result,
