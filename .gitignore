@@ -1,5 +1,6 @@
 /rusty-pi/target/
 /reference/
+rust_out
 *.swp
 *.swo
 .DS_Store
