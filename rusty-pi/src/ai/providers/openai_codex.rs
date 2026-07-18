@@ -60,6 +60,11 @@ pub struct OpenAICodexProvider {
 }
 
 impl OpenAICodexProvider {
+    /// Shortcut for `self.token.lock().expect("Codex token mutex poisoned")`.
+    fn lock_token(&self) -> std::sync::MutexGuard<'_, String> {
+        self.token.lock().expect("Codex token mutex poisoned")
+    }
+
     /// Create a provider from the `OPENAI_CODEX_TOKEN` environment variable,
     /// falling back to stored OAuth credentials. Returns `None` if neither
     /// is available (call `from_oauth` to start the interactive flow).
@@ -162,24 +167,23 @@ impl ProviderApi for OpenAICodexProvider {
                 match refresh_token(&cred.refresh).await {
                     Ok(new_cred) => {
                         let _ = new_cred.save();
-                        let mut guard = self.token.lock().unwrap();
-                        *guard = new_cred.access.clone();
+                        *self.lock_token() = new_cred.access.clone();
                         new_cred.access
                     }
                     Err(_) => {
                         // Refresh failed; use existing token
-                        self.token.lock().unwrap().clone()
+                        self.lock_token().clone()
                     }
                 }
             } else {
-                let mut guard = self.token.lock().unwrap();
+                let mut guard = self.lock_token();
                 if guard.as_str() != cred.access {
                     *guard = cred.access.clone();
                 }
                 guard.clone()
             }
         } else {
-            self.token.lock().unwrap().clone()
+            self.lock_token().clone()
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -231,10 +235,18 @@ async fn do_codex_stream(
         let chunk = chunk_result?;
         buf.extend_from_slice(&chunk);
 
-        // Process complete SSE events (separated by \n\n)
-        while let Some(boundary) = find_double_newline(&buf) {
-            let raw_event = buf[..boundary].to_vec();
-            buf.drain(..boundary + 2); // skip past \n\n
+        // Process complete SSE events (separated by \n\n or \r\n\r\n)
+        while let Some(sep_start) = find_double_newline(&buf) {
+            let raw_event = buf[..sep_start].to_vec();
+            let sep_len = if sep_start + 3 < buf.len() && buf[sep_start] == b'\r'
+                && buf[sep_start + 1] == b'\n'
+                && buf[sep_start + 2] == b'\r'
+                && buf[sep_start + 3] == b'\n' {
+                4
+            } else {
+                2
+            };
+            buf.drain(..sep_start + sep_len); // skip past separator
 
             if raw_event.is_empty() || raw_event.iter().all(|&b| b == b'\n' || b == b'\r') {
                 continue;
@@ -386,17 +398,17 @@ async fn do_codex_stream(
     Ok(())
 }
 
-/// Find the position of the first double newline (\n\n) in a byte buffer.
-/// Also handles \r\n\r\n (CRLF) by advancing past the \r characters.
+/// Find the position of the first double-newline separator (\n\n or \r\n\r\n)
+/// in a byte buffer. Returns the index of the start of the separator.
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
     for i in 0..buf.len().saturating_sub(1) {
         if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some(i + 1);
+            return Some(i);
         }
-        // Handle \r\n\r\n — skip \r before \n
+        // Handle \r\n\r\n
         if i + 3 < buf.len() && buf[i] == b'\r' && buf[i + 1] == b'\n'
             && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            return Some(i + 3);
+            return Some(i);
         }
     }
     None
@@ -524,5 +536,200 @@ mod tests {
         assert_eq!(input[0]["id"], "");
         // function_call_output uses the full id as call_id
         assert_eq!(input[1]["call_id"], "simple_call_id");
+    }
+
+    // -------------------------------------------------------------------------
+    // find_double_newline
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn find_double_newline_lf() {
+        // Basic \n\n at various positions
+        assert_eq!(find_double_newline(b"aa\n\n"), Some(2));
+        assert_eq!(find_double_newline(b"\n\nbb"), Some(0));
+        assert_eq!(find_double_newline(b"a\n\nb"), Some(1));
+        // No separator
+        assert_eq!(find_double_newline(b"abc"), None);
+        assert_eq!(find_double_newline(b"a\n"), None);
+        assert_eq!(find_double_newline(b"a\n\n\n"), Some(1)); // first \n\n
+        // Empty buffer
+        assert_eq!(find_double_newline(b""), None);
+    }
+
+    #[test]
+    fn find_double_newline_crlf() {
+        // b"aa\r\n\r\n" = indices: a(0) a(1) \r(2) \n(3) \r(4) \n(5)
+        assert_eq!(find_double_newline(b"aa\r\n\r\n"), Some(2));
+        // \r\n\r\nbb = \r(0) \n(1) \r(2) \n(3) b(4) b(5)
+        assert_eq!(find_double_newline(b"\r\n\r\nbb"), Some(0));
+        // a\r\n\r\nb = a(0) \r(1) \n(2) \r(3) \n(4) b(5)
+        assert_eq!(find_double_newline(b"a\r\n\r\nb"), Some(1));
+        // Lone \r\n followed by \n\n — matches first pattern at \n\n
+        assert_eq!(find_double_newline(b"\r\n\n"), Some(1)); // \n\n starts at index 1
+        assert_eq!(find_double_newline(b"\r\nfoo"), None);
+    }
+
+    #[test]
+    fn find_double_newline_lf_preferred_over_crlf() {
+        // When both patterns exist, return the first one
+        assert_eq!(find_double_newline(b"a\n\nb\r\n\r\n"), Some(1));
+    }
+
+    #[test]
+    fn find_double_newline_returns_separator_start() {
+        // The return value is the index of the first byte of the separator.
+        // For \"aa\n\nbb\": the \n\n starts at index 2.
+        let buf = b"aa\n\nbb";
+        let sep = find_double_newline(buf).unwrap();
+        assert_eq!(sep, 2);
+        assert_eq!(&buf[..sep], b"aa");
+        assert_eq!(&buf[sep..sep + 2], b"\n\n");
+
+        // For CRLF: \"aa\r\n\r\nbb\" — separator starts at index 2.
+        let buf = b"aa\r\n\r\nbb";
+        let sep = find_double_newline(buf).unwrap();
+        assert_eq!(sep, 2);
+        assert_eq!(&buf[..sep], b"aa");
+        assert_eq!(&buf[sep..sep + 4], b"\r\n\r\n");
+    }
+
+    #[test]
+    fn find_double_newline_multipart_stream() {
+        // Simulate SSE events separated by \n\n, arriving in chunks.
+        // Event 1: "event: a\ndata: {\"x\":1}"
+        // Event 2: "event: b\ndata: {\"y\":2}"
+        let chunk1 = b"event: a\ndata: {\"x\":1}\n\nevent";
+        let sep1 = find_double_newline(chunk1).unwrap();
+        assert_eq!(&chunk1[..sep1], b"event: a\ndata: {\"x\":1}");
+
+        let remaining = &chunk1[sep1 + 2..]; // skip \n\n
+        assert_eq!(remaining, b"event".as_slice());
+
+        // Complete chunk2
+        let chunk2 = [remaining, b": b\ndata: {\"y\":2}\n\n"].concat();
+        let sep2 = find_double_newline(&chunk2).unwrap();
+        assert_eq!(&chunk2[..sep2], b"event: b\ndata: {\"y\":2}");
+    }
+
+    // -------------------------------------------------------------------------
+    // SSE buffer processing (do_codex_stream internals)
+    // -------------------------------------------------------------------------
+
+    /// Simulate the SSE accumulation and extraction loop used by do_codex_stream.
+    /// Feeds byte `chunks` in sequence and returns extracted raw event strings.
+    fn extract_sse_events(chunks: Vec<&[u8]>) -> Vec<String> {
+        let mut buf = Vec::<u8>::new();
+        let mut events = Vec::new();
+
+        for chunk in chunks {
+            buf.extend_from_slice(chunk);
+            while let Some(sep_start) = find_double_newline(&buf) {
+                let raw_event = buf[..sep_start].to_vec();
+                let sep_len = if sep_start + 3 < buf.len() && buf[sep_start] == b'\r'
+                    && buf[sep_start + 1] == b'\n'
+                    && buf[sep_start + 2] == b'\r'
+                    && buf[sep_start + 3] == b'\n'
+                {
+                    4
+                } else {
+                    2
+                };
+                buf.drain(..sep_start + sep_len);
+
+                if raw_event.is_empty() || raw_event.iter().all(|&b| b == b'\n' || b == b'\r') {
+                    continue;
+                }
+                events.push(String::from_utf8_lossy(&raw_event).to_string());
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn sse_extract_single_event() {
+        let events = extract_sse_events(vec![
+            b"event: a\ndata: hello\n\n",
+        ]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("event: a"));
+        assert!(events[0].contains("data: hello"));
+    }
+
+    #[test]
+    fn sse_extract_multiple_events() {
+        let events = extract_sse_events(vec![
+            b"event: a\ndata: 1\n\nevent: b\ndata: 2\n\nevent: c\ndata: 3\n\n",
+        ]);
+        assert_eq!(events.len(), 3);
+        assert!(events[0].contains("data: 1"));
+        assert!(events[1].contains("data: 2"));
+        assert!(events[2].contains("data: 3"));
+    }
+
+    #[test]
+    fn sse_extract_chunked() {
+        // Same events but arriving in two chunks, split in the middle
+        let events = extract_sse_events(vec![
+            b"event: a\ndata: 1\n\nevent: b\nda",
+            b"ta: 2\n\nevent: c\ndata: 3\n\n",
+        ]);
+        assert_eq!(events.len(), 3);
+        assert!(events[0].contains("data: 1"));
+        assert!(events[1].contains("data: 2"));
+        assert!(events[2].contains("data: 3"));
+    }
+
+    #[test]
+    fn sse_extract_with_trailing_data_no_separator() {
+        // Partial event at the end (no \n\n) should be left in buffer
+        let events = extract_sse_events(vec![
+            b"event: a\ndata: 1\n\nevent: b\ndata: 2",
+        ]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("data: 1"));
+    }
+
+    #[test]
+    fn sse_extract_with_leading_noise() {
+        // Empty leading event (just whitespace / blank lines before first event)
+        let events = extract_sse_events(vec![
+            b"\n\nevent: a\ndata: 1\n\n",
+        ]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("data: 1"));
+    }
+
+    #[test]
+    fn sse_extract_crlf() {
+        let events = extract_sse_events(vec![
+            b"event: a\r\ndata: 1\r\n\r\nevent: b\r\ndata: 2\r\n\r\n",
+        ]);
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("data: 1"));
+        assert!(events[1].contains("data: 2"));
+        // Verify first raw event still looks correct
+        assert!(events[0].contains("event: a"));
+    }
+
+    #[test]
+    fn sse_extract_crlf_chunked() {
+        let events = extract_sse_events(vec![
+            b"event: a\r\ndata: 1\r\n\r\nevent: b\r\nda",
+            b"ta: 2\r\n\r\n",
+        ]);
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("data: 1"));
+        assert!(events[1].contains("data: 2"));
+    }
+
+    #[test]
+    fn sse_extract_empty_chunk_preserves_buffer() {
+        let events = extract_sse_events(vec![
+            b"event: a\ndata: 1",
+            b"",  // empty chunk, should not affect buffer
+            b"\n\n",
+        ]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("data: 1"));
     }
 }
