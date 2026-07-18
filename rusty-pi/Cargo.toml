@@ -14,3 +14,9 @@ anyhow = "1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 async-trait = "0.1.89"
 futures-util = "0.3.33"
+dummy = "0.12.0"
+diff = "0.1.13"
+similar = "3.1.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

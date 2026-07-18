@@ -12,6 +12,9 @@ use rusty_pi::ai::providers::openai_codex::{OpenAICodexProvider, OPENAI_CODEX_MO
 use rusty_pi::ai::providers::{Model, ProviderApi};
 use rusty_pi::coding_agent::repl::{self, RunConfig};
 use rusty_pi::coding_agent::tools::bash::BashTool;
+use rusty_pi::coding_agent::tools::edit::EditTool;
+use rusty_pi::coding_agent::tools::read::ReadTool;
+use rusty_pi::coding_agent::tools::write::WriteTool;
 
 #[derive(Parser)]
 #[command(name = "rusty-pi", version, about = "Rust rewrite of earendil-works/pi")]
@@ -90,14 +93,17 @@ async fn main() -> anyhow::Result<()> {
 
     let (provider, model) = build_provider(&cli.provider, cli.model.as_deref())?;
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-    let bash_tool = BashTool::new(cwd);
+    let bash_tool = BashTool::new(cwd.clone());
+    let read_tool = ReadTool::new(cwd.clone());
+    let write_tool = WriteTool::new(cwd.clone());
+    let edit_tool = EditTool::new(cwd);
 
     let config = RunConfig {
         prompt: cli.prompt,
         system_prompt: String::new(),
         provider,
         model,
-        tools: vec![Box::new(bash_tool)],
+        tools: vec![Box::new(bash_tool), Box::new(read_tool), Box::new(write_tool), Box::new(edit_tool)],
     };
 
     repl::run(config).await

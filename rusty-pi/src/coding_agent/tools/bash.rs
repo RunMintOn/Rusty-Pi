@@ -5,6 +5,7 @@
 
 use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionMode};
 use crate::ai::types::{Content, Tool};
+use crate::coding_agent::tools::truncate::{truncate_tail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,10 @@ pub struct BashParams {
     pub command: String,
     /// Timeout in seconds (optional, no default timeout).
     pub timeout: Option<u64>,
+    /// Maximum output lines before truncation (default: 2000).
+    pub max_lines: Option<usize>,
+    /// Maximum output bytes before truncation (default: 50 KB).
+    pub max_bytes: Option<usize>,
 }
 
 /// Kill a process by PID using the OS native command.
@@ -60,7 +65,9 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Optionally provide a timeout in seconds."
+        "Execute a bash command in the current working directory. Returns stdout and stderr. \
+Truncates output to last 2000 lines or 50 KB (configurable via max_lines/max_bytes). \
+Optionally provide a timeout in seconds."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -74,6 +81,14 @@ impl Tool for BashTool {
                 "timeout": {
                     "type": "number",
                     "description": "Timeout in seconds (optional, no default timeout)"
+                },
+                "max_lines": {
+                    "type": "number",
+                    "description": "Maximum output lines (optional, default: 2000)"
+                },
+                "max_bytes": {
+                    "type": "number",
+                    "description": "Maximum output bytes (optional, default: 51200 = 50 KB)"
                 }
             },
             "required": ["command"]
@@ -206,14 +221,39 @@ impl AgentTool for BashTool {
             full_output.push_str(&stderr);
         }
 
+        // Apply truncation
+        let max_lines = bash_params.max_lines.unwrap_or(DEFAULT_MAX_LINES);
+        let max_bytes = bash_params.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        let tr = truncate_tail(&full_output, max_lines, max_bytes);
+
+        let mut result_text = tr.content.trim().to_string();
+        if tr.truncated {
+            let start_line = if tr.output_lines < tr.total_lines {
+                tr.total_lines - tr.output_lines + 1
+            } else {
+                1
+            };
+            if tr.truncated_by == "lines" {
+                result_text.push_str(&format!(
+                    "\n\n[Showing lines {}-{} of {}]\n",
+                    start_line, tr.total_lines, tr.total_lines
+                ));
+            } else {
+                result_text.push_str(&format!(
+                    "\n\n[Showing lines {}-{} of {} ({} KB limit)]\n",
+                    start_line, tr.total_lines, tr.total_lines, max_bytes / 1024
+                ));
+            }
+        }
+
         let exit_code = output.status.code();
 
         if let Some(code) = exit_code
             && code != 0 {
-                let text = if full_output.trim().is_empty() {
+                let text = if result_text.is_empty() {
                     format!("Command exited with code {}", code)
                 } else {
-                    format!("{}\n\nCommand exited with code {}", full_output.trim(), code)
+                    format!("{}\n\nCommand exited with code {}", result_text, code)
                 };
                 return Ok(AgentToolResult {
                     content: vec![Content::Text { text }],
@@ -222,14 +262,14 @@ impl AgentTool for BashTool {
                 });
             }
 
+        let final_text = if result_text.is_empty() {
+            "(no output)".into()
+        } else {
+            result_text
+        };
+
         Ok(AgentToolResult {
-            content: vec![Content::Text {
-                text: if full_output.trim().is_empty() {
-                    "(no output)".into()
-                } else {
-                    full_output.trim().to_string()
-                },
-            }],
+            content: vec![Content::Text { text: final_text }],
             details: serde_json::json!({"exit_code": exit_code}),
             ..Default::default()
         })
@@ -339,4 +379,63 @@ mod tests {
         assert!(text.contains("hi"));
         assert!(text.contains("bye"));
     }
+
+    #[tokio::test]
+    async fn truncation_under_limit_returns_full() {
+        let result = tool()
+            .execute(
+                "c6",
+                serde_json::json!({"command": "echo small", "max_lines": 100, "max_bytes": 99999}),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            Content::Text { text } => text.trim(),
+            _ => panic!("Expected text content"),
+        };
+        assert_eq!(text, "small");
+        assert!(!text.contains("Showing lines"), "Should not have truncation message");
+    }
+
+    #[tokio::test]
+    async fn truncation_lines_limit() {
+        // Generate output with many lines using seq, then truncate with max_lines=5
+        let result = tool()
+            .execute(
+                "c7",
+                serde_json::json!({"command": "seq 1 100", "max_lines": 5, "max_bytes": 99999}),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            Content::Text { text } => text,
+            _ => panic!("Expected text content"),
+        };
+        assert!(text.contains("Showing lines"), "Should have truncation message: {}", text);
+        // Last few lines (96-100) should be present
+        assert!(text.contains("96"), "Should contain '96' in output: {}", text);
+        assert!(text.contains("100"), "Should contain '100' in output: {}", text);
+    }
+
+    #[tokio::test]
+    async fn truncation_bytes_limit() {
+        // Generate a line that exceeds the byte limit
+        let result = tool()
+            .execute(
+                "c8",
+                serde_json::json!({"command": "echo short && echo long_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "max_lines": 9999, "max_bytes": 30}),
+                None,
+            )
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            Content::Text { text } => text,
+            _ => panic!("Expected text content"),
+        };
+        assert!(text.contains("KB limit") || text.contains("Showing lines"), "Should have truncation message: {}", text);
+        // First line "short" is part of the last lines kept, so it should be there or truncated
+    }
+
 }
