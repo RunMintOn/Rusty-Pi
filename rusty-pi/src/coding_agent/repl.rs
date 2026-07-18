@@ -1,9 +1,8 @@
 //! REPL — Read-Eval-Print Loop for interactive chat.
 
-use crate::agent::engine::{Agent, AbortFlag};
-use crate::agent::types::AgentTool;
-use crate::ai::providers::{Model, ProviderApi};
+use crate::agent::engine::AbortFlag;
 use crate::ai::types::{AgentMessage, StopReason};
+use crate::coding_agent::prompt_session::PromptSession;
 use anyhow::Result;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,34 +12,27 @@ use std::sync::{Arc, Mutex};
 pub struct RunConfig {
     /// Optional single-shot prompt. If `None`, enters REPL mode.
     pub prompt: Option<String>,
-    /// System prompt to set for the agent.
-    pub system_prompt: String,
-    /// LLM provider to use.
-    pub provider: Box<dyn ProviderApi>,
-    /// Model to use with the provider.
-    pub model: Model,
-    /// Tools to register with the agent.
-    pub tools: Vec<Box<dyn AgentTool>>,
+    /// Session that wraps the agent with prompt template and skill expansion.
+    pub session: PromptSession,
 }
 
 /// Run the CLI with the given configuration.
 pub async fn run(config: RunConfig) -> Result<()> {
-    let mut agent = Agent::new(config.provider, config.model);
-    agent.set_system_prompt(config.system_prompt);
-
-    for tool in config.tools {
-        agent.add_tool(tool);
-    }
+    let mut session = config.session;
 
     match config.prompt {
-        Some(prompt) => run_single_shot(&mut agent, &prompt).await,
-        None => run_repl(&mut agent).await,
+        Some(prompt) => run_single_shot(&mut session, &prompt).await,
+        None => run_repl(&mut session).await,
     }
 }
 
 /// Helper: run an agent with Ctrl+C abort support.
 /// Returns `true` if the run was aborted, `false` otherwise.
-async fn run_with_abort(agent: &mut Agent, prompt: &str) -> bool {
+async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
+    // Expand templates/skills before borrowing agent
+    let expanded = session.expand(prompt);
+
+    let agent = session.agent();
     let abort_flag: AbortFlag = Arc::new(AtomicBool::new(false));
     agent.set_abort_flag(abort_flag.clone());
 
@@ -52,7 +44,7 @@ async fn run_with_abort(agent: &mut Agent, prompt: &str) -> bool {
         buf_cb.lock().unwrap().push_str(delta);
     });
 
-    let run_future = agent.run(prompt);
+    let run_future = agent.run(&expanded);
     tokio::pin!(run_future);
 
     let was_aborted = tokio::select! {
@@ -65,8 +57,6 @@ async fn run_with_abort(agent: &mut Agent, prompt: &str) -> bool {
         _ = tokio::signal::ctrl_c() => {
             println!("\n[interrupt: aborting...]");
             abort_flag.store(true, Ordering::SeqCst);
-            // tokio::select! drops run_future automatically when this branch wins,
-            // which cancels the in-flight agent loop and closes the stream receiver.
             abort_flag.store(false, Ordering::SeqCst);
             true
         }
@@ -84,8 +74,8 @@ async fn run_with_abort(agent: &mut Agent, prompt: &str) -> bool {
 }
 
 /// Run a single prompt and print the response, then exit.
-async fn run_single_shot(agent: &mut Agent, prompt: &str) -> Result<()> {
-    run_with_abort(agent, prompt).await;
+async fn run_single_shot(session: &mut PromptSession, prompt: &str) -> Result<()> {
+    run_with_abort(session, prompt).await;
     Ok(())
 }
 
@@ -95,13 +85,13 @@ async fn run_single_shot(agent: &mut Agent, prompt: &str) -> Result<()> {
 /// The agent streams the response token-by-token. Type `/exit` or `/quit` to
 /// leave the loop. Ctrl+C at the prompt exits the REPL; Ctrl+C during agent
 /// execution aborts the current round and returns to the prompt.
-async fn run_repl(agent: &mut Agent) -> Result<()> {
+async fn run_repl(session: &mut PromptSession) -> Result<()> {
     println!("rusty-pi REPL (type '/exit' to quit)\n");
 
     let mut stdout = io::stdout();
 
     loop {
-        // Read a line from stdin asynchronously (spawn_blocking to avoid blocking the reactor)
+        // Read a line from stdin asynchronously
         let stdin = io::stdin();
         let line_future = tokio::task::spawn_blocking(move || {
             let mut line = String::new();
@@ -133,9 +123,10 @@ async fn run_repl(agent: &mut Agent) -> Result<()> {
             break;
         }
 
-        let aborted = run_with_abort(agent, &line).await;
+        let aborted = run_with_abort(session, &line).await;
 
         if !aborted {
+            let agent = session.agent();
             let msgs = agent.messages().await;
             if let Some(AgentMessage::Assistant(a)) = msgs.last()
                 && a.stop_reason == StopReason::Error
