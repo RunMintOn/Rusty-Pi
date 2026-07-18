@@ -573,4 +573,62 @@ mod tests {
         let loaded = JsonlSessionStorage::open(file_path).await.unwrap();
         assert_eq!(loaded.get_label("e1").await, None);
     }
+
+    #[tokio::test]
+    async fn roundtrip_create_append_close_reopen() {
+        // Create a JSONL session, append messages, drop the handle,
+        // reopen from the same file, and verify all messages are recovered.
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("session.jsonl").to_string_lossy().to_string();
+
+        // Create
+        let mut storage = JsonlSessionStorage::create(
+            file_path.clone(),
+            JsonlSessionCreateOptions {
+                session_id: "roundtrip-test".into(),
+                cwd: dir.path().to_string_lossy().to_string(),
+                parent_session_path: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Append three messages
+        storage
+            .append_entry(msg_entry("m1", None, user_msg("first")))
+            .await
+            .unwrap();
+        storage
+            .append_entry(msg_entry("m2", Some("m1"), assistant_msg("second")))
+            .await
+            .unwrap();
+        storage
+            .append_entry(msg_entry("m3", Some("m2"), user_msg("third")))
+            .await
+            .unwrap();
+
+        // Close by dropping the handle (let it go out of scope)
+        drop(storage);
+
+        // Reopen from the same file
+        let loaded = JsonlSessionStorage::open(file_path).await.unwrap();
+
+        // Verify all messages are recovered in order
+        let entries = loaded.get_entries().await;
+        assert_eq!(entries.len(), 3, "should have 3 entries after reopen");
+        assert_eq!(entries[0].id(), "m1");
+        assert_eq!(entries[1].id(), "m2");
+        assert_eq!(entries[2].id(), "m3");
+
+        // Verify leaf_id points to the last entry
+        assert_eq!(loaded.get_leaf_id().await, Some("m3".into()));
+
+        // Verify message content recovered
+        if let SessionTreeEntry::Message(msg) = &entries[2] {
+            assert!(matches!(msg.message, AgentMessage::User(_)), "expected User variant");
+        } else {
+            panic!("expected message entry");
+        }
+    }
 }

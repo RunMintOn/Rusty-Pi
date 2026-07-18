@@ -71,12 +71,12 @@ impl BashTool {
 
     /// Get the current cached working directory.
     fn cached_cwd(&self) -> PathBuf {
-        self.shared_cwd.read().unwrap().clone()
+        self.shared_cwd.read().expect("shared_cwd lock poisoned").clone()
     }
 
     /// Update the shared CWD after detecting a change.
     fn update_cwd(&self, new_cwd: PathBuf) {
-        *self.shared_cwd.write().unwrap() = new_cwd;
+        *self.shared_cwd.write().expect("shared_cwd lock poisoned") = new_cwd;
     }
 
     /// Detect CWD marker in output and update shared_cwd. Returns cleaned output (without marker).

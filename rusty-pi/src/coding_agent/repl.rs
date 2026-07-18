@@ -82,27 +82,39 @@ async fn run_single_shot(session: &mut PromptSession, prompt: &str) -> Result<()
     Ok(())
 }
 
+/// Resolve history path given a home directory string.
+fn history_path_for_home(home: &str) -> PathBuf {
+    PathBuf::from(home).join(".pi").join("agent").join("repl-history.txt")
+}
+
 /// Get the REPL history file path.
 fn history_path() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".pi").join("agent").join("repl-history.txt")
+    history_path_for_home(&home)
+}
+
+/// Build the /help message text.
+fn help_text() -> String {
+    let mut out = String::new();
+    out.push_str("\n");
+    out.push_str("  Commands:\n");
+    out.push_str("    /exit, /quit   Exit the REPL\n");
+    out.push_str("    /help          Show this help message\n");
+    out.push_str("\n");
+    out.push_str("  Tips:\n");
+    out.push_str("    - Up/down arrows navigate command history\n");
+    out.push_str("    - Ctrl+C at prompt exits\n");
+    out.push_str("    - Ctrl+C during agent run aborts the current round\n");
+    out.push_str("    - Type any text to chat with the agent\n");
+    out.push_str("\n");
+    out
 }
 
 /// Print the /help message.
 fn print_help() {
-    println!();
-    println!("  Commands:");
-    println!("    /exit, /quit   Exit the REPL");
-    println!("    /help          Show this help message");
-    println!();
-    println!("  Tips:");
-    println!("    - Up/down arrows navigate command history");
-    println!("    - Ctrl+C at prompt exits");
-    println!("    - Ctrl+C during agent run aborts the current round");
-    println!("    - Type any text to chat with the agent");
-    println!();
+    print!("{}", help_text());
 }
 
 /// Enter an interactive REPL loop.
@@ -178,4 +190,42 @@ async fn run_repl(session: &mut PromptSession) -> Result<()> {
     let _ = rl.append_history(&hist_path);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_path_uses_home_env() {
+        let path = history_path_for_home("/home/user");
+        assert_eq!(
+            path,
+            PathBuf::from("/home/user/.pi/agent/repl-history.txt")
+        );
+    }
+
+    #[test]
+    fn history_path_handles_trailing_slash() {
+        let path = history_path_for_home("/home/user/");
+        assert_eq!(
+            path,
+            PathBuf::from("/home/user/.pi/agent/repl-history.txt")
+        );
+    }
+
+    #[test]
+    fn help_text_contains_commands() {
+        let text = help_text();
+        assert!(text.contains("/exit"));
+        assert!(text.contains("/quit"));
+        assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn help_text_contains_tips() {
+        let text = help_text();
+        assert!(text.contains("Up/down arrows"));
+        assert!(text.contains("Ctrl+C"));
+    }
 }

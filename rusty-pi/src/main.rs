@@ -293,11 +293,11 @@ async fn main() -> anyhow::Result<()> {
     repl::run(config).await
 }
 
-/// List available sessions and exit.
-async fn list_sessions(sessions_dir: &PathBuf) -> anyhow::Result<()> {
+/// Build a formatted session listing string. Returns "No sessions found." or
+/// "Available sessions:\n  {id} | created: {created_at} | path: {path}\n...".
+async fn format_session_list(sessions_dir: &PathBuf) -> anyhow::Result<String> {
     if !sessions_dir.exists() {
-        println!("No sessions directory found at: {}", sessions_dir.display());
-        return Ok(());
+        return Ok(format!("No sessions directory found at: {}", sessions_dir.display()));
     }
 
     let mut read_dir = tokio::fs::read_dir(sessions_dir).await?;
@@ -323,14 +323,21 @@ async fn list_sessions(sessions_dir: &PathBuf) -> anyhow::Result<()> {
     sessions.sort_by(|a, b| b.1.cmp(&a.1));
 
     if sessions.is_empty() {
-        println!("No sessions found.");
+        Ok("No sessions found.".into())
     } else {
-        println!("Available sessions:");
+        let mut out = "Available sessions:".to_string();
         for (id, created_at, path) in &sessions {
-            println!("  {} | created: {} | path: {}", id, created_at, path);
+            use std::fmt::Write;
+            write!(&mut out, "\n  {} | created: {} | path: {}", id, created_at, path).unwrap();
         }
+        Ok(out)
     }
+}
 
+/// List available sessions and exit (thin wrapper that prints).
+async fn list_sessions(sessions_dir: &PathBuf) -> anyhow::Result<()> {
+    let formatted = format_session_list(sessions_dir).await?;
+    println!("{}", formatted);
     Ok(())
 }
 
@@ -422,4 +429,96 @@ fn get_agent_dir() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".pi").join("agent")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // ── Config deserialization (Ticket 16) ─────────────────────────────────
+
+    #[test]
+    fn config_parses_valid_toml() {
+        let toml_str = "\n            default_provider = \"deepseek\"\n            default_model = \"deepseek-v4-flash\"\n        ";
+        let config: RustyPiConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.default_model.as_deref(), Some("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn config_empty_toml_returns_defaults() {
+        let config: RustyPiConfig = toml::from_str("").unwrap();
+        assert!(config.default_provider.is_none());
+        assert!(config.default_model.is_none());
+        assert!(config.prompt_paths.is_none());
+        assert!(config.skill_paths.is_none());
+    }
+
+    #[test]
+    fn config_partial_toml() {
+        let toml_str = "\n            prompt_paths = [\"/my/templates\"]\n        ";
+        let config: RustyPiConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.default_provider.is_none());
+        assert!(config.prompt_paths.is_some());
+        let paths = config.prompt_paths.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "/my/templates");
+    }
+
+    // ── Session listing (Ticket 14) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_empty_dir() {
+        let dir = tempdir().unwrap();
+        let result = format_session_list(&dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(result, "No sessions found.");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_non_existent_dir() {
+        let path = PathBuf::from("/tmp/__rusty_pi_test_nonexistent__");
+        let result = format_session_list(&path).await.unwrap();
+        assert!(result.starts_with("No sessions directory found at"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_with_one_session() {
+        let dir = tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        tokio::fs::create_dir_all(&sessions_dir).await.unwrap();
+
+        // Create a real JSONL session file
+        let file_path = sessions_dir.join("test-session.jsonl");
+        let _storage = JsonlSessionStorage::create(
+            file_path.to_string_lossy().to_string(),
+            JsonlSessionCreateOptions {
+                session_id: "test-session-1".into(),
+                cwd: dir.path().to_string_lossy().to_string(),
+                parent_session_path: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = format_session_list(&sessions_dir).await.unwrap();
+        assert!(result.starts_with("Available sessions:"));
+        assert!(result.contains("test-session-1"));
+        assert!(result.contains("| created:"));
+        assert!(result.contains("| path:"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_ignores_non_jsonl_files() {
+        let dir = tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        tokio::fs::create_dir_all(&sessions_dir).await.unwrap();
+
+        // Create a .txt file that should be ignored
+        tokio::fs::write(sessions_dir.join("notes.txt"), "hello").await.unwrap();
+
+        let result = format_session_list(&sessions_dir).await.unwrap();
+        assert_eq!(result, "No sessions found.");
+    }
 }

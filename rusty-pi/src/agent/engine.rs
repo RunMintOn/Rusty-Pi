@@ -314,7 +314,7 @@ mod tests {
     use crate::ai::mock::{MockProvider, MockStep};
     use crate::ai::providers::Model;
     use async_trait::async_trait;
-use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, RwLock};
 
     struct EchoTool;
 

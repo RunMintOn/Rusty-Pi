@@ -67,7 +67,7 @@ impl WriteTool {
     }
 
     fn cwd(&self) -> String {
-        self.shared_cwd.read().unwrap().to_string_lossy().to_string()
+        self.shared_cwd.read().expect("shared_cwd lock poisoned").to_string_lossy().to_string()
     }
 }
 
