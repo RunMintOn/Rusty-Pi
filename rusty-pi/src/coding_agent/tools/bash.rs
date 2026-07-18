@@ -9,7 +9,8 @@ use crate::coding_agent::tools::truncate::{truncate_tail, DEFAULT_MAX_BYTES, DEF
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::time::Duration;
@@ -51,18 +52,53 @@ fn kill_process(pid: Option<u32>) {
     }
 }
 
+/// Marker used to detect CWD changes after bash execution.
+const CWD_MARKER: &str = "__RUSTY_PI_PWD__";
+
 /// The bash tool — executes shell commands.
 pub struct BashTool {
-    /// Working directory for command execution.
-    cwd: String,
+    /// Shared working directory for command execution.
+    shared_cwd: Arc<RwLock<PathBuf>>,
     /// Optional callback for streaming output as it arrives.
     output_cb: Mutex<Option<OutputCallback>>,
 }
 
 impl BashTool {
-    /// Create a new bash tool that executes commands in `cwd`.
-    pub fn new(cwd: String) -> Self {
-        Self { cwd, output_cb: Mutex::new(None) }
+    /// Create a new bash tool that executes commands in the shared working directory.
+    pub fn new(shared_cwd: Arc<RwLock<PathBuf>>) -> Self {
+        Self { shared_cwd, output_cb: Mutex::new(None) }
+    }
+
+    /// Get the current cached working directory.
+    fn cached_cwd(&self) -> PathBuf {
+        self.shared_cwd.read().unwrap().clone()
+    }
+
+    /// Update the shared CWD after detecting a change.
+    fn update_cwd(&self, new_cwd: PathBuf) {
+        *self.shared_cwd.write().unwrap() = new_cwd;
+    }
+
+    /// Detect CWD marker in output and update shared_cwd. Returns cleaned output (without marker).
+    fn extract_cwd_and_clean_output(&self, output: &str) -> String {
+        let marker_prefix = format!("{}:", CWD_MARKER);
+        let mut lines: Vec<&str> = output.lines().collect();
+
+        // Find the LAST line with the marker (most recent PWD)
+        let marker_pos = lines.iter().rposition(|l| l.trim().starts_with(&marker_prefix));
+
+        if let Some(pos) = marker_pos {
+            let marker_line = lines[pos].trim();
+            if let Some(cwd_str) = marker_line.strip_prefix(&marker_prefix) {
+                let cwd_str = cwd_str.trim();
+                if !cwd_str.is_empty() {
+                    self.update_cwd(PathBuf::from(cwd_str));
+                }
+            }
+            lines.remove(pos);
+        }
+
+        lines.join("\n")
     }
 
     /// Register a callback invoked for each chunk of stdout/stderr as it arrives.
@@ -130,18 +166,28 @@ impl AgentTool for BashTool {
     ) -> anyhow::Result<AgentToolResult> {
         let bash_params: BashParams = serde_json::from_value(params)?;
 
+        // Read current shared CWD
+        let current_cwd = self.cached_cwd();
+
+        // Build command with CWD detection appended
+        let detect_cmd = format!(
+            "{}; echo {}:$(pwd)",
+            bash_params.command,
+            CWD_MARKER,
+        );
+
         // Build and spawn the command
         let mut cmd = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
-            c.arg("/C").arg(&bash_params.command);
+            c.arg("/C").arg(&detect_cmd);
             c
         } else {
             let mut c = Command::new("sh");
-            c.arg("-c").arg(&bash_params.command);
+            c.arg("-c").arg(&detect_cmd);
             c
         };
 
-        cmd.current_dir(&self.cwd)
+        cmd.current_dir(&current_cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -259,6 +305,9 @@ impl AgentTool for BashTool {
         let exit_status = child.wait().await?;
         let exit_code = exit_status.code();
 
+        // Extract CWD marker from output and update shared CWD
+        let cleaned_output = self.extract_cwd_and_clean_output(&full_output);
+
         if timed_out {
             return Ok(AgentToolResult {
                 content: vec![Content::Text {
@@ -272,7 +321,7 @@ impl AgentTool for BashTool {
         // Apply truncation
         let max_lines = bash_params.max_lines.unwrap_or(DEFAULT_MAX_LINES);
         let max_bytes = bash_params.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-        let tr = truncate_tail(&full_output, max_lines, max_bytes);
+        let tr = truncate_tail(&cleaned_output, max_lines, max_bytes);
 
         let mut result_text = tr.content.trim().to_string();
         if tr.truncated {
@@ -327,12 +376,10 @@ mod tests {
     use super::*;
 
     fn tool() -> BashTool {
-        BashTool::new(
-            std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .to_string(),
-        )
+        let shared_cwd = Arc::new(RwLock::new(
+            std::env::current_dir().unwrap()
+        ));
+        BashTool::new(shared_cwd)
     }
 
     #[tokio::test]
@@ -485,18 +532,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_cwd_not_found() {
-        let tool = BashTool::new("/nonexistent/path/that/does/not/exist".into());
+    async fn bash_cwd_persists_across_calls() {
+        // Use a temp dir so we can cd into it
+        let tmp = tempfile::tempdir().unwrap();
+        let subdir = tmp.path().join("sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let shared_cwd = Arc::new(RwLock::new(tmp.path().to_path_buf()));
+        let tool = BashTool::new(shared_cwd.clone());
+
+        // First call: cd into sub and pwd
         let result = tool
-            .execute("c9", serde_json::json!({"command": "echo hi"}), None)
-            .await;
-        assert!(result.is_err(), "Should error when cwd does not exist");
-        let err = result.unwrap_err().to_string();
-        // The error should mention the directory or no such file
-        assert!(
-            err.contains("No such file") || err.contains("nicht gefunden") || err.contains("nonexistent") || err.contains("path"),
-            "Expected error mentioning directory issue, got: {}",
-            err
-        );
+            .execute("c1", serde_json::json!({"command": "cd sub && pwd"}), None)
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            Content::Text { text } => text.trim(),
+            _ => panic!("Expected text content"),
+        };
+        assert!(text.ends_with("/sub"), "Expected pwd to end with /sub, got: {}", text);
+
+        // Verify shared_cwd was updated
+        let cwd_after = shared_cwd.read().unwrap().clone();
+        assert!(cwd_after.ends_with("sub"), "Expected cwd to end with 'sub', got: {:?}", cwd_after);
+
+        // Second call: pwd (should now be in sub)
+        let result2 = tool
+            .execute("c2", serde_json::json!({"command": "pwd"}), None)
+            .await
+            .unwrap();
+        let text2 = match &result2.content[0] {
+            Content::Text { text } => text.trim(),
+            _ => panic!("Expected text content"),
+        };
+        assert!(text2.ends_with("/sub"), "Second pwd should show sub, got: {}", text2);
+
+        // Third call: cd .. and pwd
+        let result3 = tool
+            .execute("c3", serde_json::json!({"command": "cd .. && pwd"}), None)
+            .await
+            .unwrap();
+        let text3 = match &result3.content[0] {
+            Content::Text { text } => text.trim(),
+            _ => panic!("Expected text content"),
+        };
+        assert_eq!(text3, tmp.path().to_string_lossy(), "Should go back to tmp");
     }
 }

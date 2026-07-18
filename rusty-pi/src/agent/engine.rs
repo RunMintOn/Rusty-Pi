@@ -109,6 +109,11 @@ impl Agent {
         &self.session
     }
 
+    /// Replace the session backing this agent (e.g., with a JSONL-persisted session).
+    pub fn set_session(&mut self, session: Session) {
+        self.session = session;
+    }
+
     fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -309,6 +314,7 @@ mod tests {
     use crate::ai::mock::{MockProvider, MockStep};
     use crate::ai::providers::Model;
     use async_trait::async_trait;
+use std::sync::{Arc, RwLock};
 
     struct EchoTool;
 
@@ -404,8 +410,9 @@ mod tests {
             MockStep::Text("Done".into()),
         ]);
         let mut agent = Agent::new(Box::new(mock), make_model());
+        let shared_cwd = Arc::new(RwLock::new(std::env::current_dir().unwrap()));
         agent.add_tool(Box::new(crate::coding_agent::tools::bash::BashTool::new(
-            std::env::current_dir().unwrap().to_string_lossy().to_string(),
+            shared_cwd,
         )));
         agent.run("Run bash").await.unwrap();
         let msgs = agent.messages().await;

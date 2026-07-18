@@ -10,10 +10,8 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 /// Parameters for the write tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -60,12 +58,16 @@ where
 
 /// The write tool — writes content to files.
 pub struct WriteTool {
-    cwd: String,
+    shared_cwd: Arc<RwLock<PathBuf>>,
 }
 
 impl WriteTool {
-    pub fn new(cwd: String) -> Self {
-        Self { cwd }
+    pub fn new(shared_cwd: Arc<RwLock<PathBuf>>) -> Self {
+        Self { shared_cwd }
+    }
+
+    fn cwd(&self) -> String {
+        self.shared_cwd.read().unwrap().to_string_lossy().to_string()
     }
 }
 
@@ -112,7 +114,7 @@ impl AgentTool for WriteTool {
         let write_params: WriteParams = serde_json::from_value(params)
             .map_err(|e| anyhow::anyhow!("Invalid write parameters: {}", e))?;
 
-        let absolute_path = resolve_to_cwd(&write_params.path, &self.cwd);
+        let absolute_path = resolve_to_cwd(&write_params.path, &self.cwd());
         let path = Path::new(&absolute_path);
 
         // Use the mutation queue to serialize writes to this file
@@ -167,8 +169,8 @@ mod tests {
     /// Create a WriteTool with a temp directory as cwd.
     async fn tool_and_temp() -> (WriteTool, Arc<TokioMutex<tempfile::TempDir>>) {
         let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_string_lossy().to_string();
-        let tool = WriteTool::new(cwd);
+        let shared_cwd = Arc::new(RwLock::new(tmp.path().to_path_buf()));
+        let tool = WriteTool::new(shared_cwd);
         let tmp_arc = Arc::new(TokioMutex::new(tmp));
         (tool, tmp_arc)
     }

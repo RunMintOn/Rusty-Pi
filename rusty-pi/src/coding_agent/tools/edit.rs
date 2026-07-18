@@ -9,7 +9,8 @@ use crate::coding_agent::tools::write::with_file_mutation_queue;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 // ── Parameters ──────────────────────────────────────────────────────────────
 
@@ -427,12 +428,16 @@ fn prepare_edit_arguments(params: &serde_json::Value) -> Result<EditParams, Stri
 
 /// The edit tool — applies exact text replacements to files.
 pub struct EditTool {
-    cwd: String,
+    shared_cwd: Arc<RwLock<PathBuf>>,
 }
 
 impl EditTool {
-    pub fn new(cwd: String) -> Self {
-        Self { cwd }
+    pub fn new(shared_cwd: Arc<RwLock<PathBuf>>) -> Self {
+        Self { shared_cwd }
+    }
+
+    fn cwd(&self) -> String {
+        self.shared_cwd.read().unwrap().to_string_lossy().to_string()
     }
 }
 
@@ -505,7 +510,7 @@ impl AgentTool for EditTool {
         let absolute_path = if Path::new(&edit_params.path).is_absolute() {
             edit_params.path.clone()
         } else {
-            Path::new(&self.cwd).join(&edit_params.path).to_string_lossy().to_string()
+            Path::new(&self.cwd()).join(&edit_params.path).to_string_lossy().to_string()
         };
         let path_buf = Path::new(&absolute_path).to_path_buf();
 
@@ -591,8 +596,8 @@ mod tests {
 
     async fn tool_and_temp() -> (EditTool, Arc<TokioMutex<tempfile::TempDir>>) {
         let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_string_lossy().to_string();
-        let tool = EditTool::new(cwd);
+        let shared_cwd = Arc::new(RwLock::new(tmp.path().to_path_buf()));
+        let tool = EditTool::new(shared_cwd);
         let tmp_arc = Arc::new(TokioMutex::new(tmp));
         (tool, tmp_arc)
     }

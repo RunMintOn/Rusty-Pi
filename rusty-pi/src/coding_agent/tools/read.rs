@@ -12,7 +12,8 @@ use crate::coding_agent::tools::truncate::{format_size, truncate_head, DEFAULT_M
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 /// Parameters for the read tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -118,12 +119,16 @@ async fn read_image(path: &Path) -> anyhow::Result<Vec<Content>> {
 
 /// The read tool — reads file contents.
 pub struct ReadTool {
-    cwd: String,
+    shared_cwd: Arc<RwLock<PathBuf>>,
 }
 
 impl ReadTool {
-    pub fn new(cwd: String) -> Self {
-        Self { cwd }
+    pub fn new(shared_cwd: Arc<RwLock<PathBuf>>) -> Self {
+        Self { shared_cwd }
+    }
+
+    fn cwd(&self) -> String {
+        self.shared_cwd.read().unwrap().to_string_lossy().to_string()
     }
 }
 
@@ -186,7 +191,7 @@ impl AgentTool for ReadTool {
             }
 
         // Resolve path with macOS tolerance fallbacks
-        let absolute_path = resolve_read_path(&read_params.path, &self.cwd);
+        let absolute_path = resolve_read_path(&read_params.path, &self.cwd());
         let path = Path::new(&absolute_path);
 
         // Check if file exists (resolve_read_path already tried fallbacks,
@@ -308,18 +313,16 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     fn tool() -> ReadTool {
-        ReadTool::new(
-            std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .to_string(),
-        )
+        let shared_cwd = Arc::new(RwLock::new(
+            std::env::current_dir().unwrap()
+        ));
+        ReadTool::new(shared_cwd)
     }
 
     async fn tool_and_temp() -> (ReadTool, Arc<TokioMutex<tempfile::TempDir>>) {
         let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_string_lossy().to_string();
-        let tool = ReadTool::new(cwd);
+        let shared_cwd = Arc::new(RwLock::new(tmp.path().to_path_buf()));
+        let tool = ReadTool::new(shared_cwd);
         let tmp_arc = Arc::new(TokioMutex::new(tmp));
         (tool, tmp_arc)
     }

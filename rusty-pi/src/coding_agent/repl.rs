@@ -4,7 +4,10 @@ use crate::agent::engine::AbortFlag;
 use crate::ai::types::{AgentMessage, StopReason};
 use crate::coding_agent::prompt_session::PromptSession;
 use anyhow::Result;
-use std::io::{self, BufRead, Write};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +82,29 @@ async fn run_single_shot(session: &mut PromptSession, prompt: &str) -> Result<()
     Ok(())
 }
 
+/// Get the REPL history file path.
+fn history_path() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".pi").join("agent").join("repl-history.txt")
+}
+
+/// Print the /help message.
+fn print_help() {
+    println!();
+    println!("  Commands:");
+    println!("    /exit, /quit   Exit the REPL");
+    println!("    /help          Show this help message");
+    println!();
+    println!("  Tips:");
+    println!("    - Up/down arrows navigate command history");
+    println!("    - Ctrl+C at prompt exits");
+    println!("    - Ctrl+C during agent run aborts the current round");
+    println!("    - Type any text to chat with the agent");
+    println!();
+}
+
 /// Enter an interactive REPL loop.
 ///
 /// Displays a `> ` prompt. Each line is sent to the agent as a user message.
@@ -86,44 +112,55 @@ async fn run_single_shot(session: &mut PromptSession, prompt: &str) -> Result<()
 /// leave the loop. Ctrl+C at the prompt exits the REPL; Ctrl+C during agent
 /// execution aborts the current round and returns to the prompt.
 async fn run_repl(session: &mut PromptSession) -> Result<()> {
-    println!("rusty-pi REPL (type '/exit' to quit)\n");
+    let mut rl = DefaultEditor::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create REPL editor: {}", e))?;
 
-    let mut stdout = io::stdout();
+    // Load history
+    let hist_path = history_path();
+    if let Some(parent) = hist_path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = rl.load_history(&hist_path);
+
+    println!("rusty-pi REPL (type '/exit' to quit, '/help' for help)\n");
 
     loop {
-        // Read a line from stdin asynchronously
-        let stdin = io::stdin();
-        let line_future = tokio::task::spawn_blocking(move || {
-            let mut line = String::new();
-            stdin.lock().read_line(&mut line).ok()?;
-            let trimmed = line.trim().to_string();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
-        });
-
-        print!("> ");
-        stdout.flush()?;
-
-        let line = tokio::select! {
-            result = line_future => {
-                match result.unwrap_or(None) {
-                    Some(line) => line,
-                    None => {
-                        println!();
-                        break;
-                    }
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
+        let line = match rl.readline("> ") {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl+C at prompt → exit
                 println!("^C");
+                break;
+            }
+            Err(ReadlineError::Eof) => {
+                // Ctrl+D → exit
+                println!();
+                break;
+            }
+            Err(e) => {
+                eprintln!("[error] Input error: {}", e);
                 break;
             }
         };
 
-        if line == "/exit" || line == "/quit" {
-            break;
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
         }
 
-        let aborted = run_with_abort(session, &line).await;
+        let _ = rl.add_history_entry(&trimmed);
+
+        // Handle built-in commands
+        match trimmed.as_str() {
+            "/exit" | "/quit" => break,
+            "/help" => {
+                print_help();
+                continue;
+            }
+            _ => {}
+        }
+
+        let aborted = run_with_abort(session, &trimmed).await;
 
         if !aborted {
             let agent = session.agent();
@@ -136,6 +173,9 @@ async fn run_repl(session: &mut PromptSession) -> Result<()> {
         }
         println!();
     }
+
+    // Save history
+    let _ = rl.append_history(&hist_path);
 
     Ok(())
 }

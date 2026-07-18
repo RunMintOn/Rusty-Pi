@@ -11,12 +11,13 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::engine::Agent;
+use crate::agent::session::session::Session;
 use crate::agent::types::AgentTool;
 use crate::ai::providers::{Model, ProviderApi};
 
 use super::prompt_templates::{self, PromptTemplate};
 use super::skills::{self, Skill};
-use super::system_prompt::{self, BuildSystemPromptOptions};
+use super::system_prompt::{self, BuildSystemPromptOptions, ContextFile};
 
 /// Thin session layer that wraps an agent with prompt expansion.
 pub struct PromptSession {
@@ -32,6 +33,9 @@ impl PromptSession {
     ///
     /// `agent_dir` is the config directory for global resources (e.g., `~/.pi/agent/`).
     /// `templates_dirs` and `skills_dirs` are explicit paths for templates and skills.
+    /// `session` is an optional pre-configured session (e.g., JSONL-backed).
+    /// If `None`, an in-memory session is used.
+    /// `context_files` are pre-loaded project context files injected into the system prompt.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Box<dyn ProviderApi>,
@@ -42,8 +46,13 @@ impl PromptSession {
         template_paths: Vec<PathBuf>,
         skill_paths: Vec<PathBuf>,
         include_defaults: bool,
+        session: Option<Session>,
+        context_files: Vec<ContextFile>,
     ) -> Self {
         let mut agent = Agent::new(provider, model);
+        if let Some(s) = session {
+            agent.set_session(s);
+        }
         for tool in tools {
             agent.add_tool(tool);
         }
@@ -72,6 +81,7 @@ impl PromptSession {
             selected_tools: Vec::new(), // Will be set later via set_system_prompt with full config
             cwd: cwd.clone(),
             skills: loaded_skills.clone(),
+            context_files,
             ..Default::default()
         });
         agent.set_system_prompt(prompt);
@@ -88,6 +98,16 @@ impl PromptSession {
     /// Access the underlying agent for event subscription etc.
     pub fn agent(&mut self) -> &mut Agent {
         &mut self.agent
+    }
+
+    /// Access the underlying session.
+    pub fn session(&self) -> &Session {
+        self.agent.session()
+    }
+
+    /// Set the session backing the agent (e.g., a JSONL-persisted session).
+    pub fn set_session(&mut self, session: Session) {
+        self.agent.set_session(session);
     }
 
     /// Get current templates.
@@ -198,6 +218,8 @@ mod tests {
             vec![],
             vec![],
             false, // no defaults
+            None,  // no external session
+            vec![], // no context files
         );
         // Add a template manually
         session.templates.push(PromptTemplate {
