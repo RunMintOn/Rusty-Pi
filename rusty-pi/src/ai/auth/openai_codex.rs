@@ -10,6 +10,7 @@ use sha2::Digest;
 // ---------------------------------------------------------------------------
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+#[allow(dead_code)]
 const AUTH_BASE_URL: &str = "https://auth.openai.com";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -17,6 +18,7 @@ const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/
 const DEVICE_CODE_TIMEOUT_SECS: u64 = 15 * 60;
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const MIN_POLL_INTERVAL_MS: u64 = 1000;
+#[allow(dead_code)]
 const POLL_INCREMENT_MS: u64 = 5000;
 
 /// Credential file path derived from home directory.
@@ -76,10 +78,10 @@ impl CodexCredential {
 
     /// Delete the credential file.
     pub fn delete() -> anyhow::Result<()> {
-        if let Some(path) = credentials_path() {
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
+        if let Some(path) = credentials_path()
+            && path.exists()
+        {
+            std::fs::remove_file(&path)?;
         }
         Ok(())
     }
@@ -111,6 +113,7 @@ fn base64_url_encode(data: &[u8]) -> String {
 
 /// Polling result from the device code flow.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum DevicePollResult {
     Pending,
     Completed { authorization_code: String, code_verifier: String },
@@ -383,7 +386,7 @@ pub async fn browser_login(
     );
 
     // Try to open browser
-    let _ = open_browser(&authorize_url);
+    open_browser(&authorize_url);
 
     // Start local server and wait for callback
     let listener = tokio::net::TcpListener::bind("127.0.0.1:1455").await
@@ -444,19 +447,19 @@ async fn wait_for_callback(
                 let mut request_line = String::new();
                 reader.read_line(&mut request_line).await?;
 
-                if let Some(path) = request_line.split_whitespace().nth(1) {
-                    if let Some(uri) = url::Url::parse(&format!("http://localhost{}", path)).ok() {
-                        // Check state
-                        let state = uri.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
-                        if let Some(ref s) = state && s != expected_state {
-                            let _ = respond(&mut stream, 400, "State mismatch").await;
-                            continue;
-                        }
+                if let Some(path) = request_line.split_whitespace().nth(1)
+                    && let Ok(uri) = url::Url::parse(&format!("http://localhost{}", path))
+                {
+                    // Check state
+                    let state = uri.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+                    if let Some(ref s) = state && s != expected_state {
+                        let _ = respond(&mut stream, 400, "State mismatch").await;
+                        continue;
+                    }
 
-                        if let Some(code) = uri.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string()) {
-                            let _ = respond(&mut stream, 200, "✓ Authentication complete. You can close this window.").await;
-                            return anyhow::Result::Ok(code);
-                        }
+                    if let Some(code) = uri.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string()) {
+                        let _ = respond(&mut stream, 200, "✓ Authentication complete. You can close this window.").await;
+                        return anyhow::Result::Ok(code);
                     }
                 }
                 let _ = respond(&mut stream, 400, "Missing authorization code").await;
@@ -510,10 +513,10 @@ pub async fn resolve_codex_token(
     signal: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> anyhow::Result<String> {
     // 1. Env var
-    if let Ok(token) = std::env::var("OPENAI_CODEX_TOKEN") {
-        if !token.is_empty() {
-            return Ok(token);
-        }
+    if let Ok(token) = std::env::var("OPENAI_CODEX_TOKEN")
+        && !token.is_empty()
+    {
+        return Ok(token);
     }
 
     // 2. Stored credentials
