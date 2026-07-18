@@ -54,7 +54,7 @@ impl Agent {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         Self {
-            session: Session::new(cwd),
+            session: Session::in_memory(cwd),
             tools: Vec::new(),
             provider,
             model,
@@ -101,8 +101,8 @@ impl Agent {
         self.config.system_prompt = prompt;
     }
 
-    pub fn messages(&self) -> Vec<&AgentMessage> {
-        self.session.messages()
+    pub async fn messages(&self) -> Vec<AgentMessage> {
+        self.session.messages().await
     }
 
     pub fn session(&self) -> &Session {
@@ -127,16 +127,12 @@ impl Agent {
             content: MessageContent::Text(prompt.to_string()),
             timestamp: now,
         });
-        self.session.add_message(user_msg);
+        self.session.append_message(user_msg).await
+            .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
 
         for round in 0..=self.config.max_tool_rounds {
             let tool_refs = self.tool_refs();
-            let current_messages: Vec<AgentMessage> = self
-                .session
-                .messages()
-                .into_iter()
-                .cloned()
-                .collect();
+            let current_messages = self.session.messages().await;
 
             let mut rx = self
                 .provider
@@ -163,7 +159,8 @@ impl Agent {
                     error_message: Some("Aborted by user".into()),
                     timestamp: Self::now_ms(),
                 };
-                self.session.add_message(AgentMessage::Assistant(msg));
+                self.session.append_message(AgentMessage::Assistant(msg)).await
+                    .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
                 return Ok(());
             }
 
@@ -194,7 +191,8 @@ impl Agent {
                     error_message: Some("Aborted by user".into()),
                     timestamp: Self::now_ms(),
                 };
-                self.session.add_message(AgentMessage::Assistant(msg));
+                self.session.append_message(AgentMessage::Assistant(msg)).await
+                    .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
                 return Ok(());
             }
 
@@ -224,7 +222,8 @@ impl Agent {
             };
 
             self.session
-                .add_message(AgentMessage::Assistant(response.clone()));
+                .append_message(AgentMessage::Assistant(response.clone())).await
+                .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
 
             match response.stop_reason {
                 StopReason::Stop | StopReason::Length | StopReason::Error | StopReason::Aborted => {
@@ -244,7 +243,8 @@ impl Agent {
                             .execute_tool(&call.id, &call.name, call.arguments.clone())
                             .await
                             .with_context(|| format!("Tool '{}' execution failed", call.name))?;
-                        self.session.add_message(tool_result);
+                        self.session.append_message(tool_result).await
+                            .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
                         if terminate {
                             any_terminate = true;
                         }
@@ -349,7 +349,7 @@ mod tests {
         let mock = MockProvider::text("Hello from mock!");
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.run("Hi there").await.unwrap();
-        let msgs = agent.messages();
+        let msgs = agent.messages().await;
         let last = msgs.last().unwrap();
         match last {
             AgentMessage::Assistant(a) => {
@@ -369,7 +369,7 @@ mod tests {
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.add_tool(Box::new(EchoTool));
         agent.run("Run echo").await.unwrap();
-        let msgs = agent.messages();
+        let msgs = agent.messages().await;
         assert!(msgs.len() >= 4);
         match &msgs[msgs.len() - 2] {
             AgentMessage::ToolResult(tr) => assert_eq!(tr.tool_name, "echo"),
@@ -386,7 +386,7 @@ mod tests {
         let mock = MockProvider::new(vec![MockStep::Error("API error".into())]);
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.run("Trigger error").await.unwrap();
-        let msgs = agent.messages();
+        let msgs = agent.messages().await;
         let last = msgs.last().unwrap();
         match last {
             AgentMessage::Assistant(a) => {
@@ -408,7 +408,7 @@ mod tests {
             std::env::current_dir().unwrap().to_string_lossy().to_string(),
         )));
         agent.run("Run bash").await.unwrap();
-        let msgs = agent.messages();
+        let msgs = agent.messages().await;
         assert!(msgs.len() >= 4);
         match &msgs[msgs.len() - 2] {
             AgentMessage::ToolResult(tr) => assert_eq!(tr.tool_name, "bash"),
@@ -431,7 +431,7 @@ mod tests {
         agent.add_tool(Box::new(EchoTool));
         agent.run("Do two things").await.unwrap();
         assert_eq!(
-            agent.messages().iter().filter(|m| matches!(m, AgentMessage::ToolResult(_))).count(),
+            agent.messages().await.iter().filter(|m| matches!(m, AgentMessage::ToolResult(_))).count(),
             2
         );
     }
@@ -465,7 +465,7 @@ mod tests {
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.add_tool(Box::new(EchoTool));
         agent.run("Run echo").await.unwrap();
-        let msgs = agent.messages();
+        let msgs = agent.messages().await;
         // Only 2 messages: user + assistant (no tool result)
         assert_eq!(msgs.len(), 2, "Expected no tool result for length-truncated response");
         match msgs.last().unwrap() {
@@ -490,7 +490,7 @@ mod tests {
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.add_tool(Box::new(TerminatorTool));
         agent.run("Terminate").await.unwrap();
-        let msgs = agent.messages();
+        let msgs = agent.messages().await;
         // user + assistant + tool_result = 3 messages (no second round)
         assert_eq!(msgs.len(), 3, "Should stop after terminated tool");
     }

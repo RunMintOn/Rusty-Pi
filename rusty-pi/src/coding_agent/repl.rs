@@ -136,7 +136,7 @@ async fn run_repl(agent: &mut Agent) -> Result<()> {
         let aborted = run_with_abort(agent, &line).await;
 
         if !aborted {
-            let msgs = agent.messages();
+            let msgs = agent.messages().await;
             if let Some(AgentMessage::Assistant(a)) = msgs.last()
                 && a.stop_reason == StopReason::Error
                     && let Some(err) = &a.error_message {
