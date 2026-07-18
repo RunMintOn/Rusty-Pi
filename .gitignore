@@ -1,0 +1,6 @@
+/rusty-pi/target/
+reference/earendil-works-pi/.git/
+reference/earendil-works-pi/node_modules/
+*.swp
+*.swo
+.DS_Store
