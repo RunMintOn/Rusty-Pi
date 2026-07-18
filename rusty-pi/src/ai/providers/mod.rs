@@ -56,6 +56,14 @@ pub trait ProviderApi: Send + Sync {
         tools: &[&dyn Tool],
     ) -> anyhow::Result<StreamReceiver>;
 
+    /// List models available through this provider.
+    ///
+    /// The default implementation returns an empty vec; providers that support
+    /// runtime model listing should override this.
+    fn list_models(&self) -> Vec<&Model> {
+        Vec::new()
+    }
+
     /// Create a channel for sending stream events.
     fn channel() -> (StreamSender, StreamReceiver) where Self: Sized {
         tokio::sync::mpsc::channel(STREAM_CHANNEL_SIZE)

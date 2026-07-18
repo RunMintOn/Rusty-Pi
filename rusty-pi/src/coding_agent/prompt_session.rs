@@ -169,6 +169,31 @@ impl PromptSession {
         }
     }
 
+    /// Switch the model used by the underlying agent at runtime.
+    pub fn switch_model(&mut self, model: crate::ai::providers::Model) {
+        self.agent.switch_model(model);
+    }
+
+    /// Get the current model from the underlying agent.
+    pub fn model(&self) -> &crate::ai::providers::Model {
+        self.agent.model()
+    }
+
+    /// Add a context file and rebuild the system prompt.
+    pub fn add_context_file(&mut self, path: PathBuf, content: String) {
+        let cf = ContextFile { path, content };
+        // Rebuild system prompt with the new context file
+        let prompt = crate::coding_agent::system_prompt::build_system_prompt(
+            crate::coding_agent::system_prompt::BuildSystemPromptOptions {
+                cwd: self.cwd.clone(),
+                skills: self.skills.clone(),
+                context_files: vec![cf],
+                ..Default::default()
+            },
+        );
+        self.agent.set_system_prompt(prompt);
+    }
+
     /// Get a reference to the agent's config directory.
     pub fn agent_dir(&self) -> &Path {
         &self.agent_dir

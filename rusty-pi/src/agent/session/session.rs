@@ -403,6 +403,25 @@ impl Session {
         })
     }
 
+    /// Derive model from messages (last assistant message's model).
+    pub async fn derive_model(&self) -> Option<String> {
+        let msgs = self.messages().await;
+        msgs.iter().rev().find_map(|m| match m {
+            crate::ai::types::AgentMessage::Assistant(a) => Some(a.model.clone()),
+            _ => None,
+        })
+    }
+
+    /// Count messages by type. Returns `(total, user, assistant, tool)`.
+    pub async fn count_messages(&self) -> (usize, usize, usize, usize) {
+        let msgs = self.messages().await;
+        let total = msgs.len();
+        let user = msgs.iter().filter(|m| matches!(m, crate::ai::types::AgentMessage::User(_))).count();
+        let assistant = msgs.iter().filter(|m| matches!(m, crate::ai::types::AgentMessage::Assistant(_))).count();
+        let tool = msgs.iter().filter(|m| matches!(m, crate::ai::types::AgentMessage::ToolResult(_))).count();
+        (total, user, assistant, tool)
+    }
+
     /// Clear all entries (reset session).
     pub async fn clear(&mut self) {
         self.storage = Box::new(InMemorySessionStorage::new(self.storage.get_metadata().await));

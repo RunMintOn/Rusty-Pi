@@ -2,7 +2,12 @@
 
 use crate::agent::engine::AbortFlag;
 use crate::ai::types::{AgentMessage, StopReason};
+use crate::coding_agent::command::{
+    CommandRegistry, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader,
+    ListSessionsCommand, ModelCommand, QuitCommand, SessionCommand, TreeCommand,
+};
 use crate::coding_agent::prompt_session::PromptSession;
+use crate::format::OutputFormatter;
 use anyhow::Result;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -19,6 +24,53 @@ pub struct RunConfig {
     pub session: PromptSession,
 }
 
+/// Wraps `rustyline::DefaultEditor` as a [`LineReader`].
+pub struct RustylineReader {
+    pub inner: DefaultEditor,
+}
+
+impl RustylineReader {
+    pub fn new(inner: DefaultEditor) -> Self {
+        Self { inner }
+    }
+}
+
+impl LineReader for RustylineReader {
+    fn readline(&mut self, prompt: &str) -> Result<String, ReadlineError> {
+        self.inner.readline(prompt)
+    }
+
+    fn add_history_entry(&mut self, line: &str) {
+        let _ = self.inner.add_history_entry(line);
+    }
+
+    fn save_history(&mut self, path: &std::path::Path) -> std::result::Result<(), ReadlineError> {
+        self.inner.save_history(path)
+    }
+}
+
+/// Build the default command registry with built-in and interactive commands.
+pub fn default_registry() -> CommandRegistry {
+    use crate::coding_agent::picker::RealPicker;
+
+    let mut registry = CommandRegistry::new();
+    registry.register(Box::new(HelpCommand));
+    registry.register(Box::new(ExitCommand));
+    registry.register(Box::new(QuitCommand));
+    registry.register(Box::new(ModelCommand::new(Box::new(RealPicker))));
+    registry.register(Box::new(ContextCommand::new(Box::new(RealPicker))));
+    registry.register(Box::new(SessionCommand));
+    registry.register(Box::new(TreeCommand));
+    registry.register(Box::new(ListSessionsCommand));
+    registry
+}
+
+/// Build a startup banner string using the OutputFormatter.
+pub fn startup_banner(provider: &str, model: &str, session_id: &str) -> String {
+    let fmt = OutputFormatter::new();
+    fmt.banner(provider, model, session_id)
+}
+
 /// Run the CLI with the given configuration.
 pub async fn run(config: RunConfig) -> Result<()> {
     let mut session = config.session;
@@ -29,7 +81,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     }
 }
 
-/// Helper: run an agent with Ctrl+C abort support.
+/// Helper: run an agent with Ctrl+C abort support and tool event formatting.
 /// Returns `true` if the run was aborted, `false` otherwise.
 async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
     // Expand templates/skills before borrowing agent
@@ -39,6 +91,8 @@ async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
     let abort_flag: AbortFlag = Arc::new(AtomicBool::new(false));
     agent.set_abort_flag(abort_flag.clone());
 
+    let formatter = Arc::new(OutputFormatter::new());
+
     let buf = Arc::new(Mutex::new(String::new()));
     let buf_cb = buf.clone();
     agent.on_text(move |delta| {
@@ -46,6 +100,22 @@ async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
         let _ = io::stdout().flush();
         buf_cb.lock().unwrap().push_str(delta);
     });
+
+    // Register tool event callbacks
+    {
+        let fmt = formatter.clone();
+        agent.on_tool_start(move |name, args| {
+            print!("{}", fmt.tool_start(name, args));
+            let _ = io::stdout().flush();
+        });
+    }
+    {
+        let fmt = formatter.clone();
+        agent.on_tool_end(move |name, duration| {
+            print!("{}", fmt.tool_end(name, duration));
+            let _ = io::stdout().flush();
+        });
+    }
 
     let run_future = agent.run(&expanded);
     tokio::pin!(run_future);
@@ -58,7 +128,8 @@ async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
             false
         }
         _ = tokio::signal::ctrl_c() => {
-            println!("\n[interrupt: aborting...]");
+            let fmt = OutputFormatter::new();
+            eprintln!("{}", fmt.interrupt());
             abort_flag.store(true, Ordering::SeqCst);
             abort_flag.store(false, Ordering::SeqCst);
             true
@@ -95,57 +166,46 @@ fn history_path() -> PathBuf {
     history_path_for_home(&home)
 }
 
-/// Build the /help message text.
-fn help_text() -> String {
-    let mut out = String::new();
-    out.push_str("\n");
-    out.push_str("  Commands:\n");
-    out.push_str("    /exit, /quit   Exit the REPL\n");
-    out.push_str("    /help          Show this help message\n");
-    out.push_str("\n");
-    out.push_str("  Tips:\n");
-    out.push_str("    - Up/down arrows navigate command history\n");
-    out.push_str("    - Ctrl+C at prompt exits\n");
-    out.push_str("    - Ctrl+C during agent run aborts the current round\n");
-    out.push_str("    - Type any text to chat with the agent\n");
-    out.push_str("\n");
-    out
-}
-
-/// Print the /help message.
-fn print_help() {
-    print!("{}", help_text());
-}
-
-/// Enter an interactive REPL loop.
-///
-/// Displays a `> ` prompt. Each line is sent to the agent as a user message.
-/// The agent streams the response token-by-token. Type `/exit` or `/quit` to
-/// leave the loop. Ctrl+C at the prompt exits the REPL; Ctrl+C during agent
-/// execution aborts the current round and returns to the prompt.
+/// Enter the interactive REPL loop with default rustyline reader and commands.
 async fn run_repl(session: &mut PromptSession) -> Result<()> {
-    let mut rl = DefaultEditor::new()
-        .map_err(|e| anyhow::anyhow!("Failed to create REPL editor: {}", e))?;
-
-    // Load history
     let hist_path = history_path();
     if let Some(parent) = hist_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    let _ = rl.load_history(&hist_path);
 
-    println!("rusty-pi REPL (type '/exit' to quit, '/help' for help)\n");
+    let mut rl = DefaultEditor::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create REPL editor: {}", e))?;
+    let _ = rl.load_history(&hist_path);
+    let mut reader = RustylineReader::new(rl);
+
+    let registry = default_registry();
+    let formatter = OutputFormatter::new();
+
+    run_repl_with(session, &registry, &mut reader, &formatter, &hist_path).await
+}
+
+/// Core REPL loop, parameterized over reader and registry for testability.
+async fn run_repl_with(
+    session: &mut PromptSession,
+    registry: &CommandRegistry,
+    reader: &mut dyn LineReader,
+    _formatter: &OutputFormatter,
+    history_path: &PathBuf,
+) -> Result<()> {
+    let meta = session.session().get_metadata().await;
+    let model = session.model().id;
+    let banner = startup_banner("rusty-pi", model, &meta.id);
+    println!("{}", banner);
+    println!("Type '/help' for commands\n");
 
     loop {
-        let line = match rl.readline("> ") {
+        let line = match reader.readline("> ") {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
-                // Ctrl+C at prompt → exit
                 println!("^C");
                 break;
             }
             Err(ReadlineError::Eof) => {
-                // Ctrl+D → exit
                 println!();
                 break;
             }
@@ -160,16 +220,22 @@ async fn run_repl(session: &mut PromptSession) -> Result<()> {
             continue;
         }
 
-        let _ = rl.add_history_entry(&trimmed);
+        reader.add_history_entry(&trimmed);
 
-        // Handle built-in commands
-        match trimmed.as_str() {
-            "/exit" | "/quit" => break,
-            "/help" => {
-                print_help();
-                continue;
+        // Handle /help before dispatch: HelpCommand is registered only so it
+        // appears in the listing; the actual help text comes from the registry.
+        if trimmed == "/help" || trimmed.starts_with("/help ") {
+            print!("{}", registry.help_text());
+            continue;
+        }
+
+        // Try command dispatch
+        match registry.dispatch(&trimmed, session)? {
+            DispatchOutcome::Exit => break,
+            DispatchOutcome::Handled => continue,
+            DispatchOutcome::NotACommand => {
+                // Treat as a prompt for the agent
             }
-            _ => {}
         }
 
         let aborted = run_with_abort(session, &trimmed).await;
@@ -179,15 +245,16 @@ async fn run_repl(session: &mut PromptSession) -> Result<()> {
             let msgs = agent.messages().await;
             if let Some(AgentMessage::Assistant(a)) = msgs.last()
                 && a.stop_reason == StopReason::Error
-                    && let Some(err) = &a.error_message {
-                        eprintln!("[error] {}", err);
-                    }
+                && let Some(err) = &a.error_message
+            {
+                eprintln!("[error] {}", err);
+            }
         }
         println!();
     }
 
-    // Save history
-    let _ = rl.append_history(&hist_path);
+    // Save history (best-effort)
+    let _ = reader.save_history(history_path);
 
     Ok(())
 }
@@ -195,6 +262,154 @@ async fn run_repl(session: &mut PromptSession) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding_agent::command::MockLineReader;
+
+    /// A minimal PromptSession that doesn't connect to real providers.
+    fn mock_session() -> PromptSession {
+        let provider = crate::ai::mock::MockProvider::text("mock reply");
+        let model = crate::ai::providers::Model { id: "mock", api: "mock" };
+        PromptSession::new(
+            Box::new(provider),
+            model,
+            vec![],
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/.pi/agent"),
+            vec![],
+            vec![],
+            false,
+            None,
+            vec![],
+        )
+    }
+
+    #[tokio::test]
+    async fn repl_with_exit_command() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec!["/exit".into()]);
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+
+        // Should have processed the exit without error
+        assert!(reader.history.contains(&"/exit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn repl_with_quit_command() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec!["/quit".into()]);
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repl_with_help_command() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec!["/help".into(), "/exit".into()]);
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repl_with_unknown_command() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec!["/unknown".into(), "/exit".into()]);
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repl_with_regular_prompt_then_exit() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec![
+            "hello agent".into(),
+            "/exit".into(),
+        ]);
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+
+        assert!(reader.history.contains(&"hello agent".to_string()));
+        assert!(reader.history.contains(&"/exit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn repl_with_empty_lines_skips() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec![
+            "".into(),
+            "  ".into(),
+            "/exit".into(),
+        ]);
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+
+        // Empty lines shouldn't be added to history
+        assert_eq!(reader.history.len(), 1);
+        assert!(reader.history.contains(&"/exit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn repl_eof_triggers_exit() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec![]); // empty → immediate EOF
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repl_multiple_prompts() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let formatter = OutputFormatter::new();
+        let mut reader = MockLineReader::new(vec![
+            "first".into(),
+            "second".into(),
+            "/exit".into(),
+        ]);
+        let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with(&mut session, &registry, &mut reader, &formatter, &hist)
+            .await
+            .unwrap();
+
+        assert_eq!(reader.history.len(), 3);
+    }
+
+    // ── Existing tests (unchanged) ─────────────────────────────────────
 
     #[test]
     fn history_path_uses_home_env() {
@@ -212,20 +427,5 @@ mod tests {
             path,
             PathBuf::from("/home/user/.pi/agent/repl-history.txt")
         );
-    }
-
-    #[test]
-    fn help_text_contains_commands() {
-        let text = help_text();
-        assert!(text.contains("/exit"));
-        assert!(text.contains("/quit"));
-        assert!(text.contains("/help"));
-    }
-
-    #[test]
-    fn help_text_contains_tips() {
-        let text = help_text();
-        assert!(text.contains("Up/down arrows"));
-        assert!(text.contains("Ctrl+C"));
     }
 }

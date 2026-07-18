@@ -32,6 +32,12 @@ impl Default for AgentConfig {
 /// Callback for streaming text deltas.
 pub type TextCallback = Box<dyn FnMut(&str) + Send>;
 
+/// Callback when a tool starts executing. Arguments: (tool_name, args_json).
+pub type ToolStartCallback = Box<dyn Fn(&str, &str) + Send>;
+
+/// Callback when a tool finishes executing. Arguments: (tool_name, duration_ms).
+pub type ToolEndCallback = Box<dyn Fn(&str, u64) + Send>;
+
 /// Shared abort flag for signalling Ctrl+C / cancellation.
 pub type AbortFlag = Arc<AtomicBool>;
 
@@ -44,6 +50,10 @@ pub struct Agent {
     config: AgentConfig,
     /// Optional callback for streaming text deltas.
     on_text: Option<TextCallback>,
+    /// Optional callback when a tool starts.
+    on_tool_start: Option<ToolStartCallback>,
+    /// Optional callback when a tool finishes.
+    on_tool_end: Option<ToolEndCallback>,
     /// Shared flag: when true, the agent should abort the current round.
     abort: AbortFlag,
 }
@@ -60,6 +70,8 @@ impl Agent {
             model,
             config: AgentConfig::default(),
             on_text: None,
+            on_tool_start: None,
+            on_tool_end: None,
             abort: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -77,10 +89,44 @@ impl Agent {
         self.on_text = Some(Box::new(callback));
     }
 
+    /// Register a callback for tool start events.
+    /// Arguments: `(tool_name, args_json)`.
+    pub fn on_tool_start<F>(&mut self, callback: F)
+    where
+        F: Fn(&str, &str) + Send + 'static,
+    {
+        self.on_tool_start = Some(Box::new(callback));
+    }
+
+    /// Register a callback for tool end events.
+    /// Arguments: `(tool_name, duration_ms)`.
+    pub fn on_tool_end<F>(&mut self, callback: F)
+    where
+        F: Fn(&str, u64) + Send + 'static,
+    {
+        self.on_tool_end = Some(Box::new(callback));
+    }
+
     /// Signal the agent to abort the current round.
     /// The next tick of the stream loop will notice and return `StopReason::Aborted`.
     pub fn abort(&self) {
         self.abort.store(true, Ordering::SeqCst);
+    }
+
+    /// Switch the model used by this agent at runtime.
+    /// Provider stays the same; only the model ID changes.
+    pub fn switch_model(&mut self, model: Model) {
+        self.model = model;
+    }
+
+    /// Return the current model.
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    /// List models available through this agent's provider.
+    pub fn list_models(&self) -> Vec<&Model> {
+        self.provider.list_models()
     }
 
     /// Replace the abort flag (used to share a flag between REPL and agent).
@@ -277,10 +323,25 @@ impl Agent {
             .find(|t| t.name() == tool_name)
             .with_context(|| format!("Tool '{}' not found", tool_name))?;
 
+        // Fire on_tool_start callback
+        let args_str = args.to_string();
+        if let Some(ref cb) = self.on_tool_start {
+            cb(tool_name, &args_str);
+        }
+
+        let start_ms = Self::now_ms();
         let result = tool
             .execute(tool_call_id, args, None)
             .await
             .with_context(|| format!("Tool '{}' execution failed", tool_name))?;
+
+        let end_ms = Self::now_ms();
+        let duration_ms = (end_ms - start_ms) as u64;
+
+        // Fire on_tool_end callback
+        if let Some(ref cb) = self.on_tool_end {
+            cb(tool_name, duration_ms);
+        }
 
         let now = Self::now_ms();
 

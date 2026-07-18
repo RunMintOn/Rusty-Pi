@@ -10,5 +10,6 @@
 pub mod agent;
 pub mod ai;
 pub mod coding_agent;
+pub mod format;
 pub mod orchestrator;
 pub mod tui;

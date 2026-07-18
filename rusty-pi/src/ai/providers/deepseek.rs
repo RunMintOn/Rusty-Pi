@@ -136,6 +136,10 @@ impl ProviderApi for DeepSeekProvider {
 
         Ok(rx)
     }
+
+    fn list_models(&self) -> Vec<&Model> {
+        DEEPSEEK_MODELS.iter().collect()
+    }
 }
 
 async fn do_stream(

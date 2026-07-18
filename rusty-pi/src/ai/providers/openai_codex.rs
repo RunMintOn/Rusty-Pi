@@ -202,6 +202,10 @@ impl ProviderApi for OpenAICodexProvider {
 
         Ok(rx)
     }
+
+    fn list_models(&self) -> Vec<&Model> {
+        OPENAI_CODEX_MODELS.iter().collect()
+    }
 }
 
 /// Manually parse SSE events from an HTTP byte stream and dispatch them as StreamEvents.
