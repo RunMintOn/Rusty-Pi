@@ -108,6 +108,8 @@ impl DeepSeekProvider {
                     .collect::<Vec<_>>().join("\n");
                 Some(serde_json::json!({ "role": "tool", "tool_call_id": tr.tool_call_id, "content": content }))
             }
+            // Synthetic context-only messages are never sent to the LLM API.
+            _ => None,
         }).collect()
     }
 }

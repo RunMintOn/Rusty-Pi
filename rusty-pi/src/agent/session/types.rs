@@ -281,7 +281,7 @@ impl SessionTreeEntry {
 // ---------------------------------------------------------------------------
 
 /// The built context: messages + state derived from metadata entries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionContext {
     pub messages: Vec<AgentMessage>,
     pub thinking_level: String,
@@ -338,7 +338,7 @@ pub fn uuid_v7() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let random: u64 = rand_for_id();
+    let random: u64 = time_hash_for_id();
     format!("{:016x}{:016x}", ts, random)
 }
 
@@ -370,8 +370,53 @@ impl ContainsId for Vec<String> {
     }
 }
 
-/// Simple random number for ID generation.
-fn rand_for_id() -> u64 {
+/// Parse an ISO 8601 timestamp string (as produced by [`iso_timestamp`])
+/// into milliseconds since Unix epoch.
+pub fn parse_iso_timestamp(s: &str) -> i64 {
+    // Expected format: "2026-07-18T12:34:56.789Z"
+    if s.len() < 20 || !s.ends_with('Z') {
+        return 0;
+    }
+
+    let year: i64 = s[0..4].parse().unwrap_or(0);
+    let month: u32 = s[5..7].parse().unwrap_or(1);
+    let day: u32 = s[8..10].parse().unwrap_or(1);
+    let hour: u32 = s[11..13].parse().unwrap_or(0);
+    let min: u32 = s[14..16].parse().unwrap_or(0);
+    let sec: u32 = s[17..19].parse().unwrap_or(0);
+
+    let millis: i64 = if s.len() > 20 && s.as_bytes()[19] == b'.' {
+        let end = s.find('Z').unwrap_or(s.len());
+        let ms_str = &s[20..end.min(23)];
+        let parsed: i64 = ms_str.parse().unwrap_or(0);
+        match ms_str.len() {
+            1 => parsed * 100,
+            2 => parsed * 10,
+            _ => parsed,
+        }
+    } else {
+        0
+    };
+
+    let days = date_to_days(year, month, day);
+    let total_secs = days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + sec as i64;
+    total_secs * 1000 + millis
+}
+
+/// Convert (year, month, day) to days since Unix epoch (1970-01-01).
+/// Inverse of [`days_to_date`].
+fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
+    let m = month as i64;
+    let y = if m <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Deterministic time-based hash for ID generation (not cryptographically random).
+fn time_hash_for_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -517,5 +562,30 @@ mod tests {
             target_id: None,
         });
         assert_eq!(leaf_id_after_entry(&entry), None);
+    }
+
+    #[test]
+    fn parse_iso_timestamp_standard() {
+        let ts = parse_iso_timestamp("2026-07-18T12:34:56.789Z");
+        assert_eq!(ts, 1784378096789);
+    }
+
+    #[test]
+    fn parse_iso_timestamp_zero_padded_millis() {
+        let ts = parse_iso_timestamp("2026-01-01T00:00:00.001Z");
+        assert_eq!(ts, 1767225600001);
+    }
+
+    #[test]
+    fn parse_iso_timestamp_no_millis() {
+        let ts = parse_iso_timestamp("2026-01-01T00:00:00Z");
+        assert!(ts % 1000 == 0);
+    }
+
+    #[test]
+    fn parse_iso_timestamp_roundtrip() {
+        let original = iso_timestamp();
+        let millis = parse_iso_timestamp(&original);
+        assert!(millis > 0, "expected positive millis from {} got {}", original, millis);
     }
 }

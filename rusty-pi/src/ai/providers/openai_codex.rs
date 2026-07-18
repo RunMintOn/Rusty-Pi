@@ -120,6 +120,9 @@ impl OpenAICodexProvider {
                         "output": content
                     }));
                 }
+                // Synthetic context-only messages (BranchSummary, CompactionSummary, CustomContext)
+                // are never sent to the LLM API — skip silently.
+                _ => {}
             }
         }
         items

@@ -162,6 +162,39 @@ pub struct ToolResultMessage {
     pub timestamp: i64,
 }
 
+/// A branch summary message — synthetic message produced during context building.
+/// Never sent to the LLM; used to represent a branch navigation event.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BranchSummaryMessage {
+    pub summary: String,
+    #[serde(rename = "fromId")]
+    pub from_id: String,
+    pub timestamp: i64,
+}
+
+/// A compaction summary message — synthetic message produced during context building.
+/// Marks where a long conversation was summarized.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompactionSummaryMessage {
+    pub summary: String,
+    #[serde(rename = "tokensBefore")]
+    pub tokens_before: u64,
+    pub timestamp: i64,
+}
+
+/// A custom context message — synthetic message produced during context building.
+/// Carries arbitrary custom content injected into the model context.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CustomContextMessage {
+    #[serde(rename = "customType")]
+    pub custom_type: String,
+    pub content: serde_json::Value,
+    pub display: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    pub timestamp: i64,
+}
+
 /// Union of all message types as stored/transmitted.
 /// Mirrors the `AgentMessage` union in the original `@earendil-works/pi-agent-core`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -173,6 +206,12 @@ pub enum AgentMessage {
     Assistant(AssistantMessage),
     #[serde(rename = "toolResult")]
     ToolResult(ToolResultMessage),
+    #[serde(rename = "branchSummary")]
+    BranchSummary(BranchSummaryMessage),
+    #[serde(rename = "compactionSummary")]
+    CompactionSummary(CompactionSummaryMessage),
+    #[serde(rename = "custom")]
+    CustomContext(CustomContextMessage),
 }
 
 // ── Tool interface (schema-only) ────────────────────────────────────────────

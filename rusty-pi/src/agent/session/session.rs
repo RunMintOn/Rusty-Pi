@@ -6,18 +6,48 @@
 use crate::agent::session::memory::InMemorySessionStorage;
 use crate::agent::session::storage::*;
 use crate::agent::session::types::*;
-use crate::ai::types::AgentMessage;
+use crate::ai::types::{AgentMessage, BranchSummaryMessage, CompactionSummaryMessage, CustomContextMessage};
+use std::collections::HashMap;
+
+// ──  Context build options  ──────────────────────────────────────────────
+
+/// Transform applied to context entries after the default compaction transform.
+pub type ContextEntryTransform =
+    Box<dyn Fn(&[SessionTreeEntry]) -> Vec<SessionTreeEntry> + Send + Sync>;
+
+/// Projector that converts a `CustomEntry` into context messages.
+/// Returns `None` / empty vec to omit the entry from context.
+pub type CustomEntryContextMessageProjector =
+    Box<dyn Fn(&CustomEntry, usize, &[SessionTreeEntry]) -> Vec<AgentMessage> + Send + Sync>;
+
+/// Options for building session context.
+/// Mirrors `SessionContextBuildOptions` from the original source.
+#[derive(Default)]
+pub struct SessionContextBuildOptions {
+    /// Entry transforms applied after the default compaction transform.
+    pub entry_transforms: Vec<ContextEntryTransform>,
+    /// Projectors for custom entries, keyed by `custom_type`.
+    /// Custom entries without a matching projector are omitted from context.
+    pub entry_projectors: HashMap<String, CustomEntryContextMessageProjector>,
+}
 
 /// High-level session wrapper that provides business-logic operations
 /// over a [`SessionStorage`] backend.
 pub struct Session {
     storage: Box<dyn SessionStorage>,
+    context_build_options: SessionContextBuildOptions,
 }
 
 impl Session {
     /// Create a new session wrapping the given storage backend.
-    pub fn new(storage: Box<dyn SessionStorage>) -> Self {
-        Self { storage }
+    pub fn new(
+        storage: Box<dyn SessionStorage>,
+        context_build_options: SessionContextBuildOptions,
+    ) -> Self {
+        Self {
+            storage,
+            context_build_options,
+        }
     }
 
     /// Create a new in-memory session (convenience for Agent use).
@@ -33,6 +63,18 @@ impl Session {
         };
         Self {
             storage: Box::new(InMemorySessionStorage::new(metadata)),
+            context_build_options: SessionContextBuildOptions::default(),
+        }
+    }
+
+    // ──  Internal helpers  ──────────────────────────────────────────────────
+
+    /// Create an [`EntryBase`] with a new ID, current leaf as parent, and current timestamp.
+    async fn new_entry_base(&mut self) -> EntryBase {
+        EntryBase {
+            id: self.storage.create_entry_id().await,
+            parent_id: self.storage.get_leaf_id().await,
+            timestamp: iso_timestamp(),
         }
     }
 
@@ -69,14 +111,11 @@ impl Session {
 
         if let Some(s) = summary {
             let entry_id = entry_id.unwrap_or("root");
-            let now = iso_timestamp();
-            let id = self.storage.create_entry_id().await;
+            let mut base = self.new_entry_base().await;
+            // Override parent_id — the summary's parent is the entry being moved to
+            base.parent_id = Some(entry_id.to_string());
             let entry = SessionTreeEntry::BranchSummary(BranchSummaryEntry {
-                base: EntryBase {
-                    id,
-                    parent_id: Some(entry_id.to_string()),
-                    timestamp: now,
-                },
+                base,
                 entry_type: EntryTypeTag::BranchSummary,
                 from_id: entry_id.to_string(),
                 summary: s.summary,
@@ -95,20 +134,13 @@ impl Session {
 
     /// Append a message entry. Returns the entry ID.
     pub async fn append_message(&mut self, message: AgentMessage) -> Result<String, SessionError> {
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::Message(MessageEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::Message,
             message,
         });
-
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -119,21 +151,14 @@ impl Session {
         provider: String,
         model_id: String,
     ) -> Result<String, SessionError> {
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::ModelChange(ModelChangeEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::ModelChange,
             provider,
             model_id,
         });
-
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -143,20 +168,13 @@ impl Session {
         &mut self,
         level: String,
     ) -> Result<String, SessionError> {
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::ThinkingLevelChange(ThinkingLevelChangeEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::ThinkingLevelChange,
             thinking_level: level,
         });
-
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -166,20 +184,13 @@ impl Session {
         &mut self,
         tool_names: Vec<String>,
     ) -> Result<String, SessionError> {
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::ActiveToolsChange(ActiveToolsChangeEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::ActiveToolsChange,
             active_tool_names: tool_names,
         });
-
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -192,16 +203,10 @@ impl Session {
         tokens_before: u64,
         details: Option<serde_json::Value>,
     ) -> Result<String, SessionError> {
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::Compaction(CompactionEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::Compaction,
             summary,
             first_kept_entry_id,
@@ -209,7 +214,6 @@ impl Session {
             details,
             from_hook: None,
         });
-
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -220,21 +224,38 @@ impl Session {
         custom_type: String,
         data: Option<serde_json::Value>,
     ) -> Result<String, SessionError> {
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::Custom(CustomEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::Custom,
             custom_type,
             data,
         });
+        self.storage.append_entry(entry).await?;
+        Ok(id)
+    }
 
+    /// Append a custom message entry — a message visible in context with a custom type tag.
+    ///
+    /// Mirrors `appendCustomMessageEntry` from the original.
+    pub async fn append_custom_message_entry(
+        &mut self,
+        custom_type: String,
+        content: serde_json::Value,
+        display: bool,
+        details: Option<serde_json::Value>,
+    ) -> Result<String, SessionError> {
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
+        let entry = SessionTreeEntry::CustomMessage(CustomMessageEntry {
+            base,
+            entry_type: EntryTypeTag::CustomMessage,
+            custom_type,
+            content,
+            display,
+            details,
+        });
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -249,21 +270,14 @@ impl Session {
             return Err(SessionError::not_found(format!("Entry {} not found", target_id)));
         }
 
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::Label(LabelEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::Label,
             target_id,
             label,
         });
-
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -285,20 +299,13 @@ impl Session {
             }
         }
         let sanitized = sanitized.trim().to_string();
-        let now = iso_timestamp();
-        let id = self.storage.create_entry_id().await;
-        let parent_id = self.storage.get_leaf_id().await;
-
+        let base = self.new_entry_base().await;
+        let id = base.id.clone();
         let entry = SessionTreeEntry::SessionInfo(SessionInfoEntry {
-            base: EntryBase {
-                id: id.clone(),
-                parent_id,
-                timestamp: now,
-            },
+            base,
             entry_type: EntryTypeTag::SessionInfo,
             name: Some(sanitized),
         });
-
         self.storage.append_entry(entry).await?;
         Ok(id)
     }
@@ -340,46 +347,46 @@ impl Session {
     }
 
     /// Build the full session context (messages + derived state).
+    ///
+    /// Applies the default compaction transform, user-provided entry transforms,
+    /// and converts all entry types to their corresponding [`AgentMessage`]
+    /// representations (including custom entry projectors).
     pub async fn build_context(&self) -> SessionContext {
-        let entries = self.get_branch(None).await.unwrap_or_default();
+        let entries = match self.get_branch(None).await {
+            Ok(e) => e,
+            Err(_) => return SessionContext::default(),
+        };
 
-        let mut messages = Vec::new();
-        let mut thinking_level = String::from("off");
-        let mut model: Option<ModelState> = None;
-        let mut active_tool_names: Option<Vec<String>> = None;
-
-        for entry in &entries {
-            match entry {
-                SessionTreeEntry::ThinkingLevelChange(t) => {
-                    thinking_level = t.thinking_level.clone();
-                }
-                SessionTreeEntry::ModelChange(m) => {
-                    model = Some(ModelState {
-                        provider: m.provider.clone(),
-                        model_id: m.model_id.clone(),
-                    });
-                }
-                SessionTreeEntry::ActiveToolsChange(a) => {
-                    active_tool_names = Some(a.active_tool_names.clone());
-                }
-                _ => {}
-            }
-        }
-
-        // Extract messages with compaction/branch_summary awareness
-        // (simplified: just extract plain messages for now)
-        for entry in &entries {
-            if let SessionTreeEntry::Message(m) = entry {
-                messages.push(m.message.clone());
-            }
-        }
+        let state = derive_session_context_state(&entries);
+        let context_entries = self.context_entries_with_transforms(&entries);
+        let projectors = &self.context_build_options.entry_projectors;
+        let messages = context_entries
+            .iter()
+            .enumerate()
+            .flat_map(|(i, entry)| session_entry_to_context_messages(entry, i, &context_entries, projectors))
+            .collect();
 
         SessionContext {
             messages,
-            thinking_level,
-            model,
-            active_tool_names,
+            thinking_level: state.thinking_level,
+            model: state.model,
+            active_tool_names: state.active_tool_names,
         }
+    }
+
+    /// Build the context entries (after compaction + user transforms) without converting to messages.
+    pub async fn build_context_entries(&self) -> Result<Vec<SessionTreeEntry>, SessionError> {
+        let entries = self.get_branch(None).await?;
+        Ok(self.context_entries_with_transforms(&entries))
+    }
+
+    /// Apply the default compaction transform + user-provided entry transforms.
+    fn context_entries_with_transforms(&self, entries: &[SessionTreeEntry]) -> Vec<SessionTreeEntry> {
+        let mut result = default_context_entry_transform(entries);
+        for transform in &self.context_build_options.entry_transforms {
+            result = transform(&result);
+        }
+        result
     }
 
     /// Get a label attached to an entry.
@@ -410,6 +417,99 @@ pub struct MoveSummary {
 }
 
 // ──  Default context entry transform (compaction handling)  ──────────────
+
+/// Derive state (thinking level, model, active tools) from the original branch entries.
+fn derive_session_context_state(entries: &[SessionTreeEntry]) -> SessionContextState {
+    let mut thinking_level = String::from("off");
+    let mut model: Option<ModelState> = None;
+    let mut active_tool_names: Option<Vec<String>> = None;
+
+    for entry in entries {
+        match entry {
+            SessionTreeEntry::ThinkingLevelChange(t) => {
+                thinking_level = t.thinking_level.clone();
+            }
+            SessionTreeEntry::ModelChange(m) => {
+                model = Some(ModelState {
+                    provider: m.provider.clone(),
+                    model_id: m.model_id.clone(),
+                });
+            }
+            // Also track model from assistant messages (latest wins)
+            SessionTreeEntry::Message(m) => {
+                if let AgentMessage::Assistant(a) = &m.message {
+                    model = Some(ModelState {
+                        provider: a.provider.clone(),
+                        model_id: a.model.clone(),
+                    });
+                }
+            }
+            SessionTreeEntry::ActiveToolsChange(a) => {
+                active_tool_names = Some(a.active_tool_names.clone());
+            }
+            _ => {}
+        }
+    }
+
+    SessionContextState {
+        thinking_level,
+        model,
+        active_tool_names,
+    }
+}
+
+/// Transient state extracted from session entries before compaction transform.
+struct SessionContextState {
+    thinking_level: String,
+    model: Option<ModelState>,
+    active_tool_names: Option<Vec<String>>,
+}
+
+/// Convert a single session tree entry to zero or more context messages.
+///
+/// Mirrors `sessionEntryToContextMessages` from the original
+/// `@earendil-works/pi-agent-core/src/harness/session/session.ts`.
+pub fn session_entry_to_context_messages(
+    entry: &SessionTreeEntry,
+    _index: usize,
+    _entries: &[SessionTreeEntry],
+    projectors: &HashMap<String, CustomEntryContextMessageProjector>,
+) -> Vec<AgentMessage> {
+    match entry {
+        SessionTreeEntry::Message(m) => vec![m.message.clone()],
+        SessionTreeEntry::Compaction(c) => {
+            vec![AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                summary: c.summary.clone(),
+                tokens_before: c.tokens_before,
+                timestamp: parse_iso_timestamp(&c.base.timestamp),
+            })]
+        }
+        SessionTreeEntry::BranchSummary(b) if !b.summary.is_empty() => {
+            vec![AgentMessage::BranchSummary(BranchSummaryMessage {
+                summary: b.summary.clone(),
+                from_id: b.from_id.clone(),
+                timestamp: parse_iso_timestamp(&b.base.timestamp),
+            })]
+        }
+        SessionTreeEntry::CustomMessage(cm) => {
+            vec![AgentMessage::CustomContext(CustomContextMessage {
+                custom_type: cm.custom_type.clone(),
+                content: cm.content.clone(),
+                display: cm.display,
+                details: cm.details.clone(),
+                timestamp: parse_iso_timestamp(&cm.base.timestamp),
+            })]
+        }
+        SessionTreeEntry::Custom(c) => {
+            if let Some(projector) = projectors.get(&c.custom_type) {
+                projector(c, _index, _entries)
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    }
+}
 
 /// Default compaction-aware entry transform.
 /// Keeps only the compaction marker + entries after `firstKeptEntryId`.
@@ -537,9 +637,16 @@ mod tests {
         session.append_message(user_msg("five")).await.unwrap();
 
         let context = session.build_context().await;
-        // Messages should include: three, four (after compaction), five
-        // Compaction entries are not converted to messages in the simple build_context
-        assert_eq!(context.messages.len(), 5); // all messages including compacted ones
+        // Messages should include: compactionSummary, three, four, five (compacted messages removed)
+        assert_eq!(context.messages.len(), 4);
+        // First message is the compaction summary
+        match &context.messages[0] {
+            AgentMessage::CompactionSummary(cs) => {
+                assert_eq!(cs.summary, "summary");
+                assert_eq!(cs.tokens_before, 1234);
+            }
+            _ => panic!("expected compaction summary message, got {:?}", context.messages[0]),
+        }
     }
 
     #[tokio::test]
@@ -567,6 +674,163 @@ mod tests {
                 assert_eq!(b.summary, "summary text");
             }
             _ => panic!("expected branch summary entry"),
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_summary_appears_in_context() {
+        let mut session = make_session();
+        let user1 = session.append_message(user_msg("one")).await.unwrap();
+        session
+            .move_to(
+                Some(&user1),
+                Some(MoveSummary {
+                    summary: "branch text".into(),
+                    details: None,
+                    from_hook: None,
+                }),
+            )
+            .await
+            .unwrap();
+        session.append_message(assistant_msg("two")).await.unwrap();
+
+        let context = session.build_context().await;
+        // Messages: user("one"), branchSummary, assistant("two")
+        assert_eq!(context.messages.len(), 3);
+        match &context.messages[1] {
+            AgentMessage::BranchSummary(bs) => {
+                assert_eq!(bs.summary, "branch text");
+                assert_eq!(bs.from_id, user1);
+            }
+            _ => panic!("expected branch summary message, got {:?}", context.messages[1]),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_context_entries_applies_compaction_transform() {
+        let mut session = make_session();
+        session.append_message(user_msg("one")).await.unwrap();
+        let user2 = session.append_message(user_msg("two")).await.unwrap();
+        session.append_compaction("sum".into(), user2, 100, None).await.unwrap();
+
+        let context_entries = session.build_context_entries().await.unwrap();
+        // Should include compaction entry + entries from firstKeptEntryId onwards
+        assert_eq!(context_entries.len(), 2);
+        // After transform, first entry is the compaction marker
+        assert!(matches!(context_entries[0], SessionTreeEntry::Compaction(_)));
+        assert!(matches!(context_entries[1], SessionTreeEntry::Message(_)));
+    }
+
+    #[tokio::test]
+    async fn custom_message_entry_appears_in_context() {
+        let mut session = make_session();
+        session.append_message(user_msg("one")).await.unwrap();
+        session
+            .append_custom_message_entry("custom_type".into(), serde_json::json!("hello"), true, None)
+            .await
+            .unwrap();
+
+        let context = session.build_context().await;
+        assert_eq!(context.messages.len(), 2);
+        match &context.messages[1] {
+            AgentMessage::CustomContext(cc) => {
+                assert_eq!(cc.custom_type, "custom_type");
+                assert!(cc.display);
+            }
+            _ => panic!("expected custom context message, got {:?}", context.messages[1]),
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_entry_omitted_by_default() {
+        let mut session = make_session();
+        session.append_message(user_msg("one")).await.unwrap();
+        session
+            .append_custom_entry("chat_message".into(), Some(serde_json::json!("hello")))
+            .await
+            .unwrap();
+
+        // Custom entries without a projector are omitted from context
+        let context = session.build_context().await;
+        assert_eq!(context.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_entry_projector_injects_messages() {
+        let projector: CustomEntryContextMessageProjector =
+            Box::new(|entry: &CustomEntry, _index: usize, _entries: &[SessionTreeEntry]| {
+                let text = entry.data.as_ref().and_then(|d| d.as_str()).unwrap_or("");
+                vec![AgentMessage::User(UserMessage {
+                    content: MessageContent::Text(format!("projected: {}", text)),
+                    timestamp: 1000,
+                })]
+            });
+        let mut projectors: HashMap<String, CustomEntryContextMessageProjector> = HashMap::new();
+        projectors.insert("greeting".into(), projector);
+
+        let opts = SessionContextBuildOptions {
+            entry_projectors: projectors,
+            ..Default::default()
+        };
+
+        let storage = Box::new(InMemorySessionStorage::new(SessionMetadata {
+            id: "test-session".into(),
+            created_at: "".into(),
+            cwd: "/test".into(),
+            path: String::new(),
+            parent_session_path: None,
+            metadata: None,
+        }));
+        let mut session = Session::new(storage, opts);
+        session.append_message(user_msg("one")).await.unwrap();
+        session
+            .append_custom_entry("greeting".into(), Some(serde_json::json!("hello")))
+            .await
+            .unwrap();
+
+        let context = session.build_context().await;
+        assert_eq!(context.messages.len(), 2);
+        match &context.messages[1] {
+            AgentMessage::User(u) => {
+                assert_eq!(u.content, MessageContent::Text("projected: hello".into()));
+            }
+            _ => panic!("expected user message from projector"),
+        }
+    }
+
+    #[tokio::test]
+    async fn entry_transform_applied_after_compaction() {
+        // Create a transform that drops compaction entries
+        let drop_compaction: ContextEntryTransform = Box::new(|entries| {
+            entries.iter().filter(|e| !matches!(e, SessionTreeEntry::Compaction(_))).cloned().collect()
+        });
+
+        let opts = SessionContextBuildOptions {
+            entry_transforms: vec![drop_compaction],
+            ..Default::default()
+        };
+
+        let storage = Box::new(InMemorySessionStorage::new(SessionMetadata {
+            id: "test-session".into(),
+            created_at: "".into(),
+            cwd: "/test".into(),
+            path: String::new(),
+            parent_session_path: None,
+            metadata: None,
+        }));
+        let mut session = Session::new(storage, opts);
+        session.append_message(user_msg("one")).await.unwrap();
+        let user2 = session.append_message(user_msg("two")).await.unwrap();
+        session.append_compaction("sum".into(), user2, 100, None).await.unwrap();
+        session.append_message(user_msg("three")).await.unwrap();
+
+        // After default compaction transform: [compaction, user("two"), user("three")]
+        // After drop_compaction: [user("two"), user("three")]
+        let context = session.build_context().await;
+        assert_eq!(context.messages.len(), 2);
+        match &context.messages[0] {
+            AgentMessage::User(u) => assert_eq!(u.content, MessageContent::Text("two".into())),
+            _ => panic!("expected user message"),
         }
     }
 
