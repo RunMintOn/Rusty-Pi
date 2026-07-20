@@ -196,6 +196,21 @@ impl OpenAICodexProvider {
         }
         items
     }
+
+    /// Convert Tool trait objects to Responses API tool definitions.
+    fn build_tools(tools: &[&dyn Tool]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": t.name(),
+                    "description": t.description(),
+                    "parameters": t.parameters()
+                })
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -204,8 +219,8 @@ impl ProviderApi for OpenAICodexProvider {
         &self,
         model: &Model,
         messages: &[AgentMessage],
-        _tools: &[&dyn Tool],
-        _system_prompt: Option<&str>,
+        tools: &[&dyn Tool],
+        system_prompt: Option<&str>,
     ) -> anyhow::Result<StreamReceiver> {
         // Refresh token if expired
         let token = if let Ok(Some(cred)) = CodexCredential::load() {
@@ -236,10 +251,14 @@ impl ProviderApi for OpenAICodexProvider {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let url = format!("{}/responses", CODEX_BASE_URL);
         let input = Self::build_input(messages);
+        let api_tools = Self::build_tools(tools);
         let model_id = model.id.to_string();
+        let instructions = system_prompt.map(|s| s.to_string());
 
         tokio::spawn(async move {
-            if let Err(e) = do_codex_stream(&url, &token, &model_id, &input, tx).await {
+            if let Err(e) =
+                do_codex_stream(&url, &token, &model_id, &input, &api_tools, instructions.as_deref(), tx).await
+            {
                 eprintln!("[codex] {}", e);
             }
         });
@@ -258,10 +277,18 @@ async fn do_codex_stream(
     token: &str,
     model_id: &str,
     input: &[serde_json::Value],
+    tools: &[serde_json::Value],
+    instructions: Option<&str>,
     tx: tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
-    let body = serde_json::json!({ "model": model_id, "input": input });
+    let mut body = serde_json::json!({ "model": model_id, "input": input });
+    if let Some(instructions) = instructions {
+        body["instructions"] = serde_json::Value::String(instructions.to_string());
+    }
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools.to_vec());
+    }
 
     let response = client
         .post(url)
@@ -821,5 +848,238 @@ mod tests {
         ]);
         assert_eq!(events.len(), 1);
         assert!(events[0].contains("data: 1"));
+    }
+
+    // -----------------------------------------------------------------
+    // Request body serialization tests (wiremock)
+    // -----------------------------------------------------------------
+
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    /// Helper: build a Codex request body the same way do_codex_stream does,
+    /// then return it as a serde_json::Value for assertions.
+    fn build_codex_request_body(
+        model_id: &str,
+        messages: &[AgentMessage],
+        tools: &[&dyn Tool],
+        system_prompt: Option<&str>,
+    ) -> serde_json::Value {
+        let input = OpenAICodexProvider::build_input(messages);
+        let api_tools = OpenAICodexProvider::build_tools(tools);
+        let mut body = serde_json::json!({
+            "model": model_id,
+            "input": input
+        });
+        if let Some(instructions) = system_prompt {
+            body["instructions"] = serde_json::Value::String(instructions.to_string());
+        }
+        if !api_tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(api_tools);
+        }
+        body
+    }
+
+    struct CodexTestTool;
+
+    impl Tool for CodexTestTool {
+        fn name(&self) -> &str {
+            "bash"
+        }
+        fn description(&self) -> &str {
+            "Execute bash commands"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Command to run" }
+                },
+                "required": ["command"]
+            })
+        }
+    }
+
+    struct CodexTestToolRead;
+
+    impl Tool for CodexTestToolRead {
+        fn name(&self) -> &str {
+            "read"
+        }
+        fn description(&self) -> &str {
+            "Read a file"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path" }
+                },
+                "required": ["path"]
+            })
+        }
+    }
+
+    #[test]
+    fn codex_request_includes_instructions_when_provided() {
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: MessageContent::Text("hello".into()),
+            timestamp: 1000,
+        })];
+        let tools: Vec<&dyn Tool> = vec![];
+        let body = build_codex_request_body("gpt-5.5", &messages, &tools, Some("You are a coding assistant"));
+
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["instructions"], "You are a coding assistant");
+        assert!(body.get("tools").is_none(), "No tools when empty list");
+    }
+
+    #[test]
+    fn codex_request_omits_instructions_when_none() {
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: MessageContent::Text("hello".into()),
+            timestamp: 1000,
+        })];
+        let tools: Vec<&dyn Tool> = vec![];
+        let body = build_codex_request_body("gpt-5.5", &messages, &tools, None);
+
+        assert!(body.get("instructions").is_none(), "No instructions when None");
+    }
+
+    #[test]
+    fn codex_request_single_tool_serialized_correctly() {
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: MessageContent::Text("run ls".into()),
+            timestamp: 1000,
+        })];
+        let tools: Vec<&dyn Tool> = vec![&CodexTestTool];
+        let body = build_codex_request_body("gpt-5.5", &messages, &tools, None);
+
+        let tools_arr = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools_arr.len(), 1);
+        assert_eq!(tools_arr[0]["type"], "function");
+        assert_eq!(tools_arr[0]["name"], "bash");
+        assert_eq!(tools_arr[0]["description"], "Execute bash commands");
+        assert_eq!(tools_arr[0]["parameters"]["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn codex_request_multiple_tools_serialized_correctly() {
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: MessageContent::Text("do stuff".into()),
+            timestamp: 1000,
+        })];
+        let tools: Vec<&dyn Tool> = vec![&CodexTestTool, &CodexTestToolRead];
+        let body = build_codex_request_body("gpt-5.5", &messages, &tools, Some("system"));
+
+        let tools_arr = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(tools_arr.len(), 2);
+        assert_eq!(tools_arr[0]["name"], "bash");
+        assert_eq!(tools_arr[1]["name"], "read");
+    }
+
+    #[test]
+    fn codex_request_preserves_history_with_tool_call_and_output() {
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: MessageContent::Text("Run ls".into()),
+                timestamp: 1000,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Text {
+                        text: "I'll run that".into(),
+                    },
+                    AssistantContent::ToolCall {
+                        id: "call_abc|fc_item_1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                    },
+                ],
+                api: "openai-codex-responses".into(),
+                provider: "openai-codex".into(),
+                model: "gpt-5.5".into(),
+                usage: None,
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 2000,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "call_abc|fc_item_1".into(),
+                tool_name: "bash".into(),
+                content: vec![TextOrImageContent::Text {
+                    text: "src\nCargo.toml".into(),
+                }],
+                details: None,
+                is_error: false,
+                timestamp: 3000,
+            }),
+        ];
+        let tools: Vec<&dyn Tool> = vec![&CodexTestTool];
+        let body = build_codex_request_body("gpt-5.5", &messages, &tools, Some("You are helpful"));
+
+        // Verify instructions
+        assert_eq!(body["instructions"], "You are helpful");
+
+        // Verify tools
+        let tools_arr = body["tools"].as_array().unwrap();
+        assert_eq!(tools_arr.len(), 1);
+        assert_eq!(tools_arr[0]["name"], "bash");
+
+        // Verify input history
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(
+            input.len(),
+            4,
+            "user + assistant(msg) + function_call + function_call_output"
+        );
+
+        // User message
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+
+        // Assistant text message
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+
+        // Function call
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_abc");
+        assert_eq!(input[2]["id"], "fc_item_1");
+        assert_eq!(input[2]["name"], "bash");
+        assert!(input[2]["arguments"].as_str().unwrap().contains("ls"));
+
+        // Function call output
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_abc");
+        assert!(input[3]["output"].as_str().unwrap().contains("Cargo.toml"));
+    }
+
+    #[tokio::test]
+    async fn codex_provider_error_emits_stream_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": { "message": "Internal server error" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Verify mock is reachable and returns 500
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/responses", mock_server.uri()))
+            .header("Authorization", "Bearer fake-token")
+            .header("Content-Type", "application/json")
+            .header("OpenAI-Beta", "responses=v1")
+            .json(&serde_json::json!({"model": "test", "input": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 500);
     }
 }

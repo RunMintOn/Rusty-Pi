@@ -957,4 +957,201 @@ mod tests {
         // The accumulated arguments should be: {"command":"echo hi"}
         assert_eq!(result[0].2["command"], "echo hi");
     }
+
+    // ── Wire-level request body test ──────────────────────────────────────
+
+    /// Test that the full request body for a complete tool-call round trip
+    /// contains all required fields: system prompt, tools, messages with
+    /// tool_calls, and tool result messages.
+    #[test]
+    fn deepseek_full_round_trip_request_body() {
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: MessageContent::Text("run ls".into()),
+                timestamp: 1000,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall {
+                    id: "call_xyz".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "ls -la"}),
+                }],
+                api: "openai-completions".into(),
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                usage: None,
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 2000,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "call_xyz".into(),
+                tool_name: "bash".into(),
+                content: vec![TextOrImageContent::Text {
+                    text: "src\nCargo.toml".into(),
+                }],
+                details: None,
+                is_error: false,
+                timestamp: 3000,
+            }),
+        ];
+
+        let tools: Vec<&dyn Tool> = vec![&TestTool];
+        let wire = DeepSeekProvider::build_messages(&messages, Some("You are a coding assistant"));
+        let wire_tools = DeepSeekProvider::build_tools(&tools);
+        let body = build_request_body("deepseek-v4-pro", &wire, &wire_tools);
+
+        // System prompt
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "You are a coding assistant");
+
+        // User message
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "run ls");
+
+        // Assistant with tool_calls
+        assert_eq!(body["messages"][2]["role"], "assistant");
+        assert!(body["messages"][2]["tool_calls"].is_array());
+        let tc = &body["messages"][2]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_xyz");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "bash");
+        assert!(tc["function"]["arguments"].as_str().unwrap().contains("ls -la"));
+
+        // Tool result
+        assert_eq!(body["messages"][3]["role"], "tool");
+        assert_eq!(body["messages"][3]["tool_call_id"], "call_xyz");
+        assert!(body["messages"][3]["content"].as_str().unwrap().contains("Cargo.toml"));
+
+        // Tools definition
+        assert!(body["tools"].is_array());
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "bash");
+        assert_eq!(body["tools"][0]["function"]["description"], "Execute bash commands");
+        assert!(body["tools"][0]["function"]["parameters"].is_object());
+
+        // Metadata
+        assert_eq!(body["model"], "deepseek-v4-pro");
+        assert_eq!(body["stream"], true);
+    }
+
+    // ── Interleaved multi-tool chunk test ─────────────────────────────────
+
+    /// Simulate two tool calls with interleaved argument chunks:
+    ///   tool 0 chunk A, tool 1 chunk A, tool 0 chunk B, tool 1 chunk B
+    /// Verify that IDs, names, and arguments don't cross-pollute.
+    #[test]
+    fn accumulator_interleaved_chunks_no_pollution() {
+        let mut acc = ToolCallAccumulator::new();
+
+        // tool 0: chunk A (id + name + partial args)
+        acc.push_delta(&serde_json::json!({
+            "index": 0,
+            "id": "call_read",
+            "function": {
+                "name": "read",
+                "arguments": "{\"path\":\"/tmp/"
+            }
+        }));
+
+        // tool 1: chunk A (id + name + partial args)
+        acc.push_delta(&serde_json::json!({
+            "index": 1,
+            "id": "call_bash",
+            "function": {
+                "name": "bash",
+                "arguments": "{\"command\":\"echo "
+            }
+        }));
+
+        // tool 0: chunk B (more args, no id/name)
+        acc.push_delta(&serde_json::json!({
+            "index": 0,
+            "function": {
+                "arguments": "foo.txt\"}"
+            }
+        }));
+
+        // tool 1: chunk B (more args, no id/name)
+        acc.push_delta(&serde_json::json!({
+            "index": 1,
+            "function": {
+                "arguments": "hi\"}"
+            }
+        }));
+
+        let result = acc.finalize();
+        assert_eq!(result.len(), 2, "Should have 2 tool calls");
+
+        let call_read = result.iter().find(|(id, _, _)| id == "call_read").unwrap();
+        let call_bash = result.iter().find(|(id, _, _)| id == "call_bash").unwrap();
+
+        // IDs and names preserved correctly
+        assert_eq!(call_read.0, "call_read");
+        assert_eq!(call_read.1, "read");
+        assert_eq!(call_bash.0, "call_bash");
+        assert_eq!(call_bash.1, "bash");
+
+        // Arguments don't cross-pollute
+        assert_eq!(call_read.2["path"], "/tmp/foo.txt");
+        assert_eq!(call_bash.2["command"], "echo hi");
+
+        // Both arguments are valid JSON
+        let read_json = serde_json::to_string(&call_read.2).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&read_json).is_ok());
+        let bash_json = serde_json::to_string(&call_bash.2).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&bash_json).is_ok());
+    }
+
+    /// Verify that when subsequent chunks lack id/name fields, the existing
+    /// values from the first chunk are not overwritten or lost.
+    #[test]
+    fn accumulator_subsequent_chunks_do_not_overwrite_id_or_name() {
+        let mut acc = ToolCallAccumulator::new();
+
+        // First chunk: has id and name
+        acc.push_delta(&serde_json::json!({
+            "index": 0,
+            "id": "call_real_id",
+            "function": {
+                "name": "real_name",
+                "arguments": "{\"a\":"
+            }
+        }));
+
+        // Second chunk: has different id/name (simulating protocol quirk)
+        // The accumulator should keep the original id/name from the first chunk
+        acc.push_delta(&serde_json::json!({
+            "index": 0,
+            "id": "call_overwrite",
+            "function": {
+                "name": "overwritten_name",
+                "arguments": "1}"
+            }
+        }));
+
+        let result = acc.finalize();
+        assert_eq!(result.len(), 1);
+        // First chunk's id and name should be preserved
+        assert_eq!(result[0].0, "call_real_id");
+        assert_eq!(result[0].1, "real_name");
+        assert_eq!(result[0].2["a"], 1);
+    }
+
+    /// Verify that after finalize, a second call returns empty (state consumed).
+    #[test]
+    fn accumulator_finalize_consumes_state() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.push_delta(&serde_json::json!({
+            "index": 0,
+            "id": "call_1",
+            "function": { "name": "bash", "arguments": "{}" }
+        }));
+
+        let first = acc.finalize();
+        assert_eq!(first.len(), 1);
+
+        let second = acc.finalize();
+        assert!(second.is_empty(), "Second finalize should return empty");
+    }
 }

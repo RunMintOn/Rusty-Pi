@@ -13,8 +13,8 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 /// Run configuration for the CLI.
 pub struct RunConfig {
@@ -88,8 +88,8 @@ async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
     let expanded = session.expand(prompt);
 
     let agent = session.agent();
-    let abort_flag: AbortFlag = Arc::new(AtomicBool::new(false));
-    agent.set_abort_flag(abort_flag.clone());
+    let abort_token: AbortFlag = CancellationToken::new();
+    agent.set_abort_flag(abort_token.clone());
 
     let formatter = Arc::new(OutputFormatter::new());
 
@@ -130,8 +130,7 @@ async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
         _ = tokio::signal::ctrl_c() => {
             let fmt = OutputFormatter::new();
             eprintln!("{}", fmt.interrupt());
-            abort_flag.store(true, Ordering::SeqCst);
-            abort_flag.store(false, Ordering::SeqCst);
+            abort_token.cancel();
             true
         }
     };

@@ -1,7 +1,8 @@
 //! Agent — the core loop that drives LLM ↔ tool interactions.
 
+use crate::agent::events::{AgentEvent, ProviderError};
 use crate::agent::session::Session;
-use crate::agent::types::AgentTool;
+use crate::agent::types::{AgentTool, AgentToolResult};
 use crate::ai::providers::{Model, ProviderApi};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{
@@ -9,9 +10,9 @@ use crate::ai::types::{
     ToolResultMessage, UserMessage,
 };
 use anyhow::{Context, Result};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for the agent.
 #[derive(Debug, Clone)]
@@ -38,8 +39,9 @@ pub type ToolStartCallback = Box<dyn Fn(&str, &str) + Send>;
 /// Callback when a tool finishes executing. Arguments: (tool_name, duration_ms).
 pub type ToolEndCallback = Box<dyn Fn(&str, u64) + Send>;
 
-/// Shared abort flag for signalling Ctrl+C / cancellation.
-pub type AbortFlag = Arc<AtomicBool>;
+/// Shared cancellation token for signalling Ctrl+C / cancellation.
+/// Each agent run creates a child token; cancelling the parent cancels all runs.
+pub type AbortFlag = CancellationToken;
 
 /// The agent that orchestrates the LLM → tool → LLM loop.
 pub struct Agent {
@@ -54,8 +56,10 @@ pub struct Agent {
     on_tool_start: Option<ToolStartCallback>,
     /// Optional callback when a tool finishes.
     on_tool_end: Option<ToolEndCallback>,
-    /// Shared flag: when true, the agent should abort the current round.
+    /// Shared cancellation token: cancelling this aborts the current run.
     abort: AbortFlag,
+    /// Optional event sender for unified event stream.
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 }
 
 impl Agent {
@@ -72,7 +76,8 @@ impl Agent {
             on_text: None,
             on_tool_start: None,
             on_tool_end: None,
-            abort: Arc::new(AtomicBool::new(false)),
+            abort: CancellationToken::new(),
+            event_tx: None,
         }
     }
 
@@ -110,7 +115,7 @@ impl Agent {
     /// Signal the agent to abort the current round.
     /// The next tick of the stream loop will notice and return `StopReason::Aborted`.
     pub fn abort(&self) {
-        self.abort.store(true, Ordering::SeqCst);
+        self.abort.cancel();
     }
 
     /// Switch the model used by this agent at runtime.
@@ -129,14 +134,38 @@ impl Agent {
         self.provider.list_models()
     }
 
-    /// Replace the abort flag (used to share a flag between REPL and agent).
-    pub fn set_abort_flag(&mut self, flag: AbortFlag) {
-        self.abort = flag;
+    /// Replace the cancellation token (used to share a token between REPL and agent).
+    pub fn set_abort_flag(&mut self, token: AbortFlag) {
+        self.abort = token;
     }
 
-    /// Get a reference to the abort flag (for sharing with the REPL).
+    /// Get a reference to the cancellation token (for sharing with the REPL).
     pub fn abort_flag(&self) -> AbortFlag {
         self.abort.clone()
+    }
+
+    /// Set the event sender for this agent. All events will be sent through this channel.
+    pub fn set_event_sender(&mut self, tx: mpsc::Sender<AgentEvent>) {
+        self.event_tx = Some(tx);
+    }
+
+    /// Get a receiver for agent events. Creates a new channel if none exists.
+    pub fn event_receiver(&mut self) -> mpsc::Receiver<AgentEvent> {
+        let (tx, rx) = mpsc::channel(256);
+        self.event_tx = Some(tx);
+        rx
+    }
+
+    /// Get a reference to the event sender (for dropping to close channel).
+    pub fn event_sender_ref(&self) -> Option<&mpsc::Sender<AgentEvent>> {
+        self.event_tx.as_ref()
+    }
+
+    /// Send an event if a sender is configured.
+    async fn emit(&self, event: AgentEvent) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(event).await;
+        }
     }
 
     pub fn add_tool(&mut self, tool: Box<dyn AgentTool>) {
@@ -188,6 +217,13 @@ impl Agent {
             .await
             .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
 
+        // Create a child token for this run. If the parent is already cancelled,
+        // this child will be immediately cancelled too.
+        let run_token = self.abort.child_token();
+
+        // Emit RunStarted
+        self.emit(AgentEvent::RunStarted).await;
+
         for round in 0..=self.config.max_tool_rounds {
             let tool_refs = self.tool_refs();
             let current_messages = self.session.messages().await;
@@ -209,7 +245,7 @@ impl Agent {
             let mut acc = MessageAccumulator::new(self.model.api, self.model.id, self.model.id);
 
             // Check for abort BEFORE starting the stream loop
-            if self.abort.load(Ordering::SeqCst) {
+            if run_token.is_cancelled() {
                 let msg = crate::ai::types::AssistantMessage {
                     content: vec![],
                     api: self.model.api.to_string(),
@@ -224,15 +260,25 @@ impl Agent {
                     .append_message(AgentMessage::Assistant(msg))
                     .await
                     .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
+                self.emit(AgentEvent::RunAborted).await;
                 return Ok(());
             }
 
             while let Some(event) = rx.recv().await {
+                // Check for abort on each event
+                if run_token.is_cancelled() {
+                    break;
+                }
+
                 // Fire streaming callback for text deltas
-                if let StreamEvent::TextDelta { ref delta } = event
-                    && let Some(ref mut cb) = self.on_text
-                {
-                    cb(delta);
+                if let StreamEvent::TextDelta { ref delta } = event {
+                    // Emit through event channel
+                    self.emit(AgentEvent::TextDelta { text: delta.clone() }).await;
+
+                    // Also fire legacy callback
+                    if let Some(ref mut cb) = self.on_text {
+                        cb(delta);
+                    }
                 }
 
                 let is_terminal = matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
@@ -243,7 +289,7 @@ impl Agent {
             }
 
             // Check for abort AFTER the stream loop (user hit Ctrl+C during streaming)
-            if self.abort.load(Ordering::SeqCst) {
+            if run_token.is_cancelled() {
                 // Override response with aborted status
                 let msg = crate::ai::types::AssistantMessage {
                     content: vec![],
@@ -259,10 +305,24 @@ impl Agent {
                     .append_message(AgentMessage::Assistant(msg))
                     .await
                     .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
+                self.emit(AgentEvent::RunAborted).await;
                 return Ok(());
             }
 
             let response = acc.build();
+
+            // Check for provider error
+            if response.stop_reason == StopReason::Error {
+                if let Some(err_msg) = &response.error_message {
+                    self.emit(AgentEvent::ProviderError {
+                        error: ProviderError {
+                            reason: StopReason::Error,
+                            message: err_msg.clone(),
+                        },
+                    })
+                    .await;
+                }
+            }
 
             // Extract tool calls as AgentToolCall structs
             let tool_calls: Vec<AgentToolCall> = response
@@ -299,6 +359,10 @@ impl Agent {
 
             match response.stop_reason {
                 StopReason::Stop | StopReason::Length | StopReason::Error | StopReason::Aborted => {
+                    self.emit(AgentEvent::RunFinished {
+                        stop_reason: response.stop_reason,
+                    })
+                    .await;
                     return Ok(());
                 }
                 StopReason::ToolUse => {
@@ -308,10 +372,44 @@ impl Agent {
 
                     let mut any_terminate = false;
                     for call in &tool_calls {
+                        // Emit ToolStarted
+                        self.emit(AgentEvent::ToolStarted {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        })
+                        .await;
+
                         let (tool_result, terminate) = self
-                            .execute_tool(&call.id, &call.name, call.arguments.clone())
+                            .execute_tool(&call.id, &call.name, call.arguments.clone(), &run_token)
                             .await
                             .with_context(|| format!("Tool '{}' execution failed", call.name))?;
+
+                        // Emit ToolFinished
+                        let result_for_event = match &tool_result {
+                            AgentMessage::ToolResult(tr) => AgentToolResult {
+                                content: tr
+                                    .content
+                                    .iter()
+                                    .map(|c| match c {
+                                        TextOrImageContent::Text { text } => Content::Text { text: text.clone() },
+                                        TextOrImageContent::Image { data, mime_type } => Content::Image {
+                                            data: data.clone(),
+                                            mime_type: mime_type.clone(),
+                                        },
+                                    })
+                                    .collect(),
+                                is_error: tr.is_error,
+                                ..Default::default()
+                            },
+                            _ => AgentToolResult::default(),
+                        };
+                        self.emit(AgentEvent::ToolFinished {
+                            id: call.id.clone(),
+                            result: result_for_event,
+                        })
+                        .await;
+
                         self.session
                             .append_message(tool_result)
                             .await
@@ -321,6 +419,10 @@ impl Agent {
                         }
                     }
                     if any_terminate {
+                        self.emit(AgentEvent::RunFinished {
+                            stop_reason: StopReason::Stop,
+                        })
+                        .await;
                         return Ok(());
                     }
                 }
@@ -336,6 +438,7 @@ impl Agent {
         tool_call_id: &str,
         tool_name: &str,
         args: serde_json::Value,
+        run_token: &CancellationToken,
     ) -> Result<(AgentMessage, bool)> {
         let tool = self
             .tools
@@ -351,19 +454,14 @@ impl Agent {
 
         let start_ms = Self::now_ms();
 
-        // Create a watch channel to relay the abort flag to the tool.
+        // Create a watch channel to relay cancellation to the tool.
         // The tool uses this to detect when it should stop early.
         let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
-        let abort = self.abort.clone();
+        let token = run_token.clone();
         let signal_handle = tokio::spawn(async move {
-            // Poll the abort flag periodically and send updates through the channel.
-            loop {
-                if abort.load(Ordering::SeqCst) {
-                    let _ = signal_tx.send(true);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            // Wait for cancellation and relay it through the watch channel.
+            token.cancelled().await;
+            let _ = signal_tx.send(true);
         });
 
         let result = tool
@@ -978,7 +1076,7 @@ mod tests {
         use crate::ai::mock::MultiToolCallProvider;
 
         // Use a long-running bash command
-        let shared_cwd = Arc::new(RwLock::new(std::env::current_dir().unwrap()));
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
         let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
 
         let multi = MultiToolCallProvider::new(
@@ -994,16 +1092,15 @@ mod tests {
         let mut agent = Agent::new(Box::new(multi), make_model());
         agent.add_tool(Box::new(bash_tool));
 
-        // Clone abort flag
-        let abort_flag = agent.abort_flag();
+        // Clone cancellation token
+        let token = agent.abort_flag();
 
-        // Run the agent in a blocking task and abort after a short delay
+        // Run the agent and abort after a short delay
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            // Spawn a thread to trigger abort (can't use tokio::spawn because Agent isn't Send)
-            let flag = abort_flag.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let token = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                token.cancel();
             });
 
             agent.run("sleep 30 seconds").await
@@ -1013,6 +1110,54 @@ mod tests {
         assert!(result.is_ok(), "Agent should finish within timeout after abort");
         let inner = result.unwrap();
         assert!(inner.is_ok(), "Agent should finish without error: {:?}", inner.err());
+    }
+
+    // ── CancellationToken isolation tests ──
+
+    #[tokio::test]
+    async fn agent_cancel_idle_produces_no_error() {
+        let mock = MockProvider::text("never reached");
+        let agent = Agent::new(Box::new(mock), make_model());
+        let token = agent.abort_flag();
+        token.cancel();
+        // Agent hasn't started running, cancelling should be harmless
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn agent_new_run_not_affected_by_old_cancel() {
+        let mock = MockProvider::new(vec![MockStep::Text("response".into())]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+
+        // Cancel the token before running
+        let old_token = agent.abort_flag();
+        old_token.cancel();
+        assert!(old_token.is_cancelled());
+
+        // Create a fresh token for the new run
+        let new_token = CancellationToken::new();
+        agent.set_abort_flag(new_token.clone());
+
+        // The new run should not be affected by the old cancellation
+        agent.run("hello").await.unwrap();
+        let msgs = agent.messages().await;
+        let last = msgs.last().unwrap();
+        match last {
+            AgentMessage::Assistant(a) => {
+                assert_eq!(a.stop_reason, StopReason::Stop);
+            }
+            _ => panic!("Expected assistant message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_double_cancel_is_idempotent() {
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(token.is_cancelled());
+        // Second cancel should not panic
+        token.cancel();
+        assert!(token.is_cancelled());
     }
 
     // ── Task 六: DeepSeek history — tool-only assistant messages preserved ──
@@ -1159,5 +1304,164 @@ mod tests {
         assert_eq!(tool_result.tool_name, "stateful");
         let details = tool_result.details.as_ref().unwrap();
         assert_eq!(details["exit_code"], 1);
+    }
+
+    // ── Structured error tool (not just exit code) ──
+
+    struct StructuredErrorTool;
+
+    impl Tool for StructuredErrorTool {
+        fn name(&self) -> &str {
+            "structured_err"
+        }
+        fn description(&self) -> &str {
+            "Returns structured error details"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string" }
+                },
+                "required": ["kind"]
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AgentTool for StructuredErrorTool {
+        fn label(&self) -> &str {
+            "structured_err"
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            params: serde_json::Value,
+            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+        ) -> anyhow::Result<AgentToolResult> {
+            let kind = params.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "structured" => Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "Permission denied: /root/secret".into(),
+                    }],
+                    is_error: true,
+                    details: serde_json::json!({
+                        "error_type": "permission_denied",
+                        "path": "/root/secret",
+                        "suggestion": "Run with sudo or check file permissions"
+                    }),
+                    ..Default::default()
+                }),
+                "all_fields" => Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "error with all fields".into(),
+                    }],
+                    is_error: true,
+                    exit_code: Some(127),
+                    timed_out: true,
+                    aborted: false,
+                    details: serde_json::json!({ "custom": "data" }),
+                    ..Default::default()
+                }),
+                _ => Ok(AgentToolResult {
+                    content: vec![Content::Text { text: "ok".into() }],
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_structured_error_preserves_custom_details() {
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_struct".into(),
+                name: "structured_err".into(),
+                arguments: serde_json::json!({"kind": "structured"}),
+                stop_reason: None,
+            },
+            MockStep::Text("handled".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(StructuredErrorTool));
+        agent.run("trigger structured error").await.unwrap();
+
+        let msgs = agent.messages().await;
+        let tool_result = msgs
+            .iter()
+            .find_map(|m| match m {
+                AgentMessage::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .expect("Should have tool result");
+
+        assert!(tool_result.is_error);
+        let details = tool_result.details.as_ref().unwrap();
+        assert_eq!(details["error_type"], "permission_denied");
+        assert_eq!(details["path"], "/root/secret");
+        assert_eq!(details["suggestion"], "Run with sudo or check file permissions");
+
+        // Text content should contain the error description
+        let text = tool_result.content.iter().find_map(|c| match c {
+            TextOrImageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(text.unwrap().contains("Permission denied"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_all_error_fields_present_in_details() {
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_all".into(),
+                name: "structured_err".into(),
+                arguments: serde_json::json!({"kind": "all_fields"}),
+                stop_reason: None,
+            },
+            MockStep::Text("handled".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(StructuredErrorTool));
+        agent.run("trigger all fields").await.unwrap();
+
+        let msgs = agent.messages().await;
+        let tool_result = msgs
+            .iter()
+            .find_map(|m| match m {
+                AgentMessage::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .expect("Should have tool result");
+
+        assert!(tool_result.is_error);
+        let details = tool_result.details.as_ref().unwrap();
+        assert_eq!(details["exit_code"], 127);
+        assert_eq!(details["timed_out"], true);
+        assert_eq!(details["custom"], "data");
+    }
+
+    #[tokio::test]
+    async fn tool_terminate_stops_agent_without_second_model_request() {
+        // Tool returns terminate=true. Agent should stop immediately
+        // after executing the tool, without making another LLM call.
+        let mock = MockProvider::new(vec![MockStep::ToolCall {
+            id: "tc_term".into(),
+            name: "terminator".into(),
+            arguments: serde_json::json!({}),
+            stop_reason: None,
+        }]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(TerminatorTool));
+        agent.run("terminate now").await.unwrap();
+
+        let msgs = agent.messages().await;
+        // user + assistant(tool_call) + tool_result = 3 messages
+        // No second assistant message (no second LLM call)
+        assert_eq!(msgs.len(), 3, "Should have exactly 3 messages (no second LLM call)");
+        assert!(matches!(&msgs[0], AgentMessage::User(_)));
+        assert!(matches!(&msgs[1], AgentMessage::Assistant(a) if a.stop_reason == StopReason::ToolUse));
+        assert!(matches!(&msgs[2], AgentMessage::ToolResult(_)));
     }
 }
