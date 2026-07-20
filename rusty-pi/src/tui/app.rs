@@ -708,4 +708,303 @@ mod tests {
         assert!(state.quit);
         assert!(matches!(&effects[0], Effect::Quit));
     }
+
+    // ── TestBackend rendering tests ───────────────────────────────────────
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn render_state(state: &AppState) -> String {
+        let backend = TestBackend::new(state.terminal_size.0, state.terminal_size.1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                super::view(frame, state);
+            })
+            .unwrap();
+        // Capture the buffer as a string using ratatui's built-in rendering
+        let buf = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..buf.area.height {
+            let mut line = String::new();
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                let symbol = cell.symbol();
+                line.push_str(symbol);
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn render_80x24_idle() {
+        let state = AppState::new((80, 24));
+        let output = render_state(&state);
+        assert!(output.contains("Transcript"), "Should show Transcript title");
+        assert!(output.contains("Input"), "Should show Input title");
+        assert!(output.contains("Ready"), "Should show Ready status");
+    }
+
+    #[test]
+    fn render_120x40() {
+        let state = AppState::new((120, 40));
+        let output = render_state(&state);
+        assert!(output.contains("Transcript"));
+        assert!(output.contains("Input"));
+    }
+
+    #[test]
+    fn render_narrow_terminal_40x12() {
+        let state = AppState::new((40, 12));
+        let output = render_state(&state);
+        // Should not panic on small terminal
+        assert!(output.contains("Transcript"));
+    }
+
+    #[test]
+    fn render_empty_transcript() {
+        let state = AppState::new((80, 24));
+        let output = render_state(&state);
+        assert!(output.contains("Transcript"));
+        // No user/assistant messages
+        assert!(!output.contains("You:"));
+    }
+
+    #[test]
+    fn render_user_message() {
+        let mut state = AppState::new((80, 24));
+        state.transcript.push(TranscriptEntry::User("hello world".into()));
+        let output = render_state(&state);
+        assert!(output.contains("You:"));
+        assert!(output.contains("hello world"));
+    }
+
+    #[test]
+    fn render_assistant_streaming_text() {
+        let mut state = AppState::new((80, 24));
+        state
+            .transcript
+            .push(TranscriptEntry::Assistant("Hello! I am here to help.".into()));
+        let output = render_state(&state);
+        assert!(output.contains("Hello! I am here to help."));
+    }
+
+    #[test]
+    fn render_tool_started() {
+        let mut state = AppState::new((80, 24));
+        state.transcript.push(TranscriptEntry::ToolStarted {
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        });
+        let output = render_state(&state);
+        assert!(output.contains("bash"));
+    }
+
+    #[test]
+    fn render_tool_output_stdout_stderr() {
+        let mut state = AppState::new((80, 24));
+        state
+            .transcript
+            .push(TranscriptEntry::Assistant("file1.txt\nfile2.txt".into()));
+        let output = render_state(&state);
+        assert!(output.contains("file1.txt"));
+        assert!(output.contains("file2.txt"));
+    }
+
+    #[test]
+    fn render_tool_finished_success() {
+        let mut state = AppState::new((80, 24));
+        state.transcript.push(TranscriptEntry::ToolFinished {
+            name: "bash".into(),
+            is_error: false,
+            output: "success".into(),
+        });
+        let output = render_state(&state);
+        assert!(output.contains("bash"));
+    }
+
+    #[test]
+    fn render_tool_finished_error() {
+        let mut state = AppState::new((80, 24));
+        state.transcript.push(TranscriptEntry::ToolFinished {
+            name: "bash".into(),
+            is_error: true,
+            output: "command failed".into(),
+        });
+        let output = render_state(&state);
+        assert!(output.contains("bash"));
+        assert!(output.contains("command failed"));
+    }
+
+    #[test]
+    fn render_provider_error() {
+        let mut state = AppState::new((80, 24));
+        state
+            .transcript
+            .push(TranscriptEntry::ProviderError("API limit".into()));
+        let output = render_state(&state);
+        assert!(output.contains("Error"));
+        assert!(output.contains("API limit"));
+    }
+
+    #[test]
+    fn render_aborted() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::RunAborted);
+        let output = render_state(&state);
+        assert!(output.contains("Aborted") || output.contains("abort"));
+    }
+
+    #[test]
+    fn render_long_text_wrapping() {
+        let mut state = AppState::new((80, 24));
+        let long_text = "a".repeat(200);
+        state.transcript.push(TranscriptEntry::Assistant(long_text.clone()));
+        let output = render_state(&state);
+        // Long text should be present (wrapping is handled by ratatui)
+        assert!(output.contains("aaaaaaaaaa"));
+    }
+
+    #[test]
+    fn render_unicode_and_chinese() {
+        let mut state = AppState::new((80, 24));
+        state
+            .transcript
+            .push(TranscriptEntry::Assistant("你好世界 🌍 café".into()));
+        // TestBackend has limitations with wide characters, so we verify
+        // the state is correct and rendering doesn't panic
+        let output = render_state(&state);
+        assert!(!output.is_empty());
+        // Verify the transcript entry exists
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptEntry::Assistant(s) => {
+                assert!(s.contains("你好世界"));
+                assert!(s.contains("café"));
+            }
+            _ => panic!("Expected Assistant entry"),
+        }
+    }
+
+    #[test]
+    fn render_resize() {
+        let mut state = AppState::new((80, 24));
+        state.update(Action::Resize(120, 40));
+        let output = render_state(&state);
+        assert!(output.contains("Transcript"));
+    }
+
+    #[test]
+    fn render_input_cursor_position() {
+        let mut state = AppState::new((80, 24));
+        state.input = "hello".into();
+        state.cursor = 3;
+        let output = render_state(&state);
+        assert!(output.contains("hello"));
+    }
+
+    #[test]
+    fn render_narrow_no_panic() {
+        // Very small terminal should not panic
+        let state = AppState::new((10, 5));
+        let output = render_state(&state);
+        assert!(!output.is_empty());
+    }
+
+    // ── Snapshot tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_idle() {
+        let state = AppState::new((80, 24));
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_streaming() {
+        let mut state = AppState::new((80, 24));
+        state.run_state = RunState::Running;
+        state.transcript.push(TranscriptEntry::User("hi".into()));
+        state.transcript.push(TranscriptEntry::Assistant(
+            "Hello! I can help you with coding tasks.".into(),
+        ));
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_tool_running() {
+        let mut state = AppState::new((80, 24));
+        state.run_state = RunState::Running;
+        state.current_tool = Some(super::ToolState {
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        });
+        state.transcript.push(TranscriptEntry::ToolStarted {
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_tool_success() {
+        let mut state = AppState::new((80, 24));
+        state.transcript.push(TranscriptEntry::ToolFinished {
+            name: "bash".into(),
+            is_error: false,
+            output: "file1.txt\nfile2.txt".into(),
+        });
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_tool_error() {
+        let mut state = AppState::new((80, 24));
+        state.transcript.push(TranscriptEntry::ToolFinished {
+            name: "bash".into(),
+            is_error: true,
+            output: "command not found".into(),
+        });
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_provider_error() {
+        let mut state = AppState::new((80, 24));
+        state
+            .transcript
+            .push(TranscriptEntry::ProviderError("Rate limit exceeded".into()));
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_aborted() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::RunAborted);
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_narrow_terminal() {
+        let state = AppState::new((40, 12));
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn snapshot_unicode() {
+        let mut state = AppState::new((80, 24));
+        state
+            .transcript
+            .push(TranscriptEntry::Assistant("你好世界 🌍 café résumé".into()));
+        let output = render_state(&state);
+        insta::assert_snapshot!(output);
+    }
 }

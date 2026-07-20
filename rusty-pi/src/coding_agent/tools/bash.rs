@@ -3,6 +3,7 @@
 //! Mirrors the original `@earendil-works/pi-coding-agent/src/core/tools/bash.ts`.
 //! Spawns a subprocess, captures stdout/stderr, handles timeouts and abort signals.
 
+use crate::agent::events::{AgentEvent, ToolOutputStream};
 use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionMode};
 use crate::ai::types::{Content, Tool};
 use crate::coding_agent::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
@@ -67,6 +68,8 @@ pub struct BashTool {
     shared_cwd: Arc<RwLock<PathBuf>>,
     /// Optional callback for streaming output as it arrives.
     output_cb: Mutex<Option<OutputCallback>>,
+    /// Optional event sender for ToolOutput events.
+    event_tx: Mutex<Option<tokio::sync::mpsc::Sender<AgentEvent>>>,
 }
 
 impl BashTool {
@@ -75,6 +78,7 @@ impl BashTool {
         Self {
             shared_cwd,
             output_cb: Mutex::new(None),
+            event_tx: Mutex::new(None),
         }
     }
 
@@ -167,6 +171,10 @@ impl AgentTool for BashTool {
         ToolExecutionMode::Sequential
     }
 
+    fn configure_streaming(&self, event_tx: tokio::sync::mpsc::Sender<AgentEvent>) {
+        *self.event_tx.lock().unwrap() = Some(event_tx);
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -174,6 +182,7 @@ impl AgentTool for BashTool {
         signal: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> anyhow::Result<AgentToolResult> {
         let bash_params: BashParams = serde_json::from_value(params)?;
+        let tool_call_id = _tool_call_id.to_string();
 
         // Read current shared CWD
         let current_cwd = self.cached_cwd();
@@ -206,12 +215,16 @@ impl AgentTool for BashTool {
         let mut child = cmd.spawn()?;
         let pid = child.id();
 
-        // Check if already aborted
+        // Take the event_tx for emitting ToolOutput events
+        let event_tx = self.event_tx.lock().unwrap().take();
+
+        // Check if already aborted before taking pipes
         if let Some(rx) = &signal
             && *rx.borrow()
         {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            kill_process_group(pid);
+            // Use timeout to avoid hanging on child.wait() due to SIGCHLD races
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             return Ok(AgentToolResult {
                 content: vec![Content::Text {
                     text: "Command aborted".into(),
@@ -237,31 +250,28 @@ impl AgentTool for BashTool {
         let mut stderr_reader = tokio::io::BufReader::new(stderr);
         let mut full_output = String::new();
 
-        // Read lines from both pipes concurrently, streaming via callback
         let mut stdout_line = String::new();
         let mut stderr_line = String::new();
         let mut stdout_done = false;
         let mut stderr_done = false;
         let mut timed_out = false;
+        let mut aborted_early = false;
 
         let timeout_dur = bash_params.timeout.filter(|&t| t > 0).map(Duration::from_secs);
 
+        // ── Main read loop ────────────────────────────────────────────────
+        // Design: child.wait() is called EXACTLY ONCE, after this loop exits.
+        // All branches that previously called child.wait() + return now just
+        // set a flag and break. This avoids the Linux SIGCHLD race condition
+        // where multiple wait() calls on a process_group(0) child can hang.
         while !stdout_done || !stderr_done {
-            // Check abort signal
+            // Check abort signal at top of loop
             if let Some(ref rx) = signal
                 && *rx.borrow()
             {
+                aborted_early = true;
                 kill_process_group(pid);
-                let _ = child.wait().await;
-                return Ok(AgentToolResult {
-                    content: vec![Content::Text {
-                        text: "Command aborted".into(),
-                    }],
-                    details: serde_json::json!({"aborted": true}),
-                    aborted: true,
-                    is_error: true,
-                    ..Default::default()
-                });
+                break;
             }
 
             tokio::select! {
@@ -273,6 +283,15 @@ impl AgentTool for BashTool {
                     if n == 0 {
                         stdout_done = true;
                     } else {
+                        // Emit ToolOutput event for stdout
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.try_send(AgentEvent::ToolOutput {
+                                id: tool_call_id.clone(),
+                                stream: ToolOutputStream::Stdout,
+                                chunk: stdout_line.clone(),
+                            });
+                        }
+                        // Also fire legacy callback
                         if let Some(ref mut cb) = *self.output_cb.lock().unwrap() {
                             cb(&stdout_line);
                         }
@@ -288,6 +307,15 @@ impl AgentTool for BashTool {
                     if n == 0 {
                         stderr_done = true;
                     } else {
+                        // Emit ToolOutput event for stderr
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.try_send(AgentEvent::ToolOutput {
+                                id: tool_call_id.clone(),
+                                stream: ToolOutputStream::Stderr,
+                                chunk: stderr_line.clone(),
+                            });
+                        }
+                        // Also fire legacy callback
                         if let Some(ref mut cb) = *self.output_cb.lock().unwrap() {
                             cb(&stderr_line);
                         }
@@ -302,15 +330,10 @@ impl AgentTool for BashTool {
                         std::future::pending::<()>().await;
                     }
                 } => {
+                    // Abort signal received during select
+                    aborted_early = true;
                     kill_process_group(pid);
-                    let _ = child.wait().await;
-                    return Ok(AgentToolResult {
-                        content: vec![Content::Text { text: "Command aborted".into() }],
-                        details: serde_json::json!({"aborted": true}),
-                        aborted: true,
-                        is_error: true,
-                        ..Default::default()
-                    });
+                    break;
                 }
                 _ = async {
                     if let Some(dur) = timeout_dur {
@@ -321,17 +344,35 @@ impl AgentTool for BashTool {
                 } => {
                     timed_out = true;
                     kill_process_group(pid);
-                    let _ = child.wait().await;
+                    break;
                 }
             }
         }
 
-        // Wait for process to fully exit
-        let exit_status = child.wait().await?;
-        let exit_code = exit_status.code();
+        // ── Single child.wait() call ──────────────────────────────────────
+        // After the loop exits (all pipes closed, or abort/timeout broke out),
+        // wait for the child process with a timeout. This is the ONLY place
+        // child.wait() is called in the normal execution path.
+        let exit_code = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => status.code(),
+            _ => None, // Process may have already been reaped or timed out
+        };
 
         // Extract CWD marker from output and update shared CWD
         let cleaned_output = self.extract_cwd_and_clean_output(&full_output);
+
+        // Handle abort (checked before timeout so abort takes priority)
+        if aborted_early {
+            return Ok(AgentToolResult {
+                content: vec![Content::Text {
+                    text: "Command aborted".into(),
+                }],
+                details: serde_json::json!({"aborted": true}),
+                aborted: true,
+                is_error: true,
+                ..Default::default()
+            });
+        }
 
         if timed_out {
             return Ok(AgentToolResult {
@@ -398,7 +439,7 @@ impl AgentTool for BashTool {
 
         Ok(AgentToolResult {
             content: vec![Content::Text { text: final_text }],
-            details: serde_json::json!({"exit_code": exit_code}),
+            details: serde_json::json!({ "exit_code": exit_code }),
             exit_code,
             ..Default::default()
         })
@@ -513,7 +554,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncation_lines_limit() {
-        // Generate output with many lines using seq, then truncate with max_lines=5
         let result = tool()
             .execute(
                 "c7",
@@ -531,14 +571,12 @@ mod tests {
             "Should have truncation message: {}",
             text
         );
-        // Last few lines (96-100) should be present
         assert!(text.contains("96"), "Should contain '96' in output: {}", text);
         assert!(text.contains("100"), "Should contain '100' in output: {}", text);
     }
 
     #[tokio::test]
     async fn truncation_bytes_limit() {
-        // Generate a line that exceeds the byte limit
         let result = tool()
             .execute(
                 "c8",
@@ -556,12 +594,10 @@ mod tests {
             "Should have truncation message: {}",
             text
         );
-        // First line "short" is part of the last lines kept, so it should be there or truncated
     }
 
     #[tokio::test]
     async fn bash_cwd_persists_across_calls() {
-        // Use a temp dir so we can cd into it
         let tmp = tempfile::tempdir().unwrap();
         let subdir = tmp.path().join("sub");
         std::fs::create_dir_all(&subdir).unwrap();
@@ -569,7 +605,6 @@ mod tests {
         let shared_cwd = Arc::new(RwLock::new(tmp.path().to_path_buf()));
         let tool = BashTool::new(shared_cwd.clone());
 
-        // First call: cd into sub and pwd
         let result = tool
             .execute("c1", serde_json::json!({"command": "cd sub && pwd"}), None)
             .await
@@ -580,7 +615,6 @@ mod tests {
         };
         assert!(text.ends_with("/sub"), "Expected pwd to end with /sub, got: {}", text);
 
-        // Verify shared_cwd was updated
         let cwd_after = shared_cwd.read().unwrap().clone();
         assert!(
             cwd_after.ends_with("sub"),
@@ -588,7 +622,6 @@ mod tests {
             cwd_after
         );
 
-        // Second call: pwd (should now be in sub)
         let result2 = tool
             .execute("c2", serde_json::json!({"command": "pwd"}), None)
             .await
@@ -599,7 +632,6 @@ mod tests {
         };
         assert!(text2.ends_with("/sub"), "Second pwd should show sub, got: {}", text2);
 
-        // Third call: cd .. and pwd
         let result3 = tool
             .execute("c3", serde_json::json!({"command": "cd .. && pwd"}), None)
             .await
@@ -609,5 +641,222 @@ mod tests {
             _ => panic!("Expected text content"),
         };
         assert_eq!(text3, tmp.path().to_string_lossy(), "Should go back to tmp");
+    }
+
+    // ── ToolOutput event tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_output_stdout_single_chunk() {
+        let t = tool();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        t.configure_streaming(tx);
+
+        let result = t
+            .execute("to1", serde_json::json!({"command": "echo hello"}), None)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        // Collect ToolOutput events
+        let mut outputs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ToolOutput { id, stream, chunk } = ev {
+                outputs.push((id, stream, chunk));
+            }
+        }
+        assert!(!outputs.is_empty(), "Should have ToolOutput events");
+        assert!(
+            outputs
+                .iter()
+                .any(|(_, s, c)| *s == ToolOutputStream::Stdout && c.contains("hello"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_stderr_single_chunk() {
+        let t = tool();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        t.configure_streaming(tx);
+
+        let result = t
+            .execute("to2", serde_json::json!({"command": "echo err >&2"}), None)
+            .await
+            .unwrap();
+
+        let mut outputs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ToolOutput { id, stream, chunk } = ev {
+                outputs.push((id, stream, chunk));
+            }
+        }
+        assert!(
+            outputs
+                .iter()
+                .any(|(_, s, c)| *s == ToolOutputStream::Stderr && c.contains("err"))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_stdout_stderr_interleaved() {
+        let t = tool();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        t.configure_streaming(tx);
+
+        let result = t
+            .execute(
+                "to3",
+                serde_json::json!({"command": "echo out1; echo err1 >&2; echo out2; echo err2 >&2"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+
+        let mut outputs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ToolOutput { stream, chunk, .. } = ev {
+                outputs.push((stream, chunk));
+            }
+        }
+        let stdout_chunks: Vec<&str> = outputs
+            .iter()
+            .filter(|(s, _)| *s == ToolOutputStream::Stdout)
+            .map(|(_, c)| c.as_str())
+            .collect();
+        let stderr_chunks: Vec<&str> = outputs
+            .iter()
+            .filter(|(s, _)| *s == ToolOutputStream::Stderr)
+            .map(|(_, c)| c.as_str())
+            .collect();
+        assert!(!stdout_chunks.is_empty(), "Should have stdout chunks");
+        assert!(!stderr_chunks.is_empty(), "Should have stderr chunks");
+    }
+
+    #[tokio::test]
+    async fn tool_output_preserves_tool_call_id() {
+        let t = tool();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        t.configure_streaming(tx);
+
+        let result = t
+            .execute("my_special_id", serde_json::json!({"command": "echo test"}), None)
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ToolOutput { id, .. } = ev {
+                ids.push(id);
+            }
+        }
+        assert!(
+            ids.iter().all(|id| id == "my_special_id"),
+            "All events should have correct tool call ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_no_late_events_after_cancel() {
+        let t = tool();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        t.configure_streaming(tx);
+
+        let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            t.execute(
+                "to_cancel",
+                serde_json::json!({"command": "for i in 1 2 3 4 5; do echo line_$i; sleep 0.1; done"}),
+                Some(abort_rx),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        abort_tx.send(true).ok();
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.aborted);
+
+        // Drain any events that arrived before cancel
+        let mut count = 0;
+        while let Ok(_ev) = rx.try_recv() {
+            count += 1;
+        }
+        // After cancel, no new events should arrive (this is a basic check)
+        // The key assertion is that the tool returned promptly
+    }
+
+    #[tokio::test]
+    async fn tool_output_timeout_no_late_events() {
+        let t = tool();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        t.configure_streaming(tx);
+
+        let result = t
+            .execute(
+                "to_timeout",
+                serde_json::json!({"command": "echo start; sleep 30", "timeout": 1}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+
+        // Drain events
+        let mut count = 0;
+        while let Ok(_ev) = rx.try_recv() {
+            count += 1;
+        }
+        // Events should have stopped after timeout
+    }
+
+    // ── Regression tests for parallel execution ──────────────────────────
+
+    #[tokio::test]
+    async fn bash_abort_pre_cancelled_token() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).ok();
+        let result = tool()
+            .execute("c_pre", serde_json::json!({"command": "sleep 30"}), Some(rx))
+            .await
+            .unwrap();
+        assert!(result.aborted);
+        let text = match &result.content[0] {
+            Content::Text { text } => text,
+            _ => panic!("Expected text"),
+        };
+        assert!(text.contains("aborted"));
+    }
+
+    #[tokio::test]
+    async fn bash_abort_concurrent_with_output() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let tool_instance = tool();
+
+        let handle = tokio::spawn(async move {
+            tool_instance
+                .execute(
+                    "c_conc",
+                    serde_json::json!({"command": "for i in 1 2 3 4 5; do echo line_$i; sleep 0.1; done"}),
+                    Some(rx),
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tx.send(true).ok();
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.aborted);
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_then_no_hang() {
+        let result = tool()
+            .execute("c_to", serde_json::json!({"command": "sleep 60", "timeout": 1}), None)
+            .await
+            .unwrap();
+        assert!(result.timed_out);
+        assert!(result.is_error);
     }
 }

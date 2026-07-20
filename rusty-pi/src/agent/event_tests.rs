@@ -343,4 +343,292 @@ mod tests {
             _ => unreachable!(),
         }
     }
+
+    // ── ToolOutput event chain tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_output_stdout_single_chunk_events() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_out1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "echo hello"}),
+                stop_reason: None,
+            },
+            MockStep::Text("done".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(bash_tool));
+
+        let events = collect_events(&mut agent, "echo hello").await;
+
+        // Should have ToolOutput events between ToolStarted and ToolFinished
+        let tool_outputs: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolOutput { .. }))
+            .collect();
+        assert!(!tool_outputs.is_empty(), "Should have ToolOutput events");
+
+        // All ToolOutput events should have the correct tool call ID
+        for ev in &tool_outputs {
+            if let AgentEvent::ToolOutput { id, stream, .. } = ev {
+                assert_eq!(id, "tc_out1");
+                assert_eq!(*stream, crate::agent::events::ToolOutputStream::Stdout);
+            }
+        }
+
+        // ToolFinished should come after all ToolOutput events
+        let last_output_idx = events
+            .iter()
+            .rposition(|e| matches!(e, AgentEvent::ToolOutput { .. }))
+            .unwrap();
+        let tool_finished_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolFinished { .. }))
+            .unwrap();
+        assert!(
+            tool_finished_idx > last_output_idx,
+            "ToolFinished should come after ToolOutput"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_stderr_events() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_err1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "echo err_msg >&2"}),
+                stop_reason: None,
+            },
+            MockStep::Text("done".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(bash_tool));
+
+        let events = collect_events(&mut agent, "stderr test").await;
+
+        let stderr_outputs: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::ToolOutput {
+                        stream: crate::agent::events::ToolOutputStream::Stderr,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(!stderr_outputs.is_empty(), "Should have stderr ToolOutput events");
+    }
+
+    #[tokio::test]
+    async fn tool_output_stdout_stderr_interleaved_events() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_mix".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "echo out1; echo err1 >&2; echo out2"}),
+                stop_reason: None,
+            },
+            MockStep::Text("done".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(bash_tool));
+
+        let events = collect_events(&mut agent, "mix test").await;
+
+        let stdout_events: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::ToolOutput {
+                        stream: crate::agent::events::ToolOutputStream::Stdout,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let stderr_events: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::ToolOutput {
+                        stream: crate::agent::events::ToolOutputStream::Stderr,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(!stdout_events.is_empty(), "Should have stdout events");
+        assert!(!stderr_events.is_empty(), "Should have stderr events");
+    }
+
+    #[tokio::test]
+    async fn tool_output_two_tools_no_id_crossover() {
+        use crate::ai::mock::MultiToolCallProvider;
+
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let multi = MultiToolCallProvider::new(
+            vec![
+                MockStep::ToolCall {
+                    id: "tc_a".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo alpha"}),
+                    stop_reason: None,
+                },
+                MockStep::ToolCall {
+                    id: "tc_b".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo beta"}),
+                    stop_reason: None,
+                },
+            ],
+            "both done",
+        );
+        let mut agent = Agent::new(Box::new(multi), make_model());
+        agent.add_tool(Box::new(bash_tool));
+
+        let events = collect_events(&mut agent, "two tools").await;
+
+        // Collect ToolOutput events and verify IDs don't cross
+        for ev in &events {
+            if let AgentEvent::ToolOutput { id, .. } = ev {
+                assert!(
+                    id == "tc_a" || id == "tc_b",
+                    "Tool ID should be tc_a or tc_b, got: {}",
+                    id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_output_then_tool_finished() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_of".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "echo data"}),
+                stop_reason: None,
+            },
+            MockStep::Text("done".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(bash_tool));
+
+        let events = collect_events(&mut agent, "output then finish").await;
+
+        // Verify order: ToolStarted -> ToolOutput(s) -> ToolFinished
+        let mut saw_started = false;
+        let mut saw_output = false;
+        let mut saw_finished = false;
+        for ev in &events {
+            match ev {
+                AgentEvent::ToolStarted { .. } => {
+                    assert!(!saw_started, "Should not see ToolStarted twice");
+                    saw_started = true;
+                }
+                AgentEvent::ToolOutput { .. } => {
+                    assert!(saw_started, "ToolOutput should come after ToolStarted");
+                    assert!(!saw_finished, "ToolOutput should come before ToolFinished");
+                    saw_output = true;
+                }
+                AgentEvent::ToolFinished { .. } => {
+                    assert!(saw_started, "ToolFinished should come after ToolStarted");
+                    saw_finished = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_started, "Should have ToolStarted");
+        assert!(saw_output, "Should have ToolOutput");
+        assert!(saw_finished, "Should have ToolFinished");
+    }
+
+    #[tokio::test]
+    async fn cancel_no_late_tool_output() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let multi = MultiToolCallProvider::new(
+            vec![MockStep::ToolCall {
+                id: "tc_long".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 30"}),
+                stop_reason: None,
+            }],
+            "should not reach",
+        );
+        let mut agent = Agent::new(Box::new(multi), make_model());
+        agent.add_tool(Box::new(bash_tool));
+        let token = agent.abort_flag();
+
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let token = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                token.cancel();
+            });
+            collect_events(&mut agent, "cancel test").await
+        })
+        .await
+        .unwrap();
+
+        // After cancel, should not have late ToolOutput events
+        // The events should end with RunAborted or RunFinished(Aborted)
+        let last = events.last().unwrap();
+        assert!(
+            matches!(
+                last,
+                AgentEvent::RunAborted | AgentEvent::ToolFinished { .. } | AgentEvent::RunFinished { .. }
+            ),
+            "Last event should be terminal: {:?}",
+            last
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_no_late_tool_output() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_to".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 30", "timeout": 1}),
+                stop_reason: None,
+            },
+            MockStep::Text("done".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(bash_tool));
+
+        let events = collect_events(&mut agent, "timeout no late").await;
+
+        // After timeout, ToolFinished should have is_error=true
+        let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
+        assert!(tool_finished.is_some());
+        if let AgentEvent::ToolFinished { result, .. } = tool_finished.unwrap() {
+            assert!(result.is_error || result.timed_out, "Tool should report error/timeout");
+        }
+    }
 }

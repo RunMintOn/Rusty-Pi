@@ -259,7 +259,8 @@ impl ProviderApi for OpenAICodexProvider {
             if let Err(e) =
                 do_codex_stream(&url, &token, &model_id, &input, &api_tools, instructions.as_deref(), tx).await
             {
-                eprintln!("[codex] {}", e);
+                // Error already sent through the channel by do_codex_stream.
+                let _ = e;
             }
         });
 

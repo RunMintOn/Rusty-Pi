@@ -98,6 +98,11 @@ impl PromptSession {
         &mut self.agent
     }
 
+    /// Consume the PromptSession and return the underlying Agent.
+    pub fn into_agent(self) -> Agent {
+        self.agent
+    }
+
     /// Access the underlying session.
     pub fn session(&self) -> &Session {
         self.agent.session()

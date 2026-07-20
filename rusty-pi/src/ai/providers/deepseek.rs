@@ -235,7 +235,10 @@ impl ProviderApi for DeepSeekProvider {
 
         tokio::spawn(async move {
             if let Err(e) = do_stream(&url, &api_key, &model_id, &api_messages, &api_tools, tx).await {
-                eprintln!("[deepseek] {}", e);
+                // Error already sent through the channel by do_stream.
+                // Intentionally not writing to stderr here — all terminal output
+                // goes through AgentEvent / frontend.
+                let _ = e;
             }
         });
 

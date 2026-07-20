@@ -99,6 +99,10 @@ struct Cli {
     /// Path to context file(s) whose content is injected into the system prompt
     #[arg(short = 'c', long = "context")]
     context: Vec<PathBuf>,
+
+    /// Launch the Ratatui TUI frontend instead of the print-based REPL
+    #[arg(long = "tui")]
+    tui: bool,
 }
 
 fn build_provider(name: &str, model_id: Option<&str>) -> anyhow::Result<(Box<dyn ProviderApi>, Model)> {
@@ -305,12 +309,109 @@ async fn main() -> anyhow::Result<()> {
         context_files,
     );
 
-    let config = RunConfig {
-        prompt: cli.prompt,
-        session,
-    };
+    // Launch TUI or REPL
+    if cli.tui {
+        run_tui(session).await
+    } else {
+        let config = RunConfig {
+            prompt: cli.prompt,
+            session,
+        };
+        repl::run(config).await
+    }
+}
 
-    repl::run(config).await
+/// Launch the Ratatui TUI frontend.
+async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
+    // Setup terminal
+    crossterm::terminal::enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    let size = terminal.size()?;
+    let mut app_state = rusty_pi::tui::app::AppState::new((size.width, size.height));
+
+    // Create agent and event channel
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+    let mut agent = session.into_agent();
+    agent.set_event_sender(event_tx);
+    let mut current_token = tokio_util::sync::CancellationToken::new();
+    agent.set_abort_flag(current_token.clone());
+
+    // Run TUI loop — agent runs inline when a prompt is submitted
+    let result = run_tui_loop(
+        &mut terminal,
+        &mut app_state,
+        &mut agent,
+        &mut current_token,
+        &mut event_rx,
+    )
+    .await;
+
+    // Restore terminal
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+/// TUI event loop.
+/// When a prompt is submitted, the agent runs inline (not in a separate task)
+/// so we avoid Send/Sync issues with the Agent's callback fields.
+async fn run_tui_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    state: &mut rusty_pi::tui::app::AppState,
+    agent: &mut rusty_pi::agent::engine::Agent,
+    current_token: &mut tokio_util::sync::CancellationToken,
+    event_rx: &mut tokio::sync::mpsc::Receiver<rusty_pi::agent::events::AgentEvent>,
+) -> anyhow::Result<()> {
+    use rusty_pi::tui::app::{Action, Effect};
+
+    loop {
+        // Draw
+        terminal.draw(|frame| {
+            rusty_pi::tui::app::view(frame, state);
+        })?;
+
+        // Handle events with a timeout so we can process agent events
+        let poll_timeout = std::time::Duration::from_millis(50);
+        if crossterm::event::poll(poll_timeout)? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                let effects = state.update(Action::KeyInput(key));
+                for effect in effects {
+                    match effect {
+                        Effect::RunAgent(prompt) => {
+                            // Create fresh token for this run
+                            let new_token = tokio_util::sync::CancellationToken::new();
+                            agent.set_abort_flag(new_token.clone());
+                            *current_token = new_token;
+                            // Run agent inline — events flow through the channel
+                            let _ = agent.run(&prompt).await;
+                        }
+                        Effect::CancelAgent => {
+                            current_token.cancel();
+                        }
+                        Effect::Quit => {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process agent events
+        while let Ok(event) = event_rx.try_recv() {
+            state.update(Action::AgentEvent(event));
+        }
+
+        // Check if we should quit
+        if state.quit {
+            return Ok(());
+        }
+    }
 }
 
 /// Build a formatted session listing string. Returns "No sessions found." or

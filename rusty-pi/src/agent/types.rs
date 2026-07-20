@@ -2,9 +2,11 @@
 //!
 //! Mirrors `@earendil-works/pi-agent-core/src/types.ts`.
 
+use crate::agent::events::AgentEvent;
 use crate::ai::types::{Content, Tool};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 /// Execution mode for a tool — sequential or parallel.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -86,6 +88,11 @@ pub trait AgentTool: Tool + Send + Sync {
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Sequential
     }
+
+    /// Configure streaming output for this tool execution.
+    /// Called before `execute()` to set up the event channel for ToolOutput events.
+    /// Default implementation does nothing (tools that don't stream output).
+    fn configure_streaming(&self, _event_tx: mpsc::Sender<AgentEvent>) {}
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

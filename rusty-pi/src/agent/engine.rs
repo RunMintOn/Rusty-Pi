@@ -464,6 +464,11 @@ impl Agent {
             let _ = signal_tx.send(true);
         });
 
+        // Configure streaming output for tools that support it
+        if let Some(ref tx) = self.event_tx {
+            tool.configure_streaming(tx.clone());
+        }
+
         let result = tool
             .execute(tool_call_id, args, Some(signal_rx))
             .await
