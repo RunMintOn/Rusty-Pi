@@ -54,6 +54,7 @@ pub trait ProviderApi: Send + Sync {
         model: &Model,
         messages: &[crate::ai::types::AgentMessage],
         tools: &[&dyn Tool],
+        system_prompt: Option<&str>,
     ) -> anyhow::Result<StreamReceiver>;
 
     /// List models available through this provider.
@@ -65,7 +66,10 @@ pub trait ProviderApi: Send + Sync {
     }
 
     /// Create a channel for sending stream events.
-    fn channel() -> (StreamSender, StreamReceiver) where Self: Sized {
+    fn channel() -> (StreamSender, StreamReceiver)
+    where
+        Self: Sized,
+    {
         tokio::sync::mpsc::channel(STREAM_CHANNEL_SIZE)
     }
 }

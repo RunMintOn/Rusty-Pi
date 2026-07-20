@@ -3,9 +3,9 @@
 //! Provides [`Command`] trait, [`CommandRegistry`], and built-in commands
 //! (`/help`, `/exit`, `/quit`).
 
-use anyhow::Result;
 use crate::coding_agent::prompt_session::PromptSession;
 use crate::format::OutputFormatter;
+use anyhow::Result;
 use std::sync::OnceLock;
 
 /// Run an async future to completion in a dedicated blocking runtime.
@@ -28,21 +28,14 @@ where
     // Initialize on a fresh thread — `Runtime::new()` panics if called from
     // within another runtime.
     RT.get_or_init(|| {
-        std::thread::spawn(|| {
-            tokio::runtime::Runtime::new()
-                .expect("failed to create blocking runtime")
-        })
-        .join()
-        .expect("blocking runtime init thread panicked")
+        std::thread::spawn(|| tokio::runtime::Runtime::new().expect("failed to create blocking runtime"))
+            .join()
+            .expect("blocking runtime init thread panicked")
     });
     let rt = RT.get().expect("blocking runtime not initialized");
     // Run on a scoped thread — it has no tokio context, so `rt.block_on` can
     // freely enter the separate runtime.
-    std::thread::scope(|s| {
-        s.spawn(|| rt.block_on(f))
-            .join()
-            .expect("blocking future panicked")
-    })
+    std::thread::scope(|s| s.spawn(|| rt.block_on(f)).join().expect("blocking future panicked"))
 }
 
 /// Outcome of dispatching a command.
@@ -90,9 +83,7 @@ pub struct CommandRegistry {
 impl CommandRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self {
-            commands: Vec::new(),
-        }
+        Self { commands: Vec::new() }
     }
 
     /// Register a command.
@@ -123,10 +114,7 @@ impl CommandRegistry {
 
         let parts: Vec<&str> = trimmed[1..].splitn(2, ' ').collect();
         let cmd_name = parts[0];
-        let args: Vec<&str> = parts
-            .get(1)
-            .map(|s| s.split_whitespace().collect())
-            .unwrap_or_default();
+        let args: Vec<&str> = parts.get(1).map(|s| s.split_whitespace().collect()).unwrap_or_default();
 
         // Handle /help directly so it works even when HelpCommand is a stub
         if cmd_name == "help" {
@@ -145,7 +133,10 @@ impl CommandRegistry {
         let fmt = OutputFormatter::new();
         eprintln!(
             "{}",
-            fmt.error(&format!("Unknown command '/{}'. Type '/help' for available commands.", cmd_name))
+            fmt.error(&format!(
+                "Unknown command '/{}'. Type '/help' for available commands.",
+                cmd_name
+            ))
         );
         Ok(DispatchOutcome::Handled)
     }
@@ -260,7 +251,11 @@ impl Command for ModelCommand {
         // Gather model IDs from the provider
         let models = {
             let agent = session.agent();
-            agent.list_models().into_iter().map(|m| m.id.to_string()).collect::<Vec<_>>()
+            agent
+                .list_models()
+                .into_iter()
+                .map(|m| m.id.to_string())
+                .collect::<Vec<_>>()
         };
 
         if models.is_empty() {
@@ -269,7 +264,10 @@ impl Command for ModelCommand {
                 let agent = session.agent();
                 agent.model().id.to_string()
             };
-            println!("Current model: {}. This provider doesn't support runtime model switching.", current);
+            println!(
+                "Current model: {}. This provider doesn't support runtime model switching.",
+                current
+            );
             return Ok(DispatchOutcome::Handled);
         }
 
@@ -326,8 +324,7 @@ impl Command for ContextCommand {
         };
 
         let path = std::path::PathBuf::from(&path_str);
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", path_str, e))?;
+        let content = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("Cannot read {}: {}", path_str, e))?;
         let size_kb = content.len() / 1024;
         session.add_context_file(path, content);
         println!("✓ Added {} ({}KB) to system prompt", path_str, size_kb);
@@ -338,14 +335,17 @@ impl Command for ContextCommand {
 #[cfg(test)]
 mod ticket21_tests {
     use super::*;
-    use crate::coding_agent::picker::MockPicker;
     use crate::ai::mock::MockProvider;
     use crate::ai::providers::Model;
+    use crate::coding_agent::picker::MockPicker;
     use std::path::PathBuf;
 
     fn mock_session() -> PromptSession {
         let provider = MockProvider::text("mock");
-        let model = Model { id: "mock", api: "mock" };
+        let model = Model {
+            id: "mock",
+            api: "mock",
+        };
         PromptSession::new(
             Box::new(provider),
             model,
@@ -393,10 +393,7 @@ mod ticket21_tests {
 
     #[test]
     fn model_command_dispatch_via_registry() {
-        let picker = Box::new(MockPicker::new(
-            vec!["model-123".into()],
-            vec![],
-        ));
+        let picker = Box::new(MockPicker::new(vec!["model-123".into()], vec![]));
         let mut registry = CommandRegistry::new();
         registry.register(Box::new(ModelCommand::new(picker)));
         let mut session = mock_session();
@@ -473,37 +470,48 @@ impl Command for TreeCommand {
         }
 
         // Find roots: entries whose parent_id is None or points outside the set
-        let roots: Vec<&SessionTreeEntry> = entries.iter()
+        let roots: Vec<&SessionTreeEntry> = entries
+            .iter()
             .filter(|e| e.parent_id().map_or(true, |pid| !all_ids.contains(pid)))
             .collect();
 
         fn label_for_entry(entry: &SessionTreeEntry) -> String {
             match entry {
-                SessionTreeEntry::Message(m) => {
-                    match &m.message {
-                        AgentMessage::User(u) => {
-                            let preview = match &u.content {
-                                MessageContent::Text(t) => {
-                                    if t.len() > 60 { format!("{}...", &t[..60]) } else { t.clone() }
-                                },
-                                _ => "(non-text)".into(),
-                            };
-                            format!("user: {}", preview)
-                        },
-                        AgentMessage::Assistant(a) => {
-                            let preview = a.content.first().map(|c| match c {
-                                AssistantContent::Text { text } => {
-                                    if text.len() > 60 { format!("{}...", &text[..60]) } else { text.clone() }
-                                },
-                                _ => "(tool call)".into(),
-                            }).unwrap_or_default();
-                            format!("assistant: {}", preview)
-                        },
-                        AgentMessage::ToolResult(t) => {
-                            format!("tool: {}", t.tool_name)
-                        },
-                        _ => "(other)".into(),
+                SessionTreeEntry::Message(m) => match &m.message {
+                    AgentMessage::User(u) => {
+                        let preview = match &u.content {
+                            MessageContent::Text(t) => {
+                                if t.len() > 60 {
+                                    format!("{}...", &t[..60])
+                                } else {
+                                    t.clone()
+                                }
+                            }
+                            _ => "(non-text)".into(),
+                        };
+                        format!("user: {}", preview)
                     }
+                    AgentMessage::Assistant(a) => {
+                        let preview = a
+                            .content
+                            .first()
+                            .map(|c| match c {
+                                AssistantContent::Text { text } => {
+                                    if text.len() > 60 {
+                                        format!("{}...", &text[..60])
+                                    } else {
+                                        text.clone()
+                                    }
+                                }
+                                _ => "(tool call)".into(),
+                            })
+                            .unwrap_or_default();
+                        format!("assistant: {}", preview)
+                    }
+                    AgentMessage::ToolResult(t) => {
+                        format!("tool: {}", t.tool_name)
+                    }
+                    _ => "(other)".into(),
                 },
                 _ => format!("{:?}", entry.entry_type()),
             }
@@ -557,8 +565,8 @@ impl Command for ListSessionsCommand {
     }
 
     fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
-        use crate::agent::session::storage::SessionStorage;
         use crate::agent::session::jsonl::JsonlSessionStorage;
+        use crate::agent::session::storage::SessionStorage;
         use crate::ai::types::AgentMessage;
 
         let sessions_dir = session.agent_dir().join("sessions");
@@ -627,7 +635,10 @@ mod ticket22_tests {
 
     fn mock_session() -> PromptSession {
         let provider = MockProvider::text("mock");
-        let model = Model { id: "mock", api: "mock" };
+        let model = Model {
+            id: "mock",
+            api: "mock",
+        };
         PromptSession::new(
             Box::new(provider),
             model,
@@ -771,7 +782,10 @@ mod tests {
     /// Create a minimal PromptSession for testing command dispatch.
     fn mock_session() -> PromptSession {
         let provider = MockProvider::text("mock");
-        let model = Model { id: "mock", api: "mock" };
+        let model = Model {
+            id: "mock",
+            api: "mock",
+        };
         PromptSession::new(
             Box::new(provider),
             model,
@@ -874,10 +888,7 @@ mod tests {
 
     #[test]
     fn mock_reader_returns_lines_in_order() {
-        let mut reader = MockLineReader::new(vec![
-            "first".into(),
-            "second".into(),
-        ]);
+        let mut reader = MockLineReader::new(vec!["first".into(), "second".into()]);
         assert_eq!(reader.readline("> ").unwrap(), "first");
         assert_eq!(reader.readline("> ").unwrap(), "second");
     }

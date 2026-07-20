@@ -3,14 +3,14 @@
 use crate::agent::engine::AbortFlag;
 use crate::ai::types::{AgentMessage, StopReason};
 use crate::coding_agent::command::{
-    CommandRegistry, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader,
-    ListSessionsCommand, ModelCommand, QuitCommand, SessionCommand, TreeCommand,
+    CommandRegistry, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader, ListSessionsCommand,
+    ModelCommand, QuitCommand, SessionCommand, TreeCommand,
 };
 use crate::coding_agent::prompt_session::PromptSession;
 use crate::format::OutputFormatter;
 use anyhow::Result;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -173,8 +173,7 @@ async fn run_repl(session: &mut PromptSession) -> Result<()> {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    let mut rl = DefaultEditor::new()
-        .map_err(|e| anyhow::anyhow!("Failed to create REPL editor: {}", e))?;
+    let mut rl = DefaultEditor::new().map_err(|e| anyhow::anyhow!("Failed to create REPL editor: {}", e))?;
     let _ = rl.load_history(&hist_path);
     let mut reader = RustylineReader::new(rl);
 
@@ -259,7 +258,10 @@ mod tests {
     /// A minimal PromptSession that doesn't connect to real providers.
     fn mock_session() -> PromptSession {
         let provider = crate::ai::mock::MockProvider::text("mock reply");
-        let model = crate::ai::providers::Model { id: "mock", api: "mock" };
+        let model = crate::ai::providers::Model {
+            id: "mock",
+            api: "mock",
+        };
         PromptSession::new(
             Box::new(provider),
             model,
@@ -329,10 +331,7 @@ mod tests {
     async fn repl_with_regular_prompt_then_exit() {
         let mut session = mock_session();
         let registry = default_registry();
-        let mut reader = MockLineReader::new(vec![
-            "hello agent".into(),
-            "/exit".into(),
-        ]);
+        let mut reader = MockLineReader::new(vec!["hello agent".into(), "/exit".into()]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
         run_repl_with(&mut session, &registry, &mut reader, &hist)
@@ -347,11 +346,7 @@ mod tests {
     async fn repl_with_empty_lines_skips() {
         let mut session = mock_session();
         let registry = default_registry();
-        let mut reader = MockLineReader::new(vec![
-            "".into(),
-            "  ".into(),
-            "/exit".into(),
-        ]);
+        let mut reader = MockLineReader::new(vec!["".into(), "  ".into(), "/exit".into()]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
         run_repl_with(&mut session, &registry, &mut reader, &hist)
@@ -379,11 +374,7 @@ mod tests {
     async fn repl_multiple_prompts() {
         let mut session = mock_session();
         let registry = default_registry();
-        let mut reader = MockLineReader::new(vec![
-            "first".into(),
-            "second".into(),
-            "/exit".into(),
-        ]);
+        let mut reader = MockLineReader::new(vec!["first".into(), "second".into(), "/exit".into()]);
         let hist = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
 
         run_repl_with(&mut session, &registry, &mut reader, &hist)
@@ -398,18 +389,12 @@ mod tests {
     #[test]
     fn history_path_uses_home_env() {
         let path = history_path_for_home("/home/user");
-        assert_eq!(
-            path,
-            PathBuf::from("/home/user/.pi/agent/repl-history.txt")
-        );
+        assert_eq!(path, PathBuf::from("/home/user/.pi/agent/repl-history.txt"));
     }
 
     #[test]
     fn history_path_handles_trailing_slash() {
         let path = history_path_for_home("/home/user/");
-        assert_eq!(
-            path,
-            PathBuf::from("/home/user/.pi/agent/repl-history.txt")
-        );
+        assert_eq!(path, PathBuf::from("/home/user/.pi/agent/repl-history.txt"));
     }
 }

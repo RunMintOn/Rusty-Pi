@@ -32,8 +32,7 @@ impl Picker for RealPicker {
         if let Some(h) = help_message {
             text = text.with_help_message(h);
         }
-        text.prompt()
-            .map_err(|e| anyhow::anyhow!("Input cancelled: {}", e))
+        text.prompt().map_err(|e| anyhow::anyhow!("Input cancelled: {}", e))
     }
 }
 
@@ -81,20 +80,14 @@ mod tests {
 
     #[test]
     fn mock_picker_returns_select_values_in_order() {
-        let picker = MockPicker::new(
-            vec!["model-a".into(), "model-b".into()],
-            vec![],
-        );
+        let picker = MockPicker::new(vec!["model-a".into(), "model-b".into()], vec![]);
         assert_eq!(picker.select("pick", vec!["a".into(), "b".into()]).unwrap(), "model-a");
         assert_eq!(picker.select("pick", vec!["a".into(), "b".into()]).unwrap(), "model-b");
     }
 
     #[test]
     fn mock_picker_returns_text_values() {
-        let picker = MockPicker::new(
-            vec![],
-            vec!["/path/to/file".into()],
-        );
+        let picker = MockPicker::new(vec![], vec!["/path/to/file".into()]);
         assert_eq!(picker.text("path?", None, None).unwrap(), "/path/to/file");
     }
 

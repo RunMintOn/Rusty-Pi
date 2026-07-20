@@ -5,8 +5,8 @@ use crate::agent::types::AgentTool;
 use crate::ai::providers::{Model, ProviderApi};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{
-    AgentMessage, AgentToolCall, AssistantContent, Content, MessageContent, StopReason,
-    TextOrImageContent, Tool, ToolResultMessage, UserMessage,
+    AgentMessage, AgentToolCall, AssistantContent, Content, MessageContent, StopReason, TextOrImageContent, Tool,
+    ToolResultMessage, UserMessage,
 };
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -155,6 +155,11 @@ impl Agent {
         &self.session
     }
 
+    /// Get a reference to the provider (for test assertions).
+    pub fn provider(&self) -> &dyn ProviderApi {
+        self.provider.as_ref()
+    }
+
     /// Replace the session backing this agent (e.g., with a JSONL-persisted session).
     pub fn set_session(&mut self, session: Session) {
         self.session = session;
@@ -178,25 +183,30 @@ impl Agent {
             content: MessageContent::Text(prompt.to_string()),
             timestamp: now,
         });
-        self.session.append_message(user_msg).await
+        self.session
+            .append_message(user_msg)
+            .await
             .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
 
         for round in 0..=self.config.max_tool_rounds {
             let tool_refs = self.tool_refs();
             let current_messages = self.session.messages().await;
 
+            // System prompt is passed separately via the provider API
+            let system_prompt = if self.config.system_prompt.is_empty() {
+                None
+            } else {
+                Some(self.config.system_prompt.as_str())
+            };
+
             let mut rx = self
                 .provider
-                .stream(&self.model, &current_messages, &tool_refs)
+                .stream(&self.model, &current_messages, &tool_refs, system_prompt)
                 .await
                 .with_context(|| format!("LLM call failed at round {}", round))?;
 
             // Accumulate stream events into an AssistantMessage
-            let mut acc = MessageAccumulator::new(
-                self.model.api,
-                self.model.id,
-                self.model.id,
-            );
+            let mut acc = MessageAccumulator::new(self.model.api, self.model.id, self.model.id);
 
             // Check for abort BEFORE starting the stream loop
             if self.abort.load(Ordering::SeqCst) {
@@ -210,7 +220,9 @@ impl Agent {
                     error_message: Some("Aborted by user".into()),
                     timestamp: Self::now_ms(),
                 };
-                self.session.append_message(AgentMessage::Assistant(msg)).await
+                self.session
+                    .append_message(AgentMessage::Assistant(msg))
+                    .await
                     .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
                 return Ok(());
             }
@@ -218,8 +230,9 @@ impl Agent {
             while let Some(event) = rx.recv().await {
                 // Fire streaming callback for text deltas
                 if let StreamEvent::TextDelta { ref delta } = event
-                    && let Some(ref mut cb) = self.on_text {
-                        cb(delta);
+                    && let Some(ref mut cb) = self.on_text
+                {
+                    cb(delta);
                 }
 
                 let is_terminal = matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
@@ -242,7 +255,9 @@ impl Agent {
                     error_message: Some("Aborted by user".into()),
                     timestamp: Self::now_ms(),
                 };
-                self.session.append_message(AgentMessage::Assistant(msg)).await
+                self.session
+                    .append_message(AgentMessage::Assistant(msg))
+                    .await
                     .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
                 return Ok(());
             }
@@ -250,13 +265,18 @@ impl Agent {
             let response = acc.build();
 
             // Extract tool calls as AgentToolCall structs
-            let tool_calls: Vec<AgentToolCall> = response.content.iter()
+            let tool_calls: Vec<AgentToolCall> = response
+                .content
+                .iter()
                 .filter_map(|c| match c {
-                    AssistantContent::ToolCall { id, name, arguments } => {
-                        Some(AgentToolCall { id: id.clone(), name: name.clone(), arguments: arguments.clone() })
-                    }
+                    AssistantContent::ToolCall { id, name, arguments } => Some(AgentToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    }),
                     _ => None,
-                }).collect();
+                })
+                .collect();
 
             let has_tool_calls = !tool_calls.is_empty();
             let stop_reason = if has_tool_calls && response.stop_reason == StopReason::Stop {
@@ -273,7 +293,8 @@ impl Agent {
             };
 
             self.session
-                .append_message(AgentMessage::Assistant(response.clone())).await
+                .append_message(AgentMessage::Assistant(response.clone()))
+                .await
                 .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
 
             match response.stop_reason {
@@ -282,10 +303,7 @@ impl Agent {
                 }
                 StopReason::ToolUse => {
                     if round >= self.config.max_tool_rounds {
-                        anyhow::bail!(
-                            "Exceeded maximum tool call rounds ({})",
-                            self.config.max_tool_rounds
-                        );
+                        anyhow::bail!("Exceeded maximum tool call rounds ({})", self.config.max_tool_rounds);
                     }
 
                     let mut any_terminate = false;
@@ -294,7 +312,9 @@ impl Agent {
                             .execute_tool(&call.id, &call.name, call.arguments.clone())
                             .await
                             .with_context(|| format!("Tool '{}' execution failed", call.name))?;
-                        self.session.append_message(tool_result).await
+                        self.session
+                            .append_message(tool_result)
+                            .await
                             .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
                         if terminate {
                             any_terminate = true;
@@ -330,10 +350,29 @@ impl Agent {
         }
 
         let start_ms = Self::now_ms();
+
+        // Create a watch channel to relay the abort flag to the tool.
+        // The tool uses this to detect when it should stop early.
+        let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
+        let abort = self.abort.clone();
+        let signal_handle = tokio::spawn(async move {
+            // Poll the abort flag periodically and send updates through the channel.
+            loop {
+                if abort.load(Ordering::SeqCst) {
+                    let _ = signal_tx.send(true);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
         let result = tool
-            .execute(tool_call_id, args, None)
+            .execute(tool_call_id, args, Some(signal_rx))
             .await
             .with_context(|| format!("Tool '{}' execution failed", tool_name))?;
+
+        // Abort the signal relay task since the tool has finished.
+        signal_handle.abort();
 
         let end_ms = Self::now_ms();
         let duration_ms = (end_ms - start_ms) as u64;
@@ -350,21 +389,40 @@ impl Agent {
             .into_iter()
             .filter_map(|c| match c {
                 Content::Text { text } => Some(TextOrImageContent::Text { text }),
-                Content::Image { data, mime_type } => {
-                    Some(TextOrImageContent::Image { data, mime_type })
-                }
+                Content::Image { data, mime_type } => Some(TextOrImageContent::Image { data, mime_type }),
                 _ => None,
             })
             .collect();
 
-        Ok((AgentMessage::ToolResult(ToolResultMessage {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            content,
-            details: Some(serde_json::json!({})),
-            is_error: false,
-            timestamp: now,
-        }), result.terminate))
+        // Build structured details from AgentToolResult fields
+        let details = {
+            let mut d = match result.details {
+                serde_json::Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            if let Some(code) = result.exit_code {
+                d.insert("exit_code".into(), serde_json::json!(code));
+            }
+            if result.timed_out {
+                d.insert("timed_out".into(), serde_json::json!(true));
+            }
+            if result.aborted {
+                d.insert("aborted".into(), serde_json::json!(true));
+            }
+            serde_json::Value::Object(d)
+        };
+
+        Ok((
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                content,
+                details: Some(details),
+                is_error: result.is_error,
+                timestamp: now,
+            }),
+            result.terminate,
+        ))
     }
 }
 
@@ -374,14 +432,19 @@ mod tests {
     use crate::agent::types::AgentToolResult;
     use crate::ai::mock::{MockProvider, MockStep};
     use crate::ai::providers::Model;
+    use crate::ai::types::AssistantMessage;
     use async_trait::async_trait;
     use std::sync::{Arc, RwLock};
 
     struct EchoTool;
 
     impl Tool for EchoTool {
-        fn name(&self) -> &str { "echo" }
-        fn description(&self) -> &str { "Echoes the input back" }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes the input back"
+        }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({
                 "type": "object",
@@ -393,7 +456,9 @@ mod tests {
 
     #[async_trait]
     impl AgentTool for EchoTool {
-        fn label(&self) -> &str { "echo" }
+        fn label(&self) -> &str {
+            "echo"
+        }
 
         async fn execute(
             &self,
@@ -403,13 +468,20 @@ mod tests {
         ) -> anyhow::Result<AgentToolResult> {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
             Ok(AgentToolResult {
-                content: vec![Content::Text { text: format!("echo: {}", text) }],
+                content: vec![Content::Text {
+                    text: format!("echo: {}", text),
+                }],
                 ..Default::default()
             })
         }
     }
 
-    fn make_model() -> Model { Model { id: "mock", api: "mock" } }
+    fn make_model() -> Model {
+        Model {
+            id: "mock",
+            api: "mock",
+        }
+    }
 
     #[tokio::test]
     async fn agent_returns_text_response() {
@@ -430,7 +502,12 @@ mod tests {
     #[tokio::test]
     async fn agent_handles_tool_call_and_result() {
         let mock = MockProvider::new(vec![
-            MockStep::ToolCall { id: "tc_1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "hello"}), stop_reason: None },
+            MockStep::ToolCall {
+                id: "tc_1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "hello"}),
+                stop_reason: None,
+            },
             MockStep::Text("Done!".into()),
         ]);
         let mut agent = Agent::new(Box::new(mock), make_model());
@@ -467,14 +544,17 @@ mod tests {
     #[tokio::test]
     async fn agent_with_bash_tool() {
         let mock = MockProvider::new(vec![
-            MockStep::ToolCall { id: "tc_bash".into(), name: "bash".into(), arguments: serde_json::json!({"command": "echo bash-works"}), stop_reason: None },
+            MockStep::ToolCall {
+                id: "tc_bash".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "echo bash-works"}),
+                stop_reason: None,
+            },
             MockStep::Text("Done".into()),
         ]);
         let mut agent = Agent::new(Box::new(mock), make_model());
         let shared_cwd = Arc::new(RwLock::new(std::env::current_dir().unwrap()));
-        agent.add_tool(Box::new(crate::coding_agent::tools::bash::BashTool::new(
-            shared_cwd,
-        )));
+        agent.add_tool(Box::new(crate::coding_agent::tools::bash::BashTool::new(shared_cwd)));
         agent.run("Run bash").await.unwrap();
         let msgs = agent.messages().await;
         assert!(msgs.len() >= 4);
@@ -491,15 +571,30 @@ mod tests {
     #[tokio::test]
     async fn agent_multiple_rounds() {
         let mock = MockProvider::new(vec![
-            MockStep::ToolCall { id: "tc_1".into(), name: "echo".into(), arguments: serde_json::json!({"text": "first"}), stop_reason: None },
-            MockStep::ToolCall { id: "tc_2".into(), name: "echo".into(), arguments: serde_json::json!({"text": "second"}), stop_reason: None },
+            MockStep::ToolCall {
+                id: "tc_1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "first"}),
+                stop_reason: None,
+            },
+            MockStep::ToolCall {
+                id: "tc_2".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "second"}),
+                stop_reason: None,
+            },
             MockStep::Text("All done".into()),
         ]);
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.add_tool(Box::new(EchoTool));
         agent.run("Do two things").await.unwrap();
         assert_eq!(
-            agent.messages().await.iter().filter(|m| matches!(m, AgentMessage::ToolResult(_))).count(),
+            agent
+                .messages()
+                .await
+                .iter()
+                .filter(|m| matches!(m, AgentMessage::ToolResult(_)))
+                .count(),
             2
         );
     }
@@ -522,14 +617,12 @@ mod tests {
     async fn agent_does_not_execute_tool_calls_from_length_truncated_response() {
         // When the provider returns tool calls with StopReason::Length,
         // the agent should NOT execute those tool calls.
-        let mock = MockProvider::new(vec![
-            MockStep::ToolCall {
-                id: "tc_1".into(),
-                name: "echo".into(),
-                arguments: serde_json::json!({"text": "should-not-run"}),
-                stop_reason: Some(StopReason::Length),
-            },
-        ]);
+        let mock = MockProvider::new(vec![MockStep::ToolCall {
+            id: "tc_1".into(),
+            name: "echo".into(),
+            arguments: serde_json::json!({"text": "should-not-run"}),
+            stop_reason: Some(StopReason::Length),
+        }]);
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.add_tool(Box::new(EchoTool));
         agent.run("Run echo").await.unwrap();
@@ -547,14 +640,12 @@ mod tests {
     #[tokio::test]
     async fn agent_terminate_flag_stops_loop() {
         // A tool that signals termination should stop the agent loop after its round.
-        let mock = MockProvider::new(vec![
-            MockStep::ToolCall {
-                id: "tc_1".into(),
-                name: "terminator".into(),
-                arguments: serde_json::json!({}),
-                stop_reason: None,
-            },
-        ]);
+        let mock = MockProvider::new(vec![MockStep::ToolCall {
+            id: "tc_1".into(),
+            name: "terminator".into(),
+            arguments: serde_json::json!({}),
+            stop_reason: None,
+        }]);
         let mut agent = Agent::new(Box::new(mock), make_model());
         agent.add_tool(Box::new(TerminatorTool));
         agent.run("Terminate").await.unwrap();
@@ -566,8 +657,12 @@ mod tests {
     struct TerminatorTool;
 
     impl Tool for TerminatorTool {
-        fn name(&self) -> &str { "terminator" }
-        fn description(&self) -> &str { "Terminates the loop" }
+        fn name(&self) -> &str {
+            "terminator"
+        }
+        fn description(&self) -> &str {
+            "Terminates the loop"
+        }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({ "type": "object", "properties": {} })
         }
@@ -575,7 +670,9 @@ mod tests {
 
     #[async_trait]
     impl AgentTool for TerminatorTool {
-        fn label(&self) -> &str { "terminator" }
+        fn label(&self) -> &str {
+            "terminator"
+        }
 
         async fn execute(
             &self,
@@ -589,5 +686,478 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    // ── Task 二: Complete tool call round-trip with second request verification ──
+
+    #[tokio::test]
+    async fn agent_complete_tool_call_round_trip_second_request_includes_history() {
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_roundtrip".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "round-trip"}),
+                stop_reason: None,
+            },
+            MockStep::Text("Round trip complete".into()),
+        ]);
+        let captured = mock.captured_requests_arc();
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(EchoTool));
+        agent.run("Do a round trip").await.unwrap();
+
+        // The provider should have been called twice
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "Provider should have been called twice");
+
+        // First request: just the user message
+        let req1 = &requests[0];
+        assert_eq!(req1.len(), 1);
+        assert!(
+            matches!(&req1[0], AgentMessage::User(u) if u.content == MessageContent::Text("Do a round trip".into()))
+        );
+
+        // Second request: user + assistant(tool_call) + tool_result
+        let req2 = &requests[1];
+        assert_eq!(
+            req2.len(),
+            3,
+            "Second request should have user + assistant + tool_result"
+        );
+
+        // Verify message types
+        assert!(matches!(&req2[0], AgentMessage::User(_)));
+        assert!(matches!(&req2[1], AgentMessage::Assistant(a) if a.stop_reason == StopReason::ToolUse));
+        assert!(matches!(&req2[2], AgentMessage::ToolResult(tr) if tr.tool_call_id == "tc_roundtrip"));
+
+        // Verify assistant message has tool call
+        if let AgentMessage::Assistant(a) = &req2[1] {
+            let tc = a.content.iter().find_map(|c| match c {
+                AssistantContent::ToolCall { id, name, arguments } => Some((id, name, arguments)),
+                _ => None,
+            });
+            let (id, name, args) = tc.expect("Should have tool call in assistant message");
+            assert_eq!(id, "tc_roundtrip");
+            assert_eq!(name, "echo");
+            assert_eq!(args["text"], "round-trip");
+        }
+
+        // Verify tool result message
+        if let AgentMessage::ToolResult(tr) = &req2[2] {
+            assert_eq!(tr.tool_call_id, "tc_roundtrip");
+            assert_eq!(tr.tool_name, "echo");
+            assert!(!tr.is_error);
+            let text = tr.content.iter().find_map(|c| match c {
+                TextOrImageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            });
+            assert_eq!(text, Some("echo: round-trip"));
+        }
+    }
+
+    // ── Task 三: Multiple tool calls in one response ──
+
+    #[tokio::test]
+    async fn agent_multiple_tool_calls_in_single_response() {
+        use crate::ai::mock::MultiToolCallProvider;
+
+        let multi = MultiToolCallProvider::new(
+            vec![
+                MockStep::ToolCall {
+                    id: "tc_multi_a".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"text": "alpha"}),
+                    stop_reason: None,
+                },
+                MockStep::ToolCall {
+                    id: "tc_multi_b".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"text": "beta"}),
+                    stop_reason: None,
+                },
+            ],
+            "Both done",
+        );
+        let mut agent = Agent::new(Box::new(multi), make_model());
+        agent.add_tool(Box::new(EchoTool));
+        agent.run("Two echoes").await.unwrap();
+
+        let msgs = agent.messages().await;
+        // user + assistant(2 tool calls) + tool_result(1) + tool_result(2) + assistant(final) = 5
+        assert_eq!(
+            msgs.len(),
+            5,
+            "Should have 5 messages: user + assistant + 2 tool results + final assistant"
+        );
+
+        // Verify both tool results
+        let tool_results: Vec<&ToolResultMessage> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 2, "Should have 2 tool results");
+        assert_eq!(tool_results[0].tool_call_id, "tc_multi_a");
+        assert_eq!(tool_results[1].tool_call_id, "tc_multi_b");
+        assert_eq!(tool_results[0].tool_name, "echo");
+        assert_eq!(tool_results[1].tool_name, "echo");
+
+        // Verify the text content
+        let text_a = tool_results[0].content.iter().find_map(|c| match c {
+            TextOrImageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(text_a, Some("echo: alpha"));
+        let text_b = tool_results[1].content.iter().find_map(|c| match c {
+            TextOrImageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(text_b, Some("echo: beta"));
+    }
+
+    // ── Task 四: Tool result five states ──
+
+    struct StatefulTool;
+
+    impl Tool for StatefulTool {
+        fn name(&self) -> &str {
+            "stateful"
+        }
+        fn description(&self) -> &str {
+            "Returns different states based on input"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                },
+                "required": ["action"]
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AgentTool for StatefulTool {
+        fn label(&self) -> &str {
+            "stateful"
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            params: serde_json::Value,
+            signal: Option<tokio::sync::watch::Receiver<bool>>,
+        ) -> anyhow::Result<AgentToolResult> {
+            let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            match action {
+                "ok" => Ok(AgentToolResult {
+                    content: vec![Content::Text { text: "success".into() }],
+                    ..Default::default()
+                }),
+                "error" => Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "something went wrong".into(),
+                    }],
+                    is_error: true,
+                    exit_code: Some(1),
+                    ..Default::default()
+                }),
+                "timeout" => Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "command timed out after 5 seconds".into(),
+                    }],
+                    is_error: true,
+                    timed_out: true,
+                    ..Default::default()
+                }),
+                "abort" => {
+                    // Check if already aborted
+                    if let Some(rx) = &signal
+                        && *rx.borrow()
+                    {
+                        return Ok(AgentToolResult {
+                            content: vec![Content::Text { text: "aborted".into() }],
+                            is_error: true,
+                            aborted: true,
+                            ..Default::default()
+                        });
+                    }
+                    Ok(AgentToolResult {
+                        content: vec![Content::Text {
+                            text: "abort requested".into(),
+                        }],
+                        is_error: true,
+                        aborted: true,
+                        ..Default::default()
+                    })
+                }
+                _ => Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: format!("unknown action: {}", action),
+                    }],
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    async fn run_single_tool_action(action: &str) -> ToolResultMessage {
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: format!("tc_{}", action),
+                name: "stateful".into(),
+                arguments: serde_json::json!({"action": action}),
+                stop_reason: None,
+            },
+            MockStep::Text("done".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(StatefulTool));
+        agent.run(&format!("do {}", action)).await.unwrap();
+        let msgs = agent.messages().await;
+        msgs.into_iter()
+            .find_map(|m| match m {
+                AgentMessage::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .expect("Should have a tool result")
+    }
+
+    #[tokio::test]
+    async fn tool_result_state_ok() {
+        let tr = run_single_tool_action("ok").await;
+        assert!(!tr.is_error);
+        let text = tr.content.iter().find_map(|c| match c {
+            TextOrImageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(text, Some("success"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_state_error() {
+        let tr = run_single_tool_action("error").await;
+        assert!(tr.is_error);
+        assert_eq!(tr.details.as_ref().and_then(|d| d["exit_code"].as_i64()), Some(1));
+        let text = tr.content.iter().find_map(|c| match c {
+            TextOrImageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(text, Some("something went wrong"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_state_timeout() {
+        let tr = run_single_tool_action("timeout").await;
+        assert!(tr.is_error);
+        let text = tr.content.iter().find_map(|c| match c {
+            TextOrImageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(text.unwrap().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn tool_result_state_aborted() {
+        let tr = run_single_tool_action("abort").await;
+        assert!(tr.is_error);
+        let text = tr.content.iter().find_map(|c| match c {
+            TextOrImageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(text.unwrap().contains("abort"));
+    }
+
+    // ── Task 五: Agent-level cancellation ──
+
+    #[tokio::test]
+    async fn agent_cancellation_aborts_long_running_tool() {
+        use crate::ai::mock::MultiToolCallProvider;
+
+        // Use a long-running bash command
+        let shared_cwd = Arc::new(RwLock::new(std::env::current_dir().unwrap()));
+        let bash_tool = crate::coding_agent::tools::bash::BashTool::new(shared_cwd);
+
+        let multi = MultiToolCallProvider::new(
+            vec![MockStep::ToolCall {
+                id: "tc_long".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 30"}),
+                stop_reason: None,
+            }],
+            "should not reach here",
+        );
+
+        let mut agent = Agent::new(Box::new(multi), make_model());
+        agent.add_tool(Box::new(bash_tool));
+
+        // Clone abort flag
+        let abort_flag = agent.abort_flag();
+
+        // Run the agent in a blocking task and abort after a short delay
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // Spawn a thread to trigger abort (can't use tokio::spawn because Agent isn't Send)
+            let flag = abort_flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            agent.run("sleep 30 seconds").await
+        })
+        .await;
+
+        assert!(result.is_ok(), "Agent should finish within timeout after abort");
+        let inner = result.unwrap();
+        assert!(inner.is_ok(), "Agent should finish without error: {:?}", inner.err());
+    }
+
+    // ── Task 六: DeepSeek history — tool-only assistant messages preserved ──
+
+    #[test]
+    fn deepseek_preserves_tool_only_assistant_messages() {
+        use crate::ai::providers::deepseek::DeepSeekProvider;
+
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: MessageContent::Text("run ls".into()),
+                timestamp: 1000,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                }],
+                api: "openai-completions".into(),
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                usage: None,
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 2000,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "bash".into(),
+                content: vec![TextOrImageContent::Text { text: "src".into() }],
+                details: None,
+                is_error: false,
+                timestamp: 3000,
+            }),
+        ];
+
+        let wire = DeepSeekProvider::build_messages(&messages, None);
+        assert_eq!(wire.len(), 3, "All 3 messages should be present");
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[1]["role"], "assistant");
+        assert!(
+            wire[1]["tool_calls"].is_array(),
+            "Assistant with tool_calls should have tool_calls field"
+        );
+        assert!(
+            wire[1]["content"].is_null(),
+            "Assistant with only tool calls should have null content"
+        );
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn deepseek_multi_turn_history_order() {
+        use crate::ai::providers::deepseek::DeepSeekProvider;
+
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: MessageContent::Text("hello".into()),
+                timestamp: 1000,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text {
+                    text: "I'll help".into(),
+                }],
+                api: "openai-completions".into(),
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 1100,
+            }),
+            AgentMessage::User(UserMessage {
+                content: MessageContent::Text("now run ls".into()),
+                timestamp: 2000,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall {
+                    id: "call_2".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                }],
+                api: "openai-completions".into(),
+                provider: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                usage: None,
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 2100,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "call_2".into(),
+                tool_name: "bash".into(),
+                content: vec![TextOrImageContent::Text {
+                    text: "file.txt".into(),
+                }],
+                details: None,
+                is_error: false,
+                timestamp: 2200,
+            }),
+        ];
+
+        let wire = DeepSeekProvider::build_messages(&messages, None);
+        assert_eq!(wire.len(), 5, "All 5 messages should be present in order");
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[1]["role"], "assistant");
+        assert_eq!(wire[2]["role"], "user");
+        assert_eq!(wire[3]["role"], "assistant");
+        assert!(wire[3]["tool_calls"].is_array());
+        assert_eq!(wire[4]["role"], "tool");
+        assert_eq!(wire[4]["tool_call_id"], "call_2");
+    }
+
+    // ── Tool result semantic preservation in session ──
+
+    #[tokio::test]
+    async fn agent_tool_result_preserves_error_state_in_session() {
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_err".into(),
+                name: "stateful".into(),
+                arguments: serde_json::json!({"action": "error"}),
+                stop_reason: None,
+            },
+            MockStep::Text("Got error".into()),
+        ]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(StatefulTool));
+        agent.run("trigger error").await.unwrap();
+
+        let msgs = agent.messages().await;
+        let tool_result = msgs
+            .iter()
+            .find_map(|m| match m {
+                AgentMessage::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .expect("Should have tool result");
+
+        assert!(tool_result.is_error, "Tool result should be marked as error");
+        assert_eq!(tool_result.tool_call_id, "tc_err");
+        assert_eq!(tool_result.tool_name, "stateful");
+        let details = tool_result.details.as_ref().unwrap();
+        assert_eq!(details["exit_code"], 1);
     }
 }

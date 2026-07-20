@@ -6,22 +6,22 @@
 //! - `rusty-pi -p codex "prompt"` — use OpenAI Codex provider
 
 use clap::Parser;
+use rusty_pi::agent::session::SessionStorage;
 use rusty_pi::agent::session::jsonl::{JsonlSessionCreateOptions, JsonlSessionStorage};
 use rusty_pi::agent::session::session::{Session, SessionContextBuildOptions};
-use rusty_pi::agent::session::SessionStorage;
+use rusty_pi::agent::session::types::iso_timestamp;
 use rusty_pi::ai::mock::MockProvider;
-use rusty_pi::ai::providers::deepseek::{DeepSeekProvider, DEEPSEEK_MODELS};
-use rusty_pi::ai::providers::openai_codex::{OpenAICodexProvider, OPENAI_CODEX_MODELS};
+use rusty_pi::ai::providers::deepseek::{DEEPSEEK_MODELS, DeepSeekProvider};
+use rusty_pi::ai::providers::openai_codex::{OPENAI_CODEX_MODELS, OpenAICodexProvider};
 use rusty_pi::ai::providers::{Model, ProviderApi};
 use rusty_pi::coding_agent::prompt_session::PromptSession;
-use rusty_pi::coding_agent::system_prompt::ContextFile;
-use rusty_pi::agent::session::types::iso_timestamp;
 use rusty_pi::coding_agent::repl::{self, RunConfig};
-use rusty_pi::format::OutputFormatter;
+use rusty_pi::coding_agent::system_prompt::ContextFile;
 use rusty_pi::coding_agent::tools::bash::BashTool;
 use rusty_pi::coding_agent::tools::edit::EditTool;
 use rusty_pi::coding_agent::tools::read::ReadTool;
 use rusty_pi::coding_agent::tools::write::WriteTool;
+use rusty_pi::format::OutputFormatter;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -104,62 +104,69 @@ struct Cli {
 fn build_provider(name: &str, model_id: Option<&str>) -> anyhow::Result<(Box<dyn ProviderApi>, Model)> {
     match name {
         "mock" => Ok((
-            Box::new(MockProvider::text(
-                "Hello from rusty-pi! I'm a mock LLM provider.",
-            )),
-            Model { id: "mock", api: "mock" },
+            Box::new(MockProvider::text("Hello from rusty-pi! I'm a mock LLM provider.")),
+            Model {
+                id: "mock",
+                api: "mock",
+            },
         )),
         "deepseek" => {
             let provider = DeepSeekProvider::from_env().ok_or_else(|| {
                 let fmt = OutputFormatter::new();
-                anyhow::anyhow!("{}", fmt.error(
-                    "DEEPSEEK_API_KEY not set. Get your key at https://platform.deepseek.com/api-keys"
-                ))
+                anyhow::anyhow!(
+                    "{}",
+                    fmt.error("DEEPSEEK_API_KEY not set. Get your key at https://platform.deepseek.com/api-keys")
+                )
             })?;
 
             let model_id = model_id.unwrap_or("deepseek-v4-flash");
-            let model = DEEPSEEK_MODELS
-                .iter()
-                .find(|m| m.id == model_id)
-                .ok_or_else(|| {
-                    let fmt = OutputFormatter::new();
-                    let available: Vec<&str> = DEEPSEEK_MODELS.iter().map(|m| m.id).collect();
-                    anyhow::anyhow!("{}", fmt.error(&format!(
+            let model = DEEPSEEK_MODELS.iter().find(|m| m.id == model_id).ok_or_else(|| {
+                let fmt = OutputFormatter::new();
+                let available: Vec<&str> = DEEPSEEK_MODELS.iter().map(|m| m.id).collect();
+                anyhow::anyhow!(
+                    "{}",
+                    fmt.error(&format!(
                         "Unknown DeepSeek model '{}'. Available: {:?}",
                         model_id, available
-                    )))
-                })?;
+                    ))
+                )
+            })?;
 
             Ok((Box::new(provider), model.clone()))
         }
         "codex" => {
             let provider = OpenAICodexProvider::from_env().ok_or_else(|| {
                 let fmt = OutputFormatter::new();
-                anyhow::anyhow!("{}", fmt.error(
-                    "OPENAI_CODEX_TOKEN not set. Get your ChatGPT access token from browser devtools."
-                ))
+                anyhow::anyhow!(
+                    "{}",
+                    fmt.error("OPENAI_CODEX_TOKEN not set. Get your ChatGPT access token from browser devtools.")
+                )
             })?;
 
             let model_id = model_id.unwrap_or("gpt-5.6-sol");
-            let model = OPENAI_CODEX_MODELS
-                .iter()
-                .find(|m| m.id == model_id)
-                .ok_or_else(|| {
-                    let fmt = OutputFormatter::new();
-                    let available: Vec<&str> = OPENAI_CODEX_MODELS.iter().map(|m| m.id).collect();
-                    anyhow::anyhow!("{}", fmt.error(&format!(
+            let model = OPENAI_CODEX_MODELS.iter().find(|m| m.id == model_id).ok_or_else(|| {
+                let fmt = OutputFormatter::new();
+                let available: Vec<&str> = OPENAI_CODEX_MODELS.iter().map(|m| m.id).collect();
+                anyhow::anyhow!(
+                    "{}",
+                    fmt.error(&format!(
                         "Unknown Codex model '{}'. Available: {:?}",
                         model_id, available
-                    )))
-                })?;
+                    ))
+                )
+            })?;
 
             Ok((Box::new(provider), model.clone()))
         }
         other => {
             let fmt = OutputFormatter::new();
-            anyhow::bail!("{}", fmt.error(&format!(
-                "Unknown provider '{}'. Supported: mock, deepseek, codex", other
-            )))
+            anyhow::bail!(
+                "{}",
+                fmt.error(&format!(
+                    "Unknown provider '{}'. Supported: mock, deepseek, codex",
+                    other
+                ))
+            )
         }
     }
 }
@@ -170,13 +177,14 @@ async fn main() -> anyhow::Result<()> {
     let config = RustyPiConfig::load();
 
     // Resolve provider: CLI > config > "mock"
-    let provider_name = cli.provider.as_deref()
+    let provider_name = cli
+        .provider
+        .as_deref()
         .or(config.default_provider.as_deref())
         .unwrap_or("mock");
 
     // Resolve model: CLI > config > None (let provider decide)
-    let model_id = cli.model.as_deref()
-        .or(config.default_model.as_deref());
+    let model_id = cli.model.as_deref().or(config.default_model.as_deref());
 
     let (provider, model) = build_provider(provider_name, model_id)?;
     let cwd = std::env::current_dir()?;
@@ -190,11 +198,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Create or resume JSONL session
-    let session_obj = create_or_resume_session(
-        &agent_dir,
-        &cwd,
-        cli.resume.as_deref(),
-    ).await?;
+    let session_obj = create_or_resume_session(&agent_dir, &cwd, cli.resume.as_deref()).await?;
 
     let shared_cwd = Arc::new(RwLock::new(cwd.clone()));
 
@@ -250,7 +254,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Load context files
-    let context_files: Vec<ContextFile> = cli.context.iter()
+    let context_files: Vec<ContextFile> = cli
+        .context
+        .iter()
         .filter_map(|p| {
             let resolved = if p.is_relative() {
                 let cwd = std::env::current_dir().ok()?;
@@ -262,24 +268,24 @@ async fn main() -> anyhow::Result<()> {
             if let Ok(meta) = std::fs::metadata(&resolved) {
                 if meta.len() > 1_048_576 {
                     let fmt = OutputFormatter::new();
-                    eprintln!("{}", fmt.error(&format!(
-                        "Context file '{}' is > 1MB, skipping", p.display()
-                    )));
+                    eprintln!(
+                        "{}",
+                        fmt.error(&format!("Context file '{}' is > 1MB, skipping", p.display()))
+                    );
                     return None;
                 }
             }
             match std::fs::read_to_string(&resolved) {
-                Ok(content) => {
-                    Some(ContextFile {
-                        path: resolved,
-                        content,
-                    })
-                }
+                Ok(content) => Some(ContextFile {
+                    path: resolved,
+                    content,
+                }),
                 Err(e) => {
                     let fmt = OutputFormatter::new();
-                    eprintln!("{}", fmt.error(&format!(
-                        "Cannot read context file '{}': {}", p.display(), e
-                    )));
+                    eprintln!(
+                        "{}",
+                        fmt.error(&format!("Cannot read context file '{}': {}", p.display(), e))
+                    );
                     None
                 }
             }
@@ -327,7 +333,11 @@ async fn format_session_list(sessions_dir: &PathBuf) -> anyhow::Result<String> {
         match JsonlSessionStorage::open(path.to_string_lossy().to_string()).await {
             Ok(storage) => {
                 let meta = storage.get_metadata().await;
-                sessions.push((meta.id.clone(), meta.created_at.clone(), path.to_string_lossy().to_string()));
+                sessions.push((
+                    meta.id.clone(),
+                    meta.created_at.clone(),
+                    path.to_string_lossy().to_string(),
+                ));
             }
             Err(_) => continue,
         }
@@ -356,11 +366,7 @@ async fn list_sessions(sessions_dir: &PathBuf) -> anyhow::Result<()> {
 }
 
 /// Create a new JSONL session or resume an existing one.
-async fn create_or_resume_session(
-    agent_dir: &PathBuf,
-    cwd: &PathBuf,
-    resume: Option<&str>,
-) -> anyhow::Result<Session> {
+async fn create_or_resume_session(agent_dir: &PathBuf, cwd: &PathBuf, resume: Option<&str>) -> anyhow::Result<Session> {
     match resume {
         Some(path_or_prefix) => {
             let path = std::path::Path::new(path_or_prefix);
@@ -371,17 +377,22 @@ async fn create_or_resume_session(
                 let sessions_dir = agent_dir.join("sessions");
                 if !sessions_dir.exists() {
                     let fmt = OutputFormatter::new();
-                    anyhow::bail!("{}", fmt.error(&format!(
-                        "No session found matching '{}'. Sessions directory does not exist.",
-                        path_or_prefix
-                    )));
+                    anyhow::bail!(
+                        "{}",
+                        fmt.error(&format!(
+                            "No session found matching '{}'. Sessions directory does not exist.",
+                            path_or_prefix
+                        ))
+                    );
                 }
                 let mut matches: Vec<PathBuf> = Vec::new();
                 let mut read_dir = tokio::fs::read_dir(&sessions_dir).await?;
                 while let Some(entry) = read_dir.next_entry().await? {
                     let p = entry.path();
                     if p.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                        && p.file_stem().and_then(|s| s.to_str()).map_or(false, |s| s.contains(path_or_prefix))
+                        && p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map_or(false, |s| s.contains(path_or_prefix))
                     {
                         matches.push(p);
                     }
@@ -389,21 +400,27 @@ async fn create_or_resume_session(
                 match matches.len() {
                     0 => {
                         let fmt = OutputFormatter::new();
-                        anyhow::bail!("{}", fmt.error(&format!(
-                            "No session found matching '{}' in {}",
-                            path_or_prefix,
-                            sessions_dir.display()
-                        )));
-                    },
+                        anyhow::bail!(
+                            "{}",
+                            fmt.error(&format!(
+                                "No session found matching '{}' in {}",
+                                path_or_prefix,
+                                sessions_dir.display()
+                            ))
+                        );
+                    }
                     1 => matches.into_iter().next().unwrap(),
                     _ => {
                         let paths: Vec<String> = matches.iter().map(|p| p.to_string_lossy().to_string()).collect();
                         let fmt = OutputFormatter::new();
-                        anyhow::bail!("{}", fmt.error(&format!(
-                            "Multiple sessions match '{}': {}. Use a more specific prefix.",
-                            path_or_prefix,
-                            paths.join(", ")
-                        )));
+                        anyhow::bail!(
+                            "{}",
+                            fmt.error(&format!(
+                                "Multiple sessions match '{}': {}. Use a more specific prefix.",
+                                path_or_prefix,
+                                paths.join(", ")
+                            ))
+                        );
                     }
                 }
             };
@@ -418,8 +435,7 @@ async fn create_or_resume_session(
 
             let session_id = format!(
                 "session-{}",
-                iso_timestamp()
-                    .replace(|c: char| !c.is_alphanumeric() && c != '-', "")
+                iso_timestamp().replace(|c: char| !c.is_alphanumeric() && c != '-', "")
             );
             let file_path = sessions_dir.join(format!("{}.jsonl", session_id));
 
@@ -431,7 +447,8 @@ async fn create_or_resume_session(
                     parent_session_path: None,
                     metadata: None,
                 },
-            ).await?;
+            )
+            .await?;
 
             Ok(Session::new(Box::new(storage), SessionContextBuildOptions::default()))
         }

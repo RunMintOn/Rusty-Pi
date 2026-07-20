@@ -36,11 +36,26 @@ const CODEX_TOKEN_ENV: &str = "OPENAI_CODEX_TOKEN";
 
 /// Models supported by the OpenAI Codex provider.
 pub const OPENAI_CODEX_MODELS: &[Model] = &[
-    Model { id: "gpt-5.6-sol", api: "openai-codex-responses" },
-    Model { id: "gpt-5.6-luna", api: "openai-codex-responses" },
-    Model { id: "gpt-5.5", api: "openai-codex-responses" },
-    Model { id: "gpt-5.4", api: "openai-codex-responses" },
-    Model { id: "gpt-5.4-mini", api: "openai-codex-responses" },
+    Model {
+        id: "gpt-5.6-sol",
+        api: "openai-codex-responses",
+    },
+    Model {
+        id: "gpt-5.6-luna",
+        api: "openai-codex-responses",
+    },
+    Model {
+        id: "gpt-5.5",
+        api: "openai-codex-responses",
+    },
+    Model {
+        id: "gpt-5.4",
+        api: "openai-codex-responses",
+    },
+    Model {
+        id: "gpt-5.4-mini",
+        api: "openai-codex-responses",
+    },
 ];
 
 /// Provider for the OpenAI Codex API (ChatGPT Plus/Pro).
@@ -71,13 +86,19 @@ impl OpenAICodexProvider {
     pub fn from_env() -> Option<Self> {
         // 1. Env var
         if let Ok(token) = std::env::var(CODEX_TOKEN_ENV)
-            && !token.is_empty() {
-                return Some(Self { token: std::sync::Mutex::new(token) });
+            && !token.is_empty()
+        {
+            return Some(Self {
+                token: std::sync::Mutex::new(token),
+            });
         }
         // 2. Stored credentials
         if let Ok(Some(cred)) = CodexCredential::load()
-            && !cred.is_expired() {
-                return Some(Self { token: std::sync::Mutex::new(cred.access) });
+            && !cred.is_expired()
+        {
+            return Some(Self {
+                token: std::sync::Mutex::new(cred.access),
+            });
         }
         None
     }
@@ -86,12 +107,16 @@ impl OpenAICodexProvider {
     /// env var → stored credentials → interactive OAuth login.
     pub async fn from_any() -> anyhow::Result<Self> {
         let token = resolve_codex_token(None).await?;
-        Ok(Self { token: std::sync::Mutex::new(token) })
+        Ok(Self {
+            token: std::sync::Mutex::new(token),
+        })
     }
 
     /// Create a new Codex provider with the given JWT access token.
     pub fn new(token: String) -> Self {
-        Self { token: std::sync::Mutex::new(token) }
+        Self {
+            token: std::sync::Mutex::new(token),
+        }
     }
 
     fn build_input(messages: &[AgentMessage]) -> Vec<serde_json::Value> {
@@ -110,9 +135,18 @@ impl OpenAICodexProvider {
                     }));
                 }
                 AgentMessage::Assistant(a) => {
-                    let text: String = a.content.iter()
-                        .filter_map(|c| if let AssistantContent::Text { text } = c { Some(text.as_str()) } else { None })
-                        .collect::<Vec<_>>().join("\n");
+                    let text: String = a
+                        .content
+                        .iter()
+                        .filter_map(|c| {
+                            if let AssistantContent::Text { text } = c {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     if !text.is_empty() {
                         items.push(serde_json::json!({
                             "type": "message",
@@ -136,9 +170,18 @@ impl OpenAICodexProvider {
                     }
                 }
                 AgentMessage::ToolResult(tr) => {
-                    let content = tr.content.iter()
-                        .filter_map(|c| if let crate::ai::types::TextOrImageContent::Text { text } = c { Some(text.clone()) } else { None })
-                        .collect::<Vec<_>>().join("\n");
+                    let content = tr
+                        .content
+                        .iter()
+                        .filter_map(|c| {
+                            if let crate::ai::types::TextOrImageContent::Text { text } = c {
+                                Some(text.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     let call_id = tr.tool_call_id.split('|').next().unwrap_or(&tr.tool_call_id);
                     items.push(serde_json::json!({
                         "type": "function_call_output",
@@ -162,6 +205,7 @@ impl ProviderApi for OpenAICodexProvider {
         model: &Model,
         messages: &[AgentMessage],
         _tools: &[&dyn Tool],
+        _system_prompt: Option<&str>,
     ) -> anyhow::Result<StreamReceiver> {
         // Refresh token if expired
         let token = if let Ok(Some(cred)) = CodexCredential::load() {
@@ -210,17 +254,23 @@ impl ProviderApi for OpenAICodexProvider {
 
 /// Manually parse SSE events from an HTTP byte stream and dispatch them as StreamEvents.
 async fn do_codex_stream(
-    url: &str, token: &str, model_id: &str,
-    input: &[serde_json::Value], tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    url: &str,
+    token: &str,
+    model_id: &str,
+    input: &[serde_json::Value],
+    tx: tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({ "model": model_id, "input": input });
 
-    let response = client.post(url)
+    let response = client
+        .post(url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("OpenAI-Beta", "responses=v1")
-        .json(&body).send().await?;
+        .json(&body)
+        .send()
+        .await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -245,10 +295,12 @@ async fn do_codex_stream(
         // Process complete SSE events (separated by \n\n or \r\n\r\n)
         while let Some(sep_start) = find_double_newline(&buf) {
             let raw_event = buf[..sep_start].to_vec();
-            let sep_len = if sep_start + 3 < buf.len() && buf[sep_start] == b'\r'
+            let sep_len = if sep_start + 3 < buf.len()
+                && buf[sep_start] == b'\r'
                 && buf[sep_start + 1] == b'\n'
                 && buf[sep_start + 2] == b'\r'
-                && buf[sep_start + 3] == b'\n' {
+                && buf[sep_start + 3] == b'\n'
+            {
                 4
             } else {
                 2
@@ -260,10 +312,12 @@ async fn do_codex_stream(
             }
 
             let raw_str = String::from_utf8_lossy(&raw_event);
-            let event_type = raw_str.lines()
+            let event_type = raw_str
+                .lines()
                 .find_map(|line| line.strip_prefix("event:"))
                 .map(|s| s.trim().to_string());
-            let data_str = raw_str.lines()
+            let data_str = raw_str
+                .lines()
                 .find_map(|line| line.strip_prefix("data:"))
                 .map(|s| s.trim().to_string());
 
@@ -278,44 +332,59 @@ async fn do_codex_stream(
                     // Just ignore; response ID isn't needed for our event system
                 }
                 "response.output_item.added" => {
-                    if data.is_empty() { continue; }
+                    if data.is_empty() {
+                        continue;
+                    }
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                         let output_index = val["output_index"].as_i64().unwrap_or(0);
                         if let Some(item) = val.get("item")
-                            && item["type"] == "function_call" {
-                                let call_id = item["call_id"].as_str().unwrap_or("call_unknown");
-                                let item_id = item["id"].as_str().unwrap_or("");
-                                let composite_id = if item_id.is_empty() {
-                                    call_id.to_string()
-                                } else {
-                                    format!("{}|{}", call_id, item_id)
-                                };
-                                let name = item["name"].as_str().unwrap_or("unknown").to_string();
-                                let initial_args = item["arguments"].as_str().unwrap_or("{}").to_string();
-                                partial_tool_calls.insert(output_index, (composite_id, name, initial_args));
-                            }
+                            && item["type"] == "function_call"
+                        {
+                            let call_id = item["call_id"].as_str().unwrap_or("call_unknown");
+                            let item_id = item["id"].as_str().unwrap_or("");
+                            let composite_id = if item_id.is_empty() {
+                                call_id.to_string()
+                            } else {
+                                format!("{}|{}", call_id, item_id)
+                            };
+                            let name = item["name"].as_str().unwrap_or("unknown").to_string();
+                            let initial_args = item["arguments"].as_str().unwrap_or("{}").to_string();
+                            partial_tool_calls.insert(output_index, (composite_id, name, initial_args));
+                        }
                     }
                 }
                 "response.output_text.delta" => {
-                    if data.is_empty() { continue; }
+                    if data.is_empty() {
+                        continue;
+                    }
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(data)
                         && let Some(delta) = val["delta"].as_str()
-                        && !delta.is_empty() {
-                            let _ = tx.send(StreamEvent::TextDelta { delta: delta.to_string() }).await;
+                        && !delta.is_empty()
+                    {
+                        let _ = tx
+                            .send(StreamEvent::TextDelta {
+                                delta: delta.to_string(),
+                            })
+                            .await;
                     }
                 }
                 "response.function_call_arguments.delta" => {
-                    if data.is_empty() { continue; }
+                    if data.is_empty() {
+                        continue;
+                    }
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                         let output_index = val["output_index"].as_i64().unwrap_or(0);
                         if let Some(delta) = val["delta"].as_str()
-                            && let Some(entry) = partial_tool_calls.get_mut(&output_index) {
-                                entry.2.push_str(delta);
-                            }
+                            && let Some(entry) = partial_tool_calls.get_mut(&output_index)
+                        {
+                            entry.2.push_str(delta);
+                        }
                     }
                 }
                 "response.output_item.done" => {
-                    if data.is_empty() { continue; }
+                    if data.is_empty() {
+                        continue;
+                    }
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                         let output_index = val["output_index"].as_i64().unwrap_or(0);
 
@@ -323,24 +392,32 @@ async fn do_codex_stream(
                         if let Some((composite_id, name, args_str)) = partial_tool_calls.remove(&output_index) {
                             has_tool_calls = true;
                             if let Ok(arguments) = serde_json::from_str(&args_str) {
-                                let _ = tx.send(StreamEvent::ToolCall {
-                                    id: composite_id,
-                                    name,
-                                    arguments,
-                                }).await;
+                                let _ = tx
+                                    .send(StreamEvent::ToolCall {
+                                        id: composite_id,
+                                        name,
+                                        arguments,
+                                    })
+                                    .await;
                             }
                         }
                     }
                 }
                 "response.completed" | "response.incomplete" => {
-                    if data.is_empty() { continue; }
+                    if data.is_empty() {
+                        continue;
+                    }
                     let stop_reason = if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                         let status = val["response"]["status"].as_str().unwrap_or("completed");
                         match status {
                             "incomplete" => StopReason::Length,
                             "failed" | "cancelled" => StopReason::Error,
                             _ => {
-                                if has_tool_calls { StopReason::ToolUse } else { StopReason::Stop }
+                                if has_tool_calls {
+                                    StopReason::ToolUse
+                                } else {
+                                    StopReason::Stop
+                                }
                             }
                         }
                     } else {
@@ -348,7 +425,9 @@ async fn do_codex_stream(
                     };
 
                     let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
                     let msg = AssistantMessage {
                         content: vec![],
                         api: "openai-codex-responses".into(),
@@ -368,19 +447,23 @@ async fn do_codex_stream(
                     } else {
                         "Codex SSE error event".to_string()
                     };
-                    let _ = tx.send(StreamEvent::Error {
-                        reason: StopReason::Error,
-                        message: err_msg.clone(),
-                    }).await;
+                    let _ = tx
+                        .send(StreamEvent::Error {
+                            reason: StopReason::Error,
+                            message: err_msg.clone(),
+                        })
+                        .await;
                     anyhow::bail!("{}", err_msg);
                 }
                 "response.failed" => {
                     let err_msg = if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                         let r = &val["response"];
                         if let Some(error) = r["error"].as_object() {
-                            format!("{}: {}",
+                            format!(
+                                "{}: {}",
                                 error.get("code").and_then(|c| c.as_str()).unwrap_or("unknown"),
-                                error.get("message").and_then(|m| m.as_str()).unwrap_or("no message"))
+                                error.get("message").and_then(|m| m.as_str()).unwrap_or("no message")
+                            )
                         } else if let Some(details) = r["incomplete_details"].as_object() {
                             format!("incomplete: {}", details["reason"].as_str().unwrap_or("unknown"))
                         } else {
@@ -389,10 +472,12 @@ async fn do_codex_stream(
                     } else {
                         "Codex response failed".to_string()
                     };
-                    let _ = tx.send(StreamEvent::Error {
-                        reason: StopReason::Error,
-                        message: err_msg.clone(),
-                    }).await;
+                    let _ = tx
+                        .send(StreamEvent::Error {
+                            reason: StopReason::Error,
+                            message: err_msg.clone(),
+                        })
+                        .await;
                     anyhow::bail!("{}", err_msg);
                 }
                 _ => {
@@ -413,8 +498,7 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
             return Some(i);
         }
         // Handle \r\n\r\n
-        if i + 3 < buf.len() && buf[i] == b'\r' && buf[i + 1] == b'\n'
-            && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+        if i + 3 < buf.len() && buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
             return Some(i);
         }
     }
@@ -424,7 +508,10 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::types::{AgentMessage, AssistantContent, AssistantMessage, MessageContent, StopReason, TextOrImageContent, ToolResultMessage, UserMessage};
+    use crate::ai::types::{
+        AgentMessage, AssistantContent, AssistantMessage, MessageContent, StopReason, TextOrImageContent,
+        ToolResultMessage, UserMessage,
+    };
 
     #[test]
     fn build_input_includes_function_call_items_for_tool_calls() {
@@ -435,7 +522,9 @@ mod tests {
             }),
             AgentMessage::Assistant(AssistantMessage {
                 content: vec![
-                    AssistantContent::Text { text: "I'll run that".into() },
+                    AssistantContent::Text {
+                        text: "I'll run that".into(),
+                    },
                     AssistantContent::ToolCall {
                         id: "call_abc|fc_item_1".into(),
                         name: "bash".into(),
@@ -453,7 +542,9 @@ mod tests {
             AgentMessage::ToolResult(ToolResultMessage {
                 tool_call_id: "call_abc|fc_item_1".into(),
                 tool_name: "bash".into(),
-                content: vec![TextOrImageContent::Text { text: "src\nCargo.toml".into() }],
+                content: vec![TextOrImageContent::Text {
+                    text: "src\nCargo.toml".into(),
+                }],
                 details: None,
                 is_error: false,
                 timestamp: 3000,
@@ -461,7 +552,11 @@ mod tests {
         ];
 
         let input = OpenAICodexProvider::build_input(&messages);
-        assert_eq!(input.len(), 4, "should produce 4 items: user msg, assistant msg, function_call, function_call_output");
+        assert_eq!(
+            input.len(),
+            4,
+            "should produce 4 items: user msg, assistant msg, function_call, function_call_output"
+        );
 
         // User message
         assert_eq!(input[0]["type"], "message");
@@ -490,7 +585,9 @@ mod tests {
                 timestamp: 1000,
             }),
             AgentMessage::Assistant(AssistantMessage {
-                content: vec![AssistantContent::Text { text: "Hi there".into() }],
+                content: vec![AssistantContent::Text {
+                    text: "Hi there".into(),
+                }],
                 api: "openai-codex-responses".into(),
                 provider: "openai-codex".into(),
                 model: "gpt-5.5".into(),
@@ -512,13 +609,11 @@ mod tests {
     fn build_input_handles_tool_call_id_without_pipe() {
         let messages = vec![
             AgentMessage::Assistant(AssistantMessage {
-                content: vec![
-                    AssistantContent::ToolCall {
-                        id: "simple_call_id".into(),
-                        name: "bash".into(),
-                        arguments: serde_json::json!({}),
-                    },
-                ],
+                content: vec![AssistantContent::ToolCall {
+                    id: "simple_call_id".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                }],
                 api: "openai-codex-responses".into(),
                 provider: "openai-codex".into(),
                 model: "gpt-5.5".into(),
@@ -632,7 +727,8 @@ mod tests {
             buf.extend_from_slice(chunk);
             while let Some(sep_start) = find_double_newline(&buf) {
                 let raw_event = buf[..sep_start].to_vec();
-                let sep_len = if sep_start + 3 < buf.len() && buf[sep_start] == b'\r'
+                let sep_len = if sep_start + 3 < buf.len()
+                    && buf[sep_start] == b'\r'
                     && buf[sep_start + 1] == b'\n'
                     && buf[sep_start + 2] == b'\r'
                     && buf[sep_start + 3] == b'\n'
@@ -654,9 +750,7 @@ mod tests {
 
     #[test]
     fn sse_extract_single_event() {
-        let events = extract_sse_events(vec![
-            b"event: a\ndata: hello\n\n",
-        ]);
+        let events = extract_sse_events(vec![b"event: a\ndata: hello\n\n"]);
         assert_eq!(events.len(), 1);
         assert!(events[0].contains("event: a"));
         assert!(events[0].contains("data: hello"));
@@ -664,9 +758,7 @@ mod tests {
 
     #[test]
     fn sse_extract_multiple_events() {
-        let events = extract_sse_events(vec![
-            b"event: a\ndata: 1\n\nevent: b\ndata: 2\n\nevent: c\ndata: 3\n\n",
-        ]);
+        let events = extract_sse_events(vec![b"event: a\ndata: 1\n\nevent: b\ndata: 2\n\nevent: c\ndata: 3\n\n"]);
         assert_eq!(events.len(), 3);
         assert!(events[0].contains("data: 1"));
         assert!(events[1].contains("data: 2"));
@@ -689,9 +781,7 @@ mod tests {
     #[test]
     fn sse_extract_with_trailing_data_no_separator() {
         // Partial event at the end (no \n\n) should be left in buffer
-        let events = extract_sse_events(vec![
-            b"event: a\ndata: 1\n\nevent: b\ndata: 2",
-        ]);
+        let events = extract_sse_events(vec![b"event: a\ndata: 1\n\nevent: b\ndata: 2"]);
         assert_eq!(events.len(), 1);
         assert!(events[0].contains("data: 1"));
     }
@@ -699,18 +789,14 @@ mod tests {
     #[test]
     fn sse_extract_with_leading_noise() {
         // Empty leading event (just whitespace / blank lines before first event)
-        let events = extract_sse_events(vec![
-            b"\n\nevent: a\ndata: 1\n\n",
-        ]);
+        let events = extract_sse_events(vec![b"\n\nevent: a\ndata: 1\n\n"]);
         assert_eq!(events.len(), 1);
         assert!(events[0].contains("data: 1"));
     }
 
     #[test]
     fn sse_extract_crlf() {
-        let events = extract_sse_events(vec![
-            b"event: a\r\ndata: 1\r\n\r\nevent: b\r\ndata: 2\r\n\r\n",
-        ]);
+        let events = extract_sse_events(vec![b"event: a\r\ndata: 1\r\n\r\nevent: b\r\ndata: 2\r\n\r\n"]);
         assert_eq!(events.len(), 2);
         assert!(events[0].contains("data: 1"));
         assert!(events[1].contains("data: 2"));
@@ -720,10 +806,7 @@ mod tests {
 
     #[test]
     fn sse_extract_crlf_chunked() {
-        let events = extract_sse_events(vec![
-            b"event: a\r\ndata: 1\r\n\r\nevent: b\r\nda",
-            b"ta: 2\r\n\r\n",
-        ]);
+        let events = extract_sse_events(vec![b"event: a\r\ndata: 1\r\n\r\nevent: b\r\nda", b"ta: 2\r\n\r\n"]);
         assert_eq!(events.len(), 2);
         assert!(events[0].contains("data: 1"));
         assert!(events[1].contains("data: 2"));
@@ -733,7 +816,7 @@ mod tests {
     fn sse_extract_empty_chunk_preserves_buffer() {
         let events = extract_sse_events(vec![
             b"event: a\ndata: 1",
-            b"",  // empty chunk, should not affect buffer
+            b"", // empty chunk, should not affect buffer
             b"\n\n",
         ]);
         assert_eq!(events.len(), 1);

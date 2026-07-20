@@ -12,8 +12,7 @@ use std::collections::HashMap;
 // ──  Context build options  ──────────────────────────────────────────────
 
 /// Transform applied to context entries after the default compaction transform.
-pub type ContextEntryTransform =
-    Box<dyn Fn(&[SessionTreeEntry]) -> Vec<SessionTreeEntry> + Send + Sync>;
+pub type ContextEntryTransform = Box<dyn Fn(&[SessionTreeEntry]) -> Vec<SessionTreeEntry> + Send + Sync>;
 
 /// Projector that converts a `CustomEntry` into context messages.
 /// Returns `None` / empty vec to omit the entry from context.
@@ -40,10 +39,7 @@ pub struct Session {
 
 impl Session {
     /// Create a new session wrapping the given storage backend.
-    pub fn new(
-        storage: Box<dyn SessionStorage>,
-        context_build_options: SessionContextBuildOptions,
-    ) -> Self {
+    pub fn new(storage: Box<dyn SessionStorage>, context_build_options: SessionContextBuildOptions) -> Self {
         Self {
             storage,
             context_build_options,
@@ -105,9 +101,7 @@ impl Session {
                 .ok_or_else(|| SessionError::not_found(format!("Entry {} not found", id)))?;
         }
 
-        self.storage
-            .set_leaf_id(entry_id.map(|s| s.to_string()))
-            .await?;
+        self.storage.set_leaf_id(entry_id.map(|s| s.to_string())).await?;
 
         if let Some(s) = summary {
             let entry_id = entry_id.unwrap_or("root");
@@ -146,11 +140,7 @@ impl Session {
     }
 
     /// Append a model change entry.
-    pub async fn append_model_change(
-        &mut self,
-        provider: String,
-        model_id: String,
-    ) -> Result<String, SessionError> {
+    pub async fn append_model_change(&mut self, provider: String, model_id: String) -> Result<String, SessionError> {
         let base = self.new_entry_base().await;
         let id = base.id.clone();
         let entry = SessionTreeEntry::ModelChange(ModelChangeEntry {
@@ -164,10 +154,7 @@ impl Session {
     }
 
     /// Append a thinking level change entry.
-    pub async fn append_thinking_level_change(
-        &mut self,
-        level: String,
-    ) -> Result<String, SessionError> {
+    pub async fn append_thinking_level_change(&mut self, level: String) -> Result<String, SessionError> {
         let base = self.new_entry_base().await;
         let id = base.id.clone();
         let entry = SessionTreeEntry::ThinkingLevelChange(ThinkingLevelChangeEntry {
@@ -180,10 +167,7 @@ impl Session {
     }
 
     /// Append an active tools change entry.
-    pub async fn append_active_tools_change(
-        &mut self,
-        tool_names: Vec<String>,
-    ) -> Result<String, SessionError> {
+    pub async fn append_active_tools_change(&mut self, tool_names: Vec<String>) -> Result<String, SessionError> {
         let base = self.new_entry_base().await;
         let id = base.id.clone();
         let entry = SessionTreeEntry::ActiveToolsChange(ActiveToolsChangeEntry {
@@ -261,11 +245,7 @@ impl Session {
     }
 
     /// Append a label entry.
-    pub async fn append_label(
-        &mut self,
-        target_id: String,
-        label: Option<String>,
-    ) -> Result<String, SessionError> {
+    pub async fn append_label(&mut self, target_id: String, label: Option<String>) -> Result<String, SessionError> {
         if self.storage.get_entry(&target_id).await.is_none() {
             return Err(SessionError::not_found(format!("Entry {} not found", target_id)));
         }
@@ -328,9 +308,7 @@ impl Session {
             Some(id) => Some(id.to_string()),
             None => self.storage.get_leaf_id().await,
         };
-        self.storage
-            .get_path_to_root(leaf_id.as_deref())
-            .await
+        self.storage.get_path_to_root(leaf_id.as_deref()).await
     }
 
     /// Get all messages in the current branch (in order).
@@ -416,9 +394,18 @@ impl Session {
     pub async fn count_messages(&self) -> (usize, usize, usize, usize) {
         let msgs = self.messages().await;
         let total = msgs.len();
-        let user = msgs.iter().filter(|m| matches!(m, crate::ai::types::AgentMessage::User(_))).count();
-        let assistant = msgs.iter().filter(|m| matches!(m, crate::ai::types::AgentMessage::Assistant(_))).count();
-        let tool = msgs.iter().filter(|m| matches!(m, crate::ai::types::AgentMessage::ToolResult(_))).count();
+        let user = msgs
+            .iter()
+            .filter(|m| matches!(m, crate::ai::types::AgentMessage::User(_)))
+            .count();
+        let assistant = msgs
+            .iter()
+            .filter(|m| matches!(m, crate::ai::types::AgentMessage::Assistant(_)))
+            .count();
+        let tool = msgs
+            .iter()
+            .filter(|m| matches!(m, crate::ai::types::AgentMessage::ToolResult(_)))
+            .count();
         (total, user, assistant, tool)
     }
 
@@ -532,13 +519,11 @@ pub fn session_entry_to_context_messages(
 
 /// Default compaction-aware entry transform.
 /// Keeps only the compaction marker + entries after `firstKeptEntryId`.
-pub fn default_context_entry_transform(
-    path_entries: &[SessionTreeEntry],
-) -> Vec<SessionTreeEntry> {
+pub fn default_context_entry_transform(path_entries: &[SessionTreeEntry]) -> Vec<SessionTreeEntry> {
     // Find the latest compaction entry
-    let compaction_idx = path_entries.iter().rposition(|e| {
-        matches!(e, SessionTreeEntry::Compaction(_))
-    });
+    let compaction_idx = path_entries
+        .iter()
+        .rposition(|e| matches!(e, SessionTreeEntry::Compaction(_)));
 
     let Some(ci) = compaction_idx else {
         return path_entries.to_vec();
@@ -611,7 +596,10 @@ mod tests {
     async fn tracks_model_and_thinking_level_changes() {
         let mut session = make_session();
         session.append_message(user_msg("one")).await.unwrap();
-        session.append_model_change("openai".into(), "gpt-4.1".into()).await.unwrap();
+        session
+            .append_model_change("openai".into(), "gpt-4.1".into())
+            .await
+            .unwrap();
         session.append_thinking_level_change("high".into()).await.unwrap();
         let context = session.build_context().await;
         assert_eq!(context.thinking_level, "high");
@@ -652,7 +640,10 @@ mod tests {
         session.append_message(assistant_msg("two")).await.unwrap();
         let user2 = session.append_message(user_msg("three")).await.unwrap();
         session.append_message(assistant_msg("four")).await.unwrap();
-        session.append_compaction("summary".into(), user2, 1234, None).await.unwrap();
+        session
+            .append_compaction("summary".into(), user2, 1234, None)
+            .await
+            .unwrap();
         session.append_message(user_msg("five")).await.unwrap();
 
         let context = session.build_context().await;
@@ -821,7 +812,11 @@ mod tests {
     async fn entry_transform_applied_after_compaction() {
         // Create a transform that drops compaction entries
         let drop_compaction: ContextEntryTransform = Box::new(|entries| {
-            entries.iter().filter(|e| !matches!(e, SessionTreeEntry::Compaction(_))).cloned().collect()
+            entries
+                .iter()
+                .filter(|e| !matches!(e, SessionTreeEntry::Compaction(_)))
+                .cloned()
+                .collect()
         });
 
         let opts = SessionContextBuildOptions {
@@ -857,7 +852,10 @@ mod tests {
     async fn supports_labels_and_session_info() {
         let mut session = make_session();
         let user1 = session.append_message(user_msg("one")).await.unwrap();
-        session.append_label(user1.clone(), Some("checkpoint".into())).await.unwrap();
+        session
+            .append_label(user1.clone(), Some("checkpoint".into()))
+            .await
+            .unwrap();
         session.append_session_name("my session".into()).await.unwrap();
 
         assert_eq!(session.get_label(&user1).await, Some("checkpoint".into()));
@@ -880,7 +878,10 @@ mod tests {
     #[tokio::test]
     async fn normalizes_session_names() {
         let mut session = make_session();
-        session.append_session_name(" hello\nworld\r\nagain ".into()).await.unwrap();
+        session
+            .append_session_name(" hello\nworld\r\nagain ".into())
+            .await
+            .unwrap();
         assert_eq!(session.get_session_name().await, Some("hello world again".into()));
     }
 
@@ -909,13 +910,15 @@ mod tests {
 
     #[tokio::test]
     async fn default_context_entry_transform_no_compaction() {
-        let entries: Vec<SessionTreeEntry> = vec![
-            SessionTreeEntry::Message(MessageEntry {
-                base: EntryBase { id: "e1".into(), parent_id: None, timestamp: "".into() },
-                entry_type: EntryTypeTag::Message,
-                message: user_msg("hello"),
-            }),
-        ];
+        let entries: Vec<SessionTreeEntry> = vec![SessionTreeEntry::Message(MessageEntry {
+            base: EntryBase {
+                id: "e1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+            },
+            entry_type: EntryTypeTag::Message,
+            message: user_msg("hello"),
+        })];
         let result = default_context_entry_transform(&entries);
         assert_eq!(result.len(), 1);
     }
@@ -924,22 +927,38 @@ mod tests {
     async fn default_context_entry_transform_with_compaction() {
         let entries: Vec<SessionTreeEntry> = vec![
             SessionTreeEntry::Message(MessageEntry {
-                base: EntryBase { id: "e1".into(), parent_id: None, timestamp: "".into() },
+                base: EntryBase {
+                    id: "e1".into(),
+                    parent_id: None,
+                    timestamp: "".into(),
+                },
                 entry_type: EntryTypeTag::Message,
                 message: user_msg("one"),
             }),
             SessionTreeEntry::Message(MessageEntry {
-                base: EntryBase { id: "e2".into(), parent_id: Some("e1".into()), timestamp: "".into() },
+                base: EntryBase {
+                    id: "e2".into(),
+                    parent_id: Some("e1".into()),
+                    timestamp: "".into(),
+                },
                 entry_type: EntryTypeTag::Message,
                 message: assistant_msg("two"),
             }),
             SessionTreeEntry::Message(MessageEntry {
-                base: EntryBase { id: "e3".into(), parent_id: Some("e2".into()), timestamp: "".into() },
+                base: EntryBase {
+                    id: "e3".into(),
+                    parent_id: Some("e2".into()),
+                    timestamp: "".into(),
+                },
                 entry_type: EntryTypeTag::Message,
                 message: user_msg("three"),
             }),
             SessionTreeEntry::Compaction(CompactionEntry {
-                base: EntryBase { id: "compaction".into(), parent_id: Some("e3".into()), timestamp: "".into() },
+                base: EntryBase {
+                    id: "compaction".into(),
+                    parent_id: Some("e3".into()),
+                    timestamp: "".into(),
+                },
                 entry_type: EntryTypeTag::Compaction,
                 summary: "summary".into(),
                 first_kept_entry_id: "e2".into(),
@@ -948,7 +967,11 @@ mod tests {
                 from_hook: None,
             }),
             SessionTreeEntry::Message(MessageEntry {
-                base: EntryBase { id: "e4".into(), parent_id: Some("compaction".into()), timestamp: "".into() },
+                base: EntryBase {
+                    id: "e4".into(),
+                    parent_id: Some("compaction".into()),
+                    timestamp: "".into(),
+                },
                 entry_type: EntryTypeTag::Message,
                 message: user_msg("four"),
             }),

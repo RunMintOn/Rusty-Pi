@@ -25,10 +25,7 @@ pub struct JsonlSessionStorage {
 
 impl JsonlSessionStorage {
     /// Create a new JSONL session file.
-    pub async fn create(
-        file_path: String,
-        options: JsonlSessionCreateOptions,
-    ) -> Result<Self, SessionError> {
+    pub async fn create(file_path: String, options: JsonlSessionCreateOptions) -> Result<Self, SessionError> {
         let now = iso_timestamp();
         let header = SessionHeader {
             entry_type: "session".into(),
@@ -96,13 +93,7 @@ impl JsonlSessionStorage {
 
         for (i, line) in lines.iter().enumerate().skip(1) {
             let entry: SessionTreeEntry = serde_json::from_str(line)
-                .map_err(|e| {
-                    SessionError::invalid_entry(format!(
-                        "line {}: {}",
-                        i + 1,
-                        e
-                    ))
-                })?;
+                .map_err(|e| SessionError::invalid_entry(format!("line {}: {}", i + 1, e)))?;
             let id = entry.id().to_string();
             by_id.insert(id, entry.clone());
             update_label_cache(&mut labels_by_id, &entry);
@@ -150,10 +141,7 @@ impl JsonlSessionStorage {
         if let Some(ref leaf_id) = self.leaf_id
             && !self.by_id.contains_key(leaf_id)
         {
-            return Err(SessionError::invalid_session(format!(
-                "Entry {} not found",
-                leaf_id
-            )));
+            return Err(SessionError::invalid_session(format!("Entry {} not found", leaf_id)));
         }
         Ok(())
     }
@@ -353,7 +341,10 @@ mod tests {
         assert_eq!(lines.len(), 2);
         let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(header["type"], "session");
-        assert_eq!(lines[1], serde_json::to_string(&msg_entry("user-1", None, user_msg("one"))).unwrap());
+        assert_eq!(
+            lines[1],
+            serde_json::to_string(&msg_entry("user-1", None, user_msg("one"))).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -471,7 +462,12 @@ mod tests {
         let loaded = JsonlSessionStorage::open(file_path.clone()).await.unwrap();
         assert_eq!(loaded.get_leaf_id().await, Some("child".into()));
         assert_eq!(
-            loaded.get_entries().await.iter().map(|e| e.id().to_string()).collect::<Vec<_>>(),
+            loaded
+                .get_entries()
+                .await
+                .iter()
+                .map(|e| e.id().to_string())
+                .collect::<Vec<_>>(),
             vec!["root", "child"]
         );
 

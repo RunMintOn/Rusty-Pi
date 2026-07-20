@@ -22,7 +22,7 @@ use crate::ai::providers::{Model, ProviderApi, StreamReceiver};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{AgentMessage, AssistantMessage, StopReason, Tool};
 use async_trait::async_trait;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A single step in a mock provider response sequence.
 #[derive(Debug, Clone)]
@@ -48,12 +48,37 @@ pub enum MockStep {
 /// Thread-safe via internal mutability (`Mutex`).
 pub struct MockProvider {
     steps: Mutex<Vec<MockStep>>,
+    /// Captured messages from each `stream()` call.
+    captured_requests: Arc<Mutex<Vec<Vec<AgentMessage>>>>,
 }
 
 impl MockProvider {
     /// Create a provider that returns the given sequence of steps.
     pub fn new(steps: Vec<MockStep>) -> Self {
-        Self { steps: Mutex::new(steps) }
+        Self {
+            steps: Mutex::new(steps),
+            captured_requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Return all messages captured by `stream()` calls, in order.
+    pub fn captured_requests(&self) -> Vec<Vec<AgentMessage>> {
+        self.captured_requests.lock().unwrap().clone()
+    }
+
+    /// Return the Arc<Mutex<...>> for capturing requests (useful when provider is boxed).
+    pub fn captured_requests_arc(&self) -> Arc<Mutex<Vec<Vec<AgentMessage>>>> {
+        self.captured_requests.clone()
+    }
+
+    /// Return the messages from the Nth `stream()` call (0-indexed).
+    pub fn captured_request(&self, index: usize) -> Vec<AgentMessage> {
+        self.captured_requests
+            .lock()
+            .unwrap()
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Create a provider that returns a single text response.
@@ -64,15 +89,107 @@ impl MockProvider {
     }
 }
 
+/// A provider that emits multiple tool calls in one response,
+/// then returns final text on the second call.
+///
+/// Used to test that the agent handles multiple tool calls correctly.
+pub struct MultiToolCallProvider {
+    /// Tool calls to emit on the first call.
+    calls: Vec<MockStep>,
+    /// Final text response after all tool calls (returned on second call).
+    final_text: String,
+    /// Captured messages.
+    captured_requests: Arc<Mutex<Vec<Vec<AgentMessage>>>>,
+    /// Track whether we've already emitted tool calls.
+    emitted: Arc<Mutex<bool>>,
+}
+
+impl MultiToolCallProvider {
+    pub fn new(calls: Vec<MockStep>, final_text: &str) -> Self {
+        Self {
+            calls,
+            final_text: final_text.to_string(),
+            captured_requests: Arc::new(Mutex::new(Vec::new())),
+            emitted: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    pub fn captured_requests(&self) -> Vec<Vec<AgentMessage>> {
+        self.captured_requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ProviderApi for MultiToolCallProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        messages: &[AgentMessage],
+        _tools: &[&dyn Tool],
+        _system_prompt: Option<&str>,
+    ) -> anyhow::Result<StreamReceiver> {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        self.captured_requests.lock().unwrap().push(messages.to_vec());
+
+        let already_emitted = *self.emitted.lock().unwrap();
+        if already_emitted {
+            // Second call: return final text
+            let final_text = self.final_text.clone();
+            tokio::spawn(async move {
+                for word in final_text.split(' ') {
+                    let chunk = format!("{} ", word);
+                    if tx.send(StreamEvent::TextDelta { delta: chunk }).await.is_err() {
+                        return;
+                    }
+                }
+                let acc = MessageAccumulator::new("mock", "mock", "mock");
+                let msg = acc.build();
+                let _ = tx.send(StreamEvent::Done { message: msg }).await;
+            });
+        } else {
+            // First call: emit tool calls
+            *self.emitted.lock().unwrap() = true;
+            let calls = self.calls.clone();
+            tokio::spawn(async move {
+                for step in &calls {
+                    if let MockStep::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                        stop_reason: _,
+                    } = step
+                    {
+                        let _ = tx
+                            .send(StreamEvent::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                            })
+                            .await;
+                    }
+                }
+                let acc = MessageAccumulator::new("mock", "mock", "mock");
+                let msg = acc.build();
+                let _ = tx.send(StreamEvent::Done { message: msg }).await;
+            });
+        }
+
+        Ok(rx)
+    }
+}
+
 #[async_trait]
 impl ProviderApi for MockProvider {
     async fn stream(
         &self,
         _model: &Model,
-        _messages: &[AgentMessage],
+        messages: &[AgentMessage],
         _tools: &[&dyn Tool],
+        _system_prompt: Option<&str>,
     ) -> anyhow::Result<StreamReceiver> {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
+        // Capture messages for test assertions
+        self.captured_requests.lock().unwrap().push(messages.to_vec());
         let mut steps = self.steps.lock().unwrap();
         let step = steps.first().cloned();
         if steps.len() > 1 {
@@ -85,14 +202,27 @@ impl ProviderApi for MockProvider {
                 MockStep::Text(text) => {
                     for word in text.split(' ') {
                         let chunk = format!("{} ", word);
-                        if tx.send(StreamEvent::TextDelta { delta: chunk }).await.is_err() { return; }
+                        if tx.send(StreamEvent::TextDelta { delta: chunk }).await.is_err() {
+                            return;
+                        }
                     }
                     let acc = MessageAccumulator::new("mock", "mock", "mock");
                     let msg = acc.build();
                     let _ = tx.send(StreamEvent::Done { message: msg }).await;
                 }
-                MockStep::ToolCall { id, name, arguments, stop_reason } => {
-                    let _ = tx.send(StreamEvent::ToolCall { id, name: name.clone(), arguments: arguments.clone() }).await;
+                MockStep::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    stop_reason,
+                } => {
+                    let _ = tx
+                        .send(StreamEvent::ToolCall {
+                            id,
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        })
+                        .await;
                     let mut acc = MessageAccumulator::new("mock", "mock", "mock");
                     if let Some(reason) = stop_reason {
                         use crate::ai::stream::StreamEvent;
@@ -116,7 +246,12 @@ impl ProviderApi for MockProvider {
                     let _ = tx.send(StreamEvent::Done { message: msg }).await;
                 }
                 MockStep::Error(msg) => {
-                    let _ = tx.send(StreamEvent::Error { reason: StopReason::Error, message: msg }).await;
+                    let _ = tx
+                        .send(StreamEvent::Error {
+                            reason: StopReason::Error,
+                            message: msg,
+                        })
+                        .await;
                 }
             }
         });

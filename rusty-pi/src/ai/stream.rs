@@ -10,9 +10,7 @@ use crate::ai::types::{AssistantMessage, StopReason};
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// A text delta (part of the response being streamed).
-    TextDelta {
-        delta: String,
-    },
+    TextDelta { delta: String },
     /// A complete tool call was received.
     ToolCall {
         id: String,
@@ -20,14 +18,9 @@ pub enum StreamEvent {
         arguments: serde_json::Value,
     },
     /// Streaming finished successfully.
-    Done {
-        message: AssistantMessage,
-    },
+    Done { message: AssistantMessage },
     /// Streaming finished with an error.
-    Error {
-        reason: StopReason,
-        message: String,
-    },
+    Error { reason: StopReason, message: String },
 }
 
 /// Buffer that accumulates stream events into a complete AssistantMessage.

@@ -58,14 +58,12 @@ impl PromptSession {
         }
 
         // Load templates
-        let templates = prompt_templates::load_prompt_templates(
-            prompt_templates::LoadPromptTemplatesOptions {
-                cwd: cwd.clone(),
-                agent_dir: agent_dir.clone(),
-                prompt_paths: template_paths,
-                include_defaults,
-            },
-        );
+        let templates = prompt_templates::load_prompt_templates(prompt_templates::LoadPromptTemplatesOptions {
+            cwd: cwd.clone(),
+            agent_dir: agent_dir.clone(),
+            prompt_paths: template_paths,
+            include_defaults,
+        });
 
         // Load skills
         let skills_result = skills::load_skills(skills::LoadSkillsOptions {
@@ -123,14 +121,12 @@ impl PromptSession {
     /// Reload templates and skills from configured paths.
     /// Useful when resources change at runtime.
     pub fn reload_resources(&mut self, template_paths: Vec<PathBuf>, skill_paths: Vec<PathBuf>) {
-        self.templates = prompt_templates::load_prompt_templates(
-            prompt_templates::LoadPromptTemplatesOptions {
-                cwd: self.cwd.clone(),
-                agent_dir: self.agent_dir.clone(),
-                prompt_paths: template_paths,
-                include_defaults: true,
-            },
-        );
+        self.templates = prompt_templates::load_prompt_templates(prompt_templates::LoadPromptTemplatesOptions {
+            cwd: self.cwd.clone(),
+            agent_dir: self.agent_dir.clone(),
+            prompt_paths: template_paths,
+            include_defaults: true,
+        });
 
         let skills_result = skills::load_skills(skills::LoadSkillsOptions {
             cwd: self.cwd.clone(),
@@ -158,7 +154,6 @@ impl PromptSession {
 
         // Then, try template expansion (/templateName)
         // But only if the text wasn't changed by skill expansion (to avoid double-expansion)
-        
 
         if after_skills == text {
             prompt_templates::expand_prompt_template(text, &self.templates)
@@ -231,7 +226,10 @@ mod tests {
 
     fn create_test_session() -> PromptSession {
         let mock = MockProvider::text("response");
-        let model = crate::ai::providers::Model { id: "mock", api: "mock" };
+        let model = crate::ai::providers::Model {
+            id: "mock",
+            api: "mock",
+        };
         let cwd = PathBuf::from("/tmp");
         let agent_dir = PathBuf::from("/tmp/.pi/agent");
         let mut session = PromptSession::new(
@@ -242,8 +240,8 @@ mod tests {
             agent_dir,
             vec![],
             vec![],
-            false, // no defaults
-            None,  // no external session
+            false,  // no defaults
+            None,   // no external session
             vec![], // no context files
         );
         // Add a template manually

@@ -30,6 +30,18 @@ pub struct AgentToolResult<T = serde_json::Value> {
     /// Hint that the agent should stop after the current tool batch.
     #[serde(default)]
     pub terminate: bool,
+    /// Whether the tool execution resulted in an error.
+    #[serde(default)]
+    pub is_error: bool,
+    /// Process exit code, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Whether the command was killed due to timeout.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// Whether the command was aborted by the user.
+    #[serde(default)]
+    pub aborted: bool,
 }
 
 impl Default for AgentToolResult {
@@ -39,6 +51,10 @@ impl Default for AgentToolResult {
             details: serde_json::Value::Null,
             added_tool_names: None,
             terminate: false,
+            is_error: false,
+            exit_code: None,
+            timed_out: false,
+            aborted: false,
         }
     }
 }
@@ -127,11 +143,7 @@ mod tests {
         assert_eq!(tool.label(), "test");
 
         let result = tool
-            .execute(
-                "call_1",
-                serde_json::json!({"input": "hello"}),
-                None,
-            )
+            .execute("call_1", serde_json::json!({"input": "hello"}), None)
             .await
             .unwrap();
         assert_eq!(result.content.len(), 1);

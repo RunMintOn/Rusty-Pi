@@ -66,8 +66,7 @@ impl OutputFormatter {
             return "No sessions found.".to_string();
         }
         let mut buf = Vec::new();
-        let mut table = Table::new()
-            .columns(["Session", "Model", "Messages", "Created"]);
+        let mut table = Table::new().columns(["Session", "Model", "Messages", "Created"]);
         for s in sessions {
             table = table.row([
                 s.id.as_str(),
@@ -86,9 +85,7 @@ impl OutputFormatter {
     /// Format a tool start line (badge + args).
     pub fn tool_start(&self, name: &str, args: &str) -> String {
         let mut buf = Vec::new();
-        Badge::new(name)
-            .print_to(&mut buf)
-            .expect("write to in-memory buffer");
+        Badge::new(name).print_to(&mut buf).expect("write to in-memory buffer");
         use std::io::Write;
         let _ = write!(buf, " {}", args);
         String::from_utf8_lossy(&buf).to_string()
@@ -135,9 +132,7 @@ impl OutputFormatter {
     /// Format an error message as a red alert box.
     pub fn error(&self, msg: &str) -> String {
         let mut buf = Vec::new();
-        Alert::error(msg)
-            .print_to(&mut buf)
-            .expect("write to in-memory buffer");
+        Alert::error(msg).print_to(&mut buf).expect("write to in-memory buffer");
         String::from_utf8_lossy(&buf).to_string()
     }
 }
@@ -189,7 +184,10 @@ mod tests {
     fn test_error_output_contains_message() {
         let fmt = OutputFormatter::new();
         let out = fmt.error("something broke");
-        assert!(out.contains("something broke"), "error output should contain the message");
+        assert!(
+            out.contains("something broke"),
+            "error output should contain the message"
+        );
     }
 
     #[test]
@@ -237,7 +235,10 @@ mod tests {
         let fmt = OutputFormatter::new();
         let out = fmt.tool_error("edit", "oldText not found");
         assert!(out.contains("edit"), "tool_error should contain tool name");
-        assert!(out.contains("oldText not found"), "tool_error should contain error message");
+        assert!(
+            out.contains("oldText not found"),
+            "tool_error should contain error message"
+        );
     }
 
     #[test]
@@ -265,14 +266,12 @@ mod tests {
     #[test]
     fn test_session_list_contains_entries() {
         let fmt = OutputFormatter::new();
-        let sessions = vec![
-            SessionSummary {
-                id: "sess-1".into(),
-                model: "deepseek-v4-flash".into(),
-                msg_count: 5,
-                created: "2m ago".into(),
-            },
-        ];
+        let sessions = vec![SessionSummary {
+            id: "sess-1".into(),
+            model: "deepseek-v4-flash".into(),
+            msg_count: 5,
+            created: "2m ago".into(),
+        }];
         let out = fmt.session_list(&sessions);
         assert!(out.contains("sess-1"), "should contain session id");
         assert!(out.contains("deepseek-v4-flash"), "should contain model");

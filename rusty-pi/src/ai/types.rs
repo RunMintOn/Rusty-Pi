@@ -262,9 +262,7 @@ mod tests {
     #[test]
     fn roundtrip_user_message_with_content_blocks() {
         let msg = AgentMessage::User(UserMessage {
-            content: MessageContent::Blocks(vec![
-                TextOrImageContent::Text { text: "hello".into() },
-            ]),
+            content: MessageContent::Blocks(vec![TextOrImageContent::Text { text: "hello".into() }]),
             timestamp: 2000,
         });
         let json = serde_json::to_value(&msg).unwrap();
@@ -284,7 +282,9 @@ mod tests {
     fn roundtrip_assistant_message_with_tool_call() {
         let msg = AgentMessage::Assistant(AssistantMessage {
             content: vec![
-                AssistantContent::Text { text: "I'll run that".into() },
+                AssistantContent::Text {
+                    text: "I'll run that".into(),
+                },
                 AssistantContent::ToolCall {
                     id: "tc_1".into(),
                     name: "bash".into(),

@@ -64,10 +64,7 @@ impl InMemorySessionStorage {
         if let Some(ref leaf_id) = self.leaf_id
             && !self.by_id.contains_key(leaf_id)
         {
-            return Err(SessionError::invalid_session(format!(
-                "Entry {} not found",
-                leaf_id
-            )));
+            return Err(SessionError::invalid_session(format!("Entry {} not found", leaf_id)));
         }
         Ok(())
     }

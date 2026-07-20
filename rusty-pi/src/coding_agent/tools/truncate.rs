@@ -307,7 +307,11 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.truncated_by, "bytes");
         // The long line should be truncated; "short" may not fit either
-        assert!(result.content.len() <= 100 + 1, "output too large: {}", result.content.len());
+        assert!(
+            result.content.len() <= 100 + 1,
+            "output too large: {}",
+            result.content.len()
+        );
     }
 
     #[test]

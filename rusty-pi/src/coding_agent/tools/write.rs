@@ -67,7 +67,11 @@ impl WriteTool {
     }
 
     fn cwd(&self) -> String {
-        self.shared_cwd.read().expect("shared_cwd lock poisoned").to_string_lossy().to_string()
+        self.shared_cwd
+            .read()
+            .expect("shared_cwd lock poisoned")
+            .to_string_lossy()
+            .to_string()
     }
 }
 
@@ -111,8 +115,8 @@ impl AgentTool for WriteTool {
         params: serde_json::Value,
         signal: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> anyhow::Result<AgentToolResult> {
-        let write_params: WriteParams = serde_json::from_value(params)
-            .map_err(|e| anyhow::anyhow!("Invalid write parameters: {}", e))?;
+        let write_params: WriteParams =
+            serde_json::from_value(params).map_err(|e| anyhow::anyhow!("Invalid write parameters: {}", e))?;
 
         let absolute_path = resolve_to_cwd(&write_params.path, &self.cwd());
         let path = Path::new(&absolute_path);
@@ -121,42 +125,55 @@ impl AgentTool for WriteTool {
         with_file_mutation_queue(&absolute_path, || async {
             // Check abort
             if let Some(rx) = &signal
-                && *rx.borrow() {
-                    return Ok(AgentToolResult {
-                        content: vec![Content::Text { text: "Operation aborted".into() }],
-                        details: serde_json::json!({"aborted": true}),
-                        ..Default::default()
-                    });
-                }
+                && *rx.borrow()
+            {
+                return Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "Operation aborted".into(),
+                    }],
+                    details: serde_json::json!({"aborted": true}),
+                    ..Default::default()
+                });
+            }
 
             // Create parent directories
             if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await
-                    .map_err(|e| anyhow::anyhow!("Failed to create parent directories for '{}': {}", write_params.path, e))?;
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to create parent directories for '{}': {}", write_params.path, e)
+                })?;
             }
 
             // Check abort after IO
             if let Some(rx) = &signal
-                && *rx.borrow() {
-                    return Ok(AgentToolResult {
-                        content: vec![Content::Text { text: "Operation aborted".into() }],
-                        details: serde_json::json!({"aborted": true}),
-                        ..Default::default()
-                    });
-                }
+                && *rx.borrow()
+            {
+                return Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "Operation aborted".into(),
+                    }],
+                    details: serde_json::json!({"aborted": true}),
+                    ..Default::default()
+                });
+            }
 
             // Write the file
-            tokio::fs::write(path, &write_params.content).await
+            tokio::fs::write(path, &write_params.content)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", write_params.path, e))?;
 
             Ok(AgentToolResult {
                 content: vec![Content::Text {
-                    text: format!("Successfully wrote {} bytes to {}", write_params.content.len(), write_params.path),
+                    text: format!(
+                        "Successfully wrote {} bytes to {}",
+                        write_params.content.len(),
+                        write_params.path
+                    ),
                 }],
                 details: serde_json::json!({"bytes_written": write_params.content.len()}),
                 ..Default::default()
             })
-        }).await
+        })
+        .await
     }
 }
 
@@ -181,7 +198,11 @@ mod tests {
         let dir = tmp.lock().await.path().to_string_lossy().to_string();
 
         let result = tool
-            .execute("c1", serde_json::json!({"path": "test.txt", "content": "hello world"}), None)
+            .execute(
+                "c1",
+                serde_json::json!({"path": "test.txt", "content": "hello world"}),
+                None,
+            )
             .await
             .unwrap();
 
@@ -193,7 +214,9 @@ mod tests {
         assert!(text.contains("11 bytes"), "Got: {}", text);
 
         // Verify file content
-        let content = tokio::fs::read_to_string(Path::new(&dir).join("test.txt")).await.unwrap();
+        let content = tokio::fs::read_to_string(Path::new(&dir).join("test.txt"))
+            .await
+            .unwrap();
         assert_eq!(content, "hello world");
     }
 
@@ -208,7 +231,11 @@ mod tests {
 
         // Overwrite
         let result = tool
-            .execute("c2", serde_json::json!({"path": "existing.txt", "content": "new content"}), None)
+            .execute(
+                "c2",
+                serde_json::json!({"path": "existing.txt", "content": "new content"}),
+                None,
+            )
             .await
             .unwrap();
 
@@ -229,7 +256,11 @@ mod tests {
         let dir = tmp.lock().await.path().to_string_lossy().to_string();
 
         let result = tool
-            .execute("c3", serde_json::json!({"path": "sub/dir/nested/file.txt", "content": "nested"}), None)
+            .execute(
+                "c3",
+                serde_json::json!({"path": "sub/dir/nested/file.txt", "content": "nested"}),
+                None,
+            )
             .await
             .unwrap();
 
@@ -240,7 +271,9 @@ mod tests {
         assert!(text.contains("Successfully wrote"), "Got: {:?}", result.content);
 
         // Verify file exists
-        let content = tokio::fs::read_to_string(Path::new(&dir).join("sub/dir/nested/file.txt")).await.unwrap();
+        let content = tokio::fs::read_to_string(Path::new(&dir).join("sub/dir/nested/file.txt"))
+            .await
+            .unwrap();
         assert_eq!(content, "nested");
     }
 
@@ -253,7 +286,11 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             tool_instance
-                .execute("c4", serde_json::json!({"path": "aborted.txt", "content": "should not appear"}), Some(rx))
+                .execute(
+                    "c4",
+                    serde_json::json!({"path": "aborted.txt", "content": "should not appear"}),
+                    Some(rx),
+                )
                 .await
         });
 

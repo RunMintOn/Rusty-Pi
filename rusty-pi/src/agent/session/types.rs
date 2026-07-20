@@ -437,9 +437,7 @@ pub fn leaf_id_after_entry(entry: &SessionTreeEntry) -> Option<String> {
 /// Create an ISO 8601 timestamp string (like `new Date().toISOString()`).
 pub fn iso_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = duration.as_secs();
     let millis = duration.subsec_millis();
     // Format as ISO 8601
@@ -534,7 +532,11 @@ mod tests {
     #[test]
     fn leaf_id_after_entry_message() {
         let entry = SessionTreeEntry::Message(MessageEntry {
-            base: EntryBase { id: "e1".into(), parent_id: None, timestamp: "".into() },
+            base: EntryBase {
+                id: "e1".into(),
+                parent_id: None,
+                timestamp: "".into(),
+            },
             entry_type: EntryTypeTag::Message,
             message: AgentMessage::User(crate::ai::types::UserMessage {
                 content: crate::ai::types::MessageContent::Text("".into()),
@@ -547,7 +549,11 @@ mod tests {
     #[test]
     fn leaf_id_after_entry_leaf() {
         let entry = SessionTreeEntry::Leaf(LeafEntry {
-            base: EntryBase { id: "leaf-1".into(), parent_id: Some("e1".into()), timestamp: "".into() },
+            base: EntryBase {
+                id: "leaf-1".into(),
+                parent_id: Some("e1".into()),
+                timestamp: "".into(),
+            },
             entry_type: EntryTypeTag::Leaf,
             target_id: Some("e1".into()),
         });
@@ -557,7 +563,11 @@ mod tests {
     #[test]
     fn leaf_id_after_entry_leaf_null_target() {
         let entry = SessionTreeEntry::Leaf(LeafEntry {
-            base: EntryBase { id: "leaf-1".into(), parent_id: Some("e1".into()), timestamp: "".into() },
+            base: EntryBase {
+                id: "leaf-1".into(),
+                parent_id: Some("e1".into()),
+                timestamp: "".into(),
+            },
             entry_type: EntryTypeTag::Leaf,
             target_id: None,
         });

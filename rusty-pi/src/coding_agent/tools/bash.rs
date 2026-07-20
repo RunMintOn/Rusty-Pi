@@ -5,7 +5,7 @@
 
 use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionMode};
 use crate::ai::types::{Content, Tool};
-use crate::coding_agent::tools::truncate::{truncate_tail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use crate::coding_agent::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,22 +31,28 @@ pub struct BashParams {
     pub max_bytes: Option<usize>,
 }
 
-/// Kill a process by PID using the OS native command.
-fn kill_process(pid: Option<u32>) {
-    if let Some(pid) = pid {
+/// Kill a process group by PGID using SIGKILL.
+///
+/// Uses `killpg` to send SIGKILL to the entire process group, ensuring
+/// child processes (e.g. `sleep` spawned by `sh -c`) are also terminated.
+/// This prevents orphaned processes from holding pipe file descriptors open.
+fn kill_process_group(pgid: Option<u32>) {
+    if let Some(pgid) = pgid {
         #[cfg(unix)]
         {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .spawn();
+            // Safety: killpg is a standard POSIX function. The pgid is validated
+            // by the kernel. We ignore the result because the process may have
+            // already exited.
+            unsafe {
+                libc::killpg(pgid as i32, libc::SIGKILL);
+            }
         }
         #[cfg(windows)]
         {
             let _ = std::process::Command::new("taskkill")
                 .arg("/F")
                 .arg("/PID")
-                .arg(pid.to_string())
+                .arg(pgid.to_string())
                 .spawn();
         }
     }
@@ -66,7 +72,10 @@ pub struct BashTool {
 impl BashTool {
     /// Create a new bash tool that executes commands in the shared working directory.
     pub fn new(shared_cwd: Arc<RwLock<PathBuf>>) -> Self {
-        Self { shared_cwd, output_cb: Mutex::new(None) }
+        Self {
+            shared_cwd,
+            output_cb: Mutex::new(None),
+        }
     }
 
     /// Get the current cached working directory.
@@ -170,11 +179,7 @@ impl AgentTool for BashTool {
         let current_cwd = self.cached_cwd();
 
         // Build command with CWD detection appended
-        let detect_cmd = format!(
-            "{}; echo {}:$(pwd)",
-            bash_params.command,
-            CWD_MARKER,
-        );
+        let detect_cmd = format!("{}; echo {}:$(pwd)", bash_params.command, CWD_MARKER,);
 
         // Build and spawn the command
         let mut cmd = if cfg!(target_os = "windows") {
@@ -191,25 +196,41 @@ impl AgentTool for BashTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        // On Unix, create a new process group so we can kill the entire group
+        // (shell + children) when aborting or timing out.
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
         let mut child = cmd.spawn()?;
         let pid = child.id();
 
         // Check if already aborted
         if let Some(rx) = &signal
-            && *rx.borrow() {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Ok(AgentToolResult {
-                    content: vec![Content::Text { text: "Command aborted".into() }],
-                    details: serde_json::json!({"aborted": true}),
-                    ..Default::default()
-                });
-            }
+            && *rx.borrow()
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Ok(AgentToolResult {
+                content: vec![Content::Text {
+                    text: "Command aborted".into(),
+                }],
+                details: serde_json::json!({"aborted": true}),
+                aborted: true,
+                is_error: true,
+                ..Default::default()
+            });
+        }
 
         // Take stdout/stderr pipes for streaming reads
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-        let stderr = child.stderr.take()
+        let stderr = child
+            .stderr
+            .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
         let mut stdout_reader = tokio::io::BufReader::new(stdout);
@@ -223,23 +244,25 @@ impl AgentTool for BashTool {
         let mut stderr_done = false;
         let mut timed_out = false;
 
-        let timeout_dur = bash_params
-            .timeout
-            .filter(|&t| t > 0)
-            .map(Duration::from_secs);
+        let timeout_dur = bash_params.timeout.filter(|&t| t > 0).map(Duration::from_secs);
 
         while !stdout_done || !stderr_done {
             // Check abort signal
             if let Some(ref rx) = signal
-                && *rx.borrow() {
-                    kill_process(pid);
-                    let _ = child.wait().await;
-                    return Ok(AgentToolResult {
-                        content: vec![Content::Text { text: "Command aborted".into() }],
-                        details: serde_json::json!({"aborted": true}),
-                        ..Default::default()
-                    });
-                }
+                && *rx.borrow()
+            {
+                kill_process_group(pid);
+                let _ = child.wait().await;
+                return Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "Command aborted".into(),
+                    }],
+                    details: serde_json::json!({"aborted": true}),
+                    aborted: true,
+                    is_error: true,
+                    ..Default::default()
+                });
+            }
 
             tokio::select! {
                 result = async {
@@ -279,11 +302,13 @@ impl AgentTool for BashTool {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    kill_process(pid);
+                    kill_process_group(pid);
                     let _ = child.wait().await;
                     return Ok(AgentToolResult {
                         content: vec![Content::Text { text: "Command aborted".into() }],
                         details: serde_json::json!({"aborted": true}),
+                        aborted: true,
+                        is_error: true,
                         ..Default::default()
                     });
                 }
@@ -295,7 +320,7 @@ impl AgentTool for BashTool {
                     }
                 } => {
                     timed_out = true;
-                    kill_process(pid);
+                    kill_process_group(pid);
                     let _ = child.wait().await;
                 }
             }
@@ -314,6 +339,8 @@ impl AgentTool for BashTool {
                     text: format!("Command timed out after {} seconds", bash_params.timeout.unwrap_or(0)),
                 }],
                 details: serde_json::json!({"timed_out": true, "timeout": bash_params.timeout}),
+                timed_out: true,
+                is_error: true,
                 ..Default::default()
             });
         }
@@ -338,24 +365,30 @@ impl AgentTool for BashTool {
             } else {
                 result_text.push_str(&format!(
                     "\n\n[Showing lines {}-{} of {} ({} KB limit)]\n",
-                    start_line, tr.total_lines, tr.total_lines, max_bytes / 1024
+                    start_line,
+                    tr.total_lines,
+                    tr.total_lines,
+                    max_bytes / 1024
                 ));
             }
         }
 
         if let Some(code) = exit_code
-            && code != 0 {
-                let text = if result_text.is_empty() {
-                    format!("Command exited with code {}", code)
-                } else {
-                    format!("{}\n\nCommand exited with code {}", result_text, code)
-                };
-                return Ok(AgentToolResult {
-                    content: vec![Content::Text { text }],
-                    details: serde_json::json!({"exit_code": code}),
-                    ..Default::default()
-                });
-            }
+            && code != 0
+        {
+            let text = if result_text.is_empty() {
+                format!("Command exited with code {}", code)
+            } else {
+                format!("{}\n\nCommand exited with code {}", result_text, code)
+            };
+            return Ok(AgentToolResult {
+                content: vec![Content::Text { text }],
+                details: serde_json::json!({"exit_code": code}),
+                exit_code: Some(code),
+                is_error: true,
+                ..Default::default()
+            });
+        }
 
         let final_text = if result_text.is_empty() {
             "(no output)".into()
@@ -366,6 +399,7 @@ impl AgentTool for BashTool {
         Ok(AgentToolResult {
             content: vec![Content::Text { text: final_text }],
             details: serde_json::json!({"exit_code": exit_code}),
+            exit_code,
             ..Default::default()
         })
     }
@@ -376,9 +410,7 @@ mod tests {
     use super::*;
 
     fn tool() -> BashTool {
-        let shared_cwd = Arc::new(RwLock::new(
-            std::env::current_dir().unwrap()
-        ));
+        let shared_cwd = Arc::new(RwLock::new(std::env::current_dir().unwrap()));
         BashTool::new(shared_cwd)
     }
 
@@ -412,22 +444,14 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout() {
         let result = tool()
-            .execute(
-                "c3",
-                serde_json::json!({"command": "sleep 10", "timeout": 1}),
-                None,
-            )
+            .execute("c3", serde_json::json!({"command": "sleep 10", "timeout": 1}), None)
             .await
             .unwrap();
         let text = match &result.content[0] {
             Content::Text { text } => text,
             _ => panic!("Expected text content"),
         };
-        assert!(
-            text.contains("timed out"),
-            "Expected timeout message, got: {}",
-            text
-        );
+        assert!(text.contains("timed out"), "Expected timeout message, got: {}", text);
     }
 
     #[tokio::test]
@@ -448,11 +472,7 @@ mod tests {
             Content::Text { text } => text,
             _ => panic!("Expected text content"),
         };
-        assert!(
-            text.contains("aborted"),
-            "Expected aborted message, got: {}",
-            text
-        );
+        assert!(text.contains("aborted"), "Expected aborted message, got: {}", text);
     }
 
     #[tokio::test]
@@ -506,7 +526,11 @@ mod tests {
             Content::Text { text } => text,
             _ => panic!("Expected text content"),
         };
-        assert!(text.contains("Showing lines"), "Should have truncation message: {}", text);
+        assert!(
+            text.contains("Showing lines"),
+            "Should have truncation message: {}",
+            text
+        );
         // Last few lines (96-100) should be present
         assert!(text.contains("96"), "Should contain '96' in output: {}", text);
         assert!(text.contains("100"), "Should contain '100' in output: {}", text);
@@ -527,7 +551,11 @@ mod tests {
             Content::Text { text } => text,
             _ => panic!("Expected text content"),
         };
-        assert!(text.contains("KB limit") || text.contains("Showing lines"), "Should have truncation message: {}", text);
+        assert!(
+            text.contains("KB limit") || text.contains("Showing lines"),
+            "Should have truncation message: {}",
+            text
+        );
         // First line "short" is part of the last lines kept, so it should be there or truncated
     }
 
@@ -554,7 +582,11 @@ mod tests {
 
         // Verify shared_cwd was updated
         let cwd_after = shared_cwd.read().unwrap().clone();
-        assert!(cwd_after.ends_with("sub"), "Expected cwd to end with 'sub', got: {:?}", cwd_after);
+        assert!(
+            cwd_after.ends_with("sub"),
+            "Expected cwd to end with 'sub', got: {:?}",
+            cwd_after
+        );
 
         // Second call: pwd (should now be in sub)
         let result2 = tool

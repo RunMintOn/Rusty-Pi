@@ -47,11 +47,7 @@ pub fn strip_bom(content: &str) -> (String, String) {
 
 /// Detect line ending style.
 pub fn detect_line_ending(content: &str) -> &'static str {
-    if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
+    if content.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
 /// Normalize line endings to LF.
@@ -148,7 +144,7 @@ fn apply_replacements(content: &str, replacements: &[(usize, usize, &str)]) -> S
     let mut result = content.to_string();
     // Sort by index descending and apply
     let mut sorted: Vec<_> = replacements.iter().enumerate().collect();
-    sorted.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0));
 
     for (_, (idx, len, new_text)) in &sorted {
         let range = *idx..*idx + len;
@@ -158,11 +154,7 @@ fn apply_replacements(content: &str, replacements: &[(usize, usize, &str)]) -> S
 }
 
 /// Apply edits to normalized (LF) content.
-fn apply_edits_to_normalized_content(
-    content: &str,
-    edits: &[Edit],
-    path: &str,
-) -> Result<AppliedEdits, String> {
+fn apply_edits_to_normalized_content(content: &str, edits: &[Edit], path: &str) -> Result<AppliedEdits, String> {
     if edits.is_empty() {
         return Err("edits must contain at least one replacement.".to_string());
     }
@@ -293,7 +285,10 @@ fn get_no_change_error(path: &str, total: usize) -> String {
             path
         )
     } else {
-        format!("No changes made to {}. The replacements produced identical content.", path)
+        format!(
+            "No changes made to {}. The replacements produced identical content.",
+            path
+        )
     }
 }
 
@@ -368,7 +363,10 @@ pub fn generate_unified_patch(path: &str, old_content: &str, new_content: &str) 
             last_new_range.end - new_range.start
         };
 
-        result.push_str(&format!("@@ -{},{} +{},{} @@\n", old_start, old_len, new_start, new_len));
+        result.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start, old_len, new_start, new_len
+        ));
 
         for op in &group {
             for change in diff.iter_changes(op) {
@@ -395,25 +393,24 @@ fn prepare_edit_arguments(params: &serde_json::Value) -> Result<EditParams, Stri
     // If edits is a JSON string, parse it
     if let Some(edits_str) = args.get("edits").and_then(|v| v.as_str())
         && let Ok(parsed) = serde_json::from_str::<Vec<Edit>>(edits_str)
-        && let Some(obj) = args.as_object_mut() {
-                obj.insert("edits".to_string(), serde_json::to_value(parsed).unwrap());
-        }
+        && let Some(obj) = args.as_object_mut()
+    {
+        obj.insert("edits".to_string(), serde_json::to_value(parsed).unwrap());
+    }
 
     // Try standard deserialization
     if let Ok(p) = serde_json::from_value::<EditParams>(args.clone())
-        && !p.edits.is_empty() {
-            return Ok(p);
-        }
+        && !p.edits.is_empty()
+    {
+        return Ok(p);
+    }
 
     // Legacy: wrap single oldText/newText into edits array
     let old_text = args.get("oldText").and_then(|v| v.as_str());
     let new_text = args.get("newText").and_then(|v| v.as_str());
     if let (Some(old), Some(new)) = (old_text, new_text) {
         return Ok(EditParams {
-            path: args.get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            path: args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             edits: vec![Edit {
                 old_text: old.to_string(),
                 new_text: new.to_string(),
@@ -437,7 +434,11 @@ impl EditTool {
     }
 
     fn cwd(&self) -> String {
-        self.shared_cwd.read().expect("shared_cwd lock poisoned").to_string_lossy().to_string()
+        self.shared_cwd
+            .read()
+            .expect("shared_cwd lock poisoned")
+            .to_string_lossy()
+            .to_string()
     }
 }
 
@@ -504,26 +505,31 @@ impl AgentTool for EditTool {
         params: serde_json::Value,
         signal: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> anyhow::Result<AgentToolResult> {
-        let edit_params: EditParams = prepare_edit_arguments(&params)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let edit_params: EditParams = prepare_edit_arguments(&params).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let absolute_path = if Path::new(&edit_params.path).is_absolute() {
             edit_params.path.clone()
         } else {
-            Path::new(&self.cwd()).join(&edit_params.path).to_string_lossy().to_string()
+            Path::new(&self.cwd())
+                .join(&edit_params.path)
+                .to_string_lossy()
+                .to_string()
         };
         let path_buf = Path::new(&absolute_path).to_path_buf();
 
         with_file_mutation_queue(&absolute_path, || async {
             // Check abort
             if let Some(rx) = &signal
-                && *rx.borrow() {
-                    return Ok(AgentToolResult {
-                        content: vec![Content::Text { text: "Operation aborted".into() }],
-                        details: serde_json::json!({"aborted": true}),
-                        ..Default::default()
-                    });
-                }
+                && *rx.borrow()
+            {
+                return Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "Operation aborted".into(),
+                    }],
+                    details: serde_json::json!({"aborted": true}),
+                    ..Default::default()
+                });
+            }
 
             // Check file exists
             if !path_buf.exists() {
@@ -531,18 +537,22 @@ impl AgentTool for EditTool {
             }
 
             // Read file
-            let raw_content = tokio::fs::read_to_string(&path_buf).await
+            let raw_content = tokio::fs::read_to_string(&path_buf)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", edit_params.path, e))?;
 
             // Check abort after IO
             if let Some(rx) = &signal
-                && *rx.borrow() {
-                    return Ok(AgentToolResult {
-                        content: vec![Content::Text { text: "Operation aborted".into() }],
-                        details: serde_json::json!({"aborted": true}),
-                        ..Default::default()
-                    });
-                }
+                && *rx.borrow()
+            {
+                return Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "Operation aborted".into(),
+                    }],
+                    details: serde_json::json!({"aborted": true}),
+                    ..Default::default()
+                });
+            }
 
             // Strip BOM
             let (bom, content) = strip_bom(&raw_content);
@@ -557,23 +567,21 @@ impl AgentTool for EditTool {
             let final_content = bom + &restore_line_endings(&applied.new_content, original_ending);
 
             // Write
-            tokio::fs::write(&path_buf, &final_content).await
+            tokio::fs::write(&path_buf, &final_content)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", edit_params.path, e))?;
 
             // Generate diff
-            let (diff, first_changed_line) = generate_diff_string(
-                &applied.base_content,
-                &applied.new_content,
-            );
-            let patch = generate_unified_patch(
-                &edit_params.path,
-                &applied.base_content,
-                &applied.new_content,
-            );
+            let (diff, first_changed_line) = generate_diff_string(&applied.base_content, &applied.new_content);
+            let patch = generate_unified_patch(&edit_params.path, &applied.base_content, &applied.new_content);
 
             Ok(AgentToolResult {
                 content: vec![Content::Text {
-                    text: format!("Successfully replaced {} block(s) in {}.", edit_params.edits.len(), edit_params.path),
+                    text: format!(
+                        "Successfully replaced {} block(s) in {}.",
+                        edit_params.edits.len(),
+                        edit_params.path
+                    ),
                 }],
                 details: serde_json::json!({
                     "diff": diff,
@@ -582,7 +590,8 @@ impl AgentTool for EditTool {
                 }),
                 ..Default::default()
             })
-        }).await
+        })
+        .await
     }
 }
 
@@ -612,10 +621,14 @@ mod tests {
         tokio::fs::write(&file_path, "hello world\nfoo bar\n").await.unwrap();
 
         let result = tool
-            .execute("c1", serde_json::json!({
-                "path": "test.txt",
-                "edits": [{"oldText": "foo bar", "newText": "baz qux"}]
-            }), None)
+            .execute(
+                "c1",
+                serde_json::json!({
+                    "path": "test.txt",
+                    "edits": [{"oldText": "foo bar", "newText": "baz qux"}]
+                }),
+                None,
+            )
             .await
             .unwrap();
 
@@ -636,20 +649,29 @@ mod tests {
         let dir = tmp.lock().await.path().to_string_lossy().to_string();
 
         let file_path = Path::new(&dir).join("multi.txt");
-        tokio::fs::write(&file_path, "line one\nline two\nline three\n").await.unwrap();
-
-        let result = tool
-            .execute("c2", serde_json::json!({
-                "path": "multi.txt",
-                "edits": [
-                    {"oldText": "line one", "newText": "changed one"},
-                    {"oldText": "line three", "newText": "changed three"}
-                ]
-            }), None)
+        tokio::fs::write(&file_path, "line one\nline two\nline three\n")
             .await
             .unwrap();
 
-        let text = match &result.content[0] { Content::Text { text } => text.as_str(), _ => panic!("Expected text content"), };
+        let result = tool
+            .execute(
+                "c2",
+                serde_json::json!({
+                    "path": "multi.txt",
+                    "edits": [
+                        {"oldText": "line one", "newText": "changed one"},
+                        {"oldText": "line three", "newText": "changed three"}
+                    ]
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let text = match &result.content[0] {
+            Content::Text { text } => text.as_str(),
+            _ => panic!("Expected text content"),
+        };
         assert!(text.contains("2 block(s)"), "Got: {}", text);
 
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
@@ -665,10 +687,14 @@ mod tests {
         tokio::fs::write(&file_path, "existing content\n").await.unwrap();
 
         let result = tool
-            .execute("c3", serde_json::json!({
-                "path": "nope.txt",
-                "edits": [{"oldText": "nonexistent text", "newText": "replacement"}]
-            }), None)
+            .execute(
+                "c3",
+                serde_json::json!({
+                    "path": "nope.txt",
+                    "edits": [{"oldText": "nonexistent text", "newText": "replacement"}]
+                }),
+                None,
+            )
             .await;
 
         assert!(result.is_err(), "Should error when oldText not found");
@@ -686,10 +712,14 @@ mod tests {
         tokio::fs::write(&file_path, "repeat\nother\nrepeat\n").await.unwrap();
 
         let result = tool
-            .execute("c4", serde_json::json!({
-                "path": "dup.txt",
-                "edits": [{"oldText": "repeat", "newText": "changed"}]
-            }), None)
+            .execute(
+                "c4",
+                serde_json::json!({
+                    "path": "dup.txt",
+                    "edits": [{"oldText": "repeat", "newText": "changed"}]
+                }),
+                None,
+            )
             .await;
 
         assert!(result.is_err(), "Should error on duplicate oldText");
@@ -707,10 +737,14 @@ mod tests {
         tokio::fs::write(&file_path, "hello\r\nworld\r\n").await.unwrap();
 
         let result = tool
-            .execute("c5", serde_json::json!({
-                "path": "crlf.txt",
-                "edits": [{"oldText": "world", "newText": "mars"}]
-            }), None)
+            .execute(
+                "c5",
+                serde_json::json!({
+                    "path": "crlf.txt",
+                    "edits": [{"oldText": "world", "newText": "mars"}]
+                }),
+                None,
+            )
             .await
             .unwrap();
 
@@ -721,7 +755,11 @@ mod tests {
         assert!(text.contains("Successfully"), "Got: {}", text);
 
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "hello\r\nmars\r\n", "CRLF should be preserved, got {:?}", content);
+        assert_eq!(
+            content, "hello\r\nmars\r\n",
+            "CRLF should be preserved, got {:?}",
+            content
+        );
     }
 
     #[tokio::test]
@@ -734,10 +772,14 @@ mod tests {
         tokio::fs::write(&file_path, "\u{FEFF}hello world\n").await.unwrap();
 
         let result = tool
-            .execute("c6", serde_json::json!({
-                "path": "bom.txt",
-                "edits": [{"oldText": "hello world", "newText": "goodbye"}]
-            }), None)
+            .execute(
+                "c6",
+                serde_json::json!({
+                    "path": "bom.txt",
+                    "edits": [{"oldText": "hello world", "newText": "goodbye"}]
+                }),
+                None,
+            )
             .await
             .unwrap();
 
@@ -763,10 +805,14 @@ mod tests {
 
         // Model sends straight quotes
         let result = tool
-            .execute("c7", serde_json::json!({
-                "path": "fuzzy.txt",
-                "edits": [{"oldText": "it's fine", "newText": "it's changed"}]
-            }), None)
+            .execute(
+                "c7",
+                serde_json::json!({
+                    "path": "fuzzy.txt",
+                    "edits": [{"oldText": "it's fine", "newText": "it's changed"}]
+                }),
+                None,
+            )
             .await
             .unwrap();
 
@@ -774,7 +820,10 @@ mod tests {
             Content::Text { text } => text.as_str(),
             _ => panic!("Expected text content"),
         };
-        assert!(text.contains("Successfully"), "Fuzzy matching should handle smart quotes");
+        assert!(
+            text.contains("Successfully"),
+            "Fuzzy matching should handle smart quotes"
+        );
     }
 
     #[tokio::test]
@@ -786,13 +835,17 @@ mod tests {
         tokio::fs::write(&file_path, "hello world fine\n").await.unwrap();
 
         let result = tool
-            .execute("c8", serde_json::json!({
-                "path": "overlap.txt",
-                "edits": [
-                    {"oldText": "hello world", "newText": "hi"},
-                    {"oldText": "world fine", "newText": "earth"}
-                ]
-            }), None)
+            .execute(
+                "c8",
+                serde_json::json!({
+                    "path": "overlap.txt",
+                    "edits": [
+                        {"oldText": "hello world", "newText": "hi"},
+                        {"oldText": "world fine", "newText": "earth"}
+                    ]
+                }),
+                None,
+            )
             .await;
 
         assert!(result.is_err(), "Should error on overlapping edits");
@@ -808,12 +861,15 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(async move {
-            tool
-                .execute("c9", serde_json::json!({
+            tool.execute(
+                "c9",
+                serde_json::json!({
                     "path": "any.txt",
                     "edits": [{"oldText": "x", "newText": "y"}]
-                }), Some(rx))
-                .await
+                }),
+                Some(rx),
+            )
+            .await
         });
 
         tx.send(true).ok();
@@ -835,10 +891,14 @@ mod tests {
         tokio::fs::write(&file_path, "AAA\nBBB\nCCC\n").await.unwrap();
 
         let result = tool
-            .execute("c10", serde_json::json!({
-                "path": "diff_test.txt",
-                "edits": [{"oldText": "BBB", "newText": "XXX"}]
-            }), None)
+            .execute(
+                "c10",
+                serde_json::json!({
+                    "path": "diff_test.txt",
+                    "edits": [{"oldText": "BBB", "newText": "XXX"}]
+                }),
+                None,
+            )
             .await
             .unwrap();
 

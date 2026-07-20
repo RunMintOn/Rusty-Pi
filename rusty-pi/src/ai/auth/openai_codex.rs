@@ -121,7 +121,9 @@ async fn poll_device_auth(
 
     while std::time::Instant::now() < deadline {
         // Check abort signal
-        if let Some(ref rx) = signal && *rx.borrow() {
+        if let Some(ref rx) = signal
+            && *rx.borrow()
+        {
             anyhow::bail!("Login cancelled");
         }
 
@@ -148,12 +150,14 @@ async fn poll_device_auth(
 
         if resp.status().is_success() {
             let json: serde_json::Value = resp.json().await?;
-            let auth_code = json["authorization_code"].as_str().ok_or_else(|| {
-                anyhow::anyhow!("Missing authorization_code in device auth response")
-            })?.to_string();
-            let code_verifier = json["code_verifier"].as_str().ok_or_else(|| {
-                anyhow::anyhow!("Missing code_verifier in device auth response")
-            })?.to_string();
+            let auth_code = json["authorization_code"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing authorization_code in device auth response"))?
+                .to_string();
+            let code_verifier = json["code_verifier"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing code_verifier in device auth response"))?
+                .to_string();
             return Ok((auth_code, code_verifier));
         }
 
@@ -179,7 +183,11 @@ async fn poll_device_auth(
 
     anyhow::bail!(
         "Device flow timed out{}",
-        if slow_count > 0 { " after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments." } else { "" }
+        if slow_count > 0 {
+            " after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments."
+        } else {
+            ""
+        }
     );
 }
 
@@ -188,11 +196,7 @@ async fn poll_device_auth(
 // ---------------------------------------------------------------------------
 
 /// Exchange an authorization code for tokens.
-async fn exchange_code(
-    code: &str,
-    verifier: &str,
-    redirect_uri: &str,
-) -> anyhow::Result<CodexCredential> {
+async fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> anyhow::Result<CodexCredential> {
     let client = reqwest::Client::new();
     let resp = client
         .post(TOKEN_URL)
@@ -211,9 +215,15 @@ async fn exchange_code(
     }
 
     let json: serde_json::Value = resp.json().await?;
-    let access = json["access_token"].as_str().ok_or_else(|| anyhow::anyhow!("Missing access_token"))?;
-    let refresh = json["refresh_token"].as_str().ok_or_else(|| anyhow::anyhow!("Missing refresh_token"))?;
-    let expires_in = json["expires_in"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing expires_in"))?;
+    let access = json["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing access_token"))?;
+    let refresh = json["refresh_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing refresh_token"))?;
+    let expires_in = json["expires_in"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("Missing expires_in"))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,9 +260,15 @@ pub async fn refresh_token(refresh: &str) -> anyhow::Result<CodexCredential> {
     }
 
     let json: serde_json::Value = resp.json().await?;
-    let access = json["access_token"].as_str().ok_or_else(|| anyhow::anyhow!("Missing access_token"))?;
-    let refresh = json["refresh_token"].as_str().ok_or_else(|| anyhow::anyhow!("Missing refresh_token"))?;
-    let expires_in = json["expires_in"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing expires_in"))?;
+    let access = json["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing access_token"))?;
+    let refresh = json["refresh_token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing refresh_token"))?;
+    let expires_in = json["expires_in"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("Missing expires_in"))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -276,7 +292,8 @@ fn extract_account_id(token: &str) -> anyhow::Result<String> {
         anyhow::bail!("Invalid JWT token format");
     }
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let decoded = URL_SAFE_NO_PAD.decode(parts[1])
+    let decoded = URL_SAFE_NO_PAD
+        .decode(parts[1])
         .map_err(|_| anyhow::anyhow!("Invalid JWT payload encoding"))?;
     let payload: serde_json::Value = serde_json::from_slice(&decoded)?;
     let account_id = payload["https://api.openai.com/auth"]["chatgpt_account_id"]
@@ -290,9 +307,7 @@ fn extract_account_id(token: &str) -> anyhow::Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Perform the full device code OAuth login flow.
-pub async fn device_code_login(
-    signal: Option<tokio::sync::watch::Receiver<bool>>,
-) -> anyhow::Result<CodexCredential> {
+pub async fn device_code_login(signal: Option<tokio::sync::watch::Receiver<bool>>) -> anyhow::Result<CodexCredential> {
     let client = reqwest::Client::new();
 
     // Start device auth
@@ -305,7 +320,9 @@ pub async fn device_code_login(
 
     if !resp.status().is_success() {
         if resp.status() == 404 {
-            anyhow::bail!("OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL.");
+            anyhow::bail!(
+                "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL."
+            );
         }
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -313,12 +330,14 @@ pub async fn device_code_login(
     }
 
     let json: serde_json::Value = resp.json().await?;
-    let device_auth_id = json["device_auth_id"].as_str().ok_or_else(|| {
-        anyhow::anyhow!("Missing device_auth_id")
-    })?.to_string();
-    let user_code = json["user_code"].as_str().ok_or_else(|| {
-        anyhow::anyhow!("Missing user_code")
-    })?.to_string();
+    let device_auth_id = json["device_auth_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing device_auth_id"))?
+        .to_string();
+    let user_code = json["user_code"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing user_code"))?
+        .to_string();
     let interval = json["interval"].as_u64().unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
 
     println!(
@@ -332,8 +351,12 @@ pub async fn device_code_login(
     );
 
     let (auth_code, code_verifier) = poll_device_auth(&device_auth_id, &user_code, interval, signal).await?;
-    let cred = exchange_code(&auth_code, &code_verifier,
-        "https://auth.openai.com/deviceauth/callback").await?;
+    let cred = exchange_code(
+        &auth_code,
+        &code_verifier,
+        "https://auth.openai.com/deviceauth/callback",
+    )
+    .await?;
     cred.save()?;
     println!("✓ Authorization complete. Credentials saved.\n");
     Ok(cred)
@@ -344,9 +367,7 @@ pub async fn device_code_login(
 // ---------------------------------------------------------------------------
 
 /// Perform the browser-based OAuth login flow (starts local HTTP server on port 1455).
-pub async fn browser_login(
-    signal: Option<tokio::sync::watch::Receiver<bool>>,
-) -> anyhow::Result<CodexCredential> {
+pub async fn browser_login(signal: Option<tokio::sync::watch::Receiver<bool>>) -> anyhow::Result<CodexCredential> {
     let (verifier, challenge) = generate_pkce();
     let state = generate_state();
 
@@ -354,11 +375,7 @@ pub async fn browser_login(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid+profile+email+offline_access&\
          code_challenge={}&code_challenge_method=S256&state={}&\
          id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=pi",
-        "https://auth.openai.com/oauth/authorize",
-        CLIENT_ID,
-        "http://localhost:1455/auth/callback",
-        challenge,
-        state,
+        "https://auth.openai.com/oauth/authorize", CLIENT_ID, "http://localhost:1455/auth/callback", challenge, state,
     );
 
     println!(
@@ -375,9 +392,13 @@ pub async fn browser_login(
     open_browser(&authorize_url);
 
     // Start local server and wait for callback
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:1455").await
-        .map_err(|e| anyhow::anyhow!("Failed to start OAuth callback server on port 1455: {}. \
-            Check if another process is using the port.", e))?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:1455").await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to start OAuth callback server on port 1455: {}. \
+            Check if another process is using the port.",
+            e
+        )
+    })?;
 
     let code = wait_for_callback(&listener, &state, signal).await?;
 
@@ -396,25 +417,21 @@ fn generate_state() -> String {
 /// Attempt to open a URL in the default browser. Errors are silently ignored.
 #[cfg(target_os = "linux")]
 fn open_browser(url: &str) {
-    let _ = std::process::Command::new("xdg-open")
-        .arg(url).spawn();
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 #[cfg(target_os = "macos")]
 fn open_browser(url: &str) {
-    let _ = std::process::Command::new("open")
-        .arg(url).spawn();
+    let _ = std::process::Command::new("open").arg(url).spawn();
 }
 
 #[cfg(target_os = "windows")]
 fn open_browser(url: &str) {
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", url]).spawn();
+    let _ = std::process::Command::new("cmd").args(["/c", "start", url]).spawn();
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn open_browser(_url: &str) {
-}
+fn open_browser(_url: &str) {}
 
 /// Wait for the OAuth callback on the local HTTP server.
 async fn wait_for_callback(
@@ -471,16 +488,15 @@ async fn wait_for_abort(signal: Option<tokio::sync::watch::Receiver<bool>>) {
 }
 
 /// Send an HTTP response to the TCP stream.
-async fn respond(
-    stream: &mut tokio::net::TcpStream,
-    status: u16,
-    body: &str,
-) -> anyhow::Result<()> {
+async fn respond(stream: &mut tokio::net::TcpStream, status: u16, body: &str) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     let status_text = if status == 200 { "OK" } else { "Bad Request" };
     let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n<html><body><p>{}</p></body></html>",
-        status, status_text, body.len() + 45, body
+        status,
+        status_text,
+        body.len() + 45,
+        body
     );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
@@ -495,9 +511,7 @@ async fn respond(
 /// 1. `OPENAI_CODEX_TOKEN` env var
 /// 2. Stored credential file (if not expired)
 /// 3. Run OAuth flow
-pub async fn resolve_codex_token(
-    signal: Option<tokio::sync::watch::Receiver<bool>>,
-) -> anyhow::Result<String> {
+pub async fn resolve_codex_token(signal: Option<tokio::sync::watch::Receiver<bool>>) -> anyhow::Result<String> {
     // 1. Env var
     if let Ok(token) = std::env::var("OPENAI_CODEX_TOKEN")
         && !token.is_empty()

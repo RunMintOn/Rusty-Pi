@@ -65,3 +65,46 @@ Single-context repo. See `docs/agents/domain.md`.
 
 - 不要提交除非用户要求。
 - 阶段性的成果确认后，由用户决定何时提交。
+
+## Known Pitfalls（踩坑记录）
+
+### 1. 子进程杀死不完整导致测试死锁
+
+**症状**：`cargo test` 卡死，运行几分钟甚至几小时不结束。
+
+**原因**：在 `bash.rs` 中，`kill_process` 只杀 shell 进程（`sh`），不杀其子进程（如 `sleep`）。被杀的 shell 留下孤儿子进程，这些子进程占用 stdout/stderr 管道的写端，导致 `child.wait()` 和 `read_line()` 永远阻塞。
+
+**修复**：
+1. 用 `process_group(0)` 让子进程成为独立进程组的组长
+2. 用 `libc::killpg(pgid, SIGKILL)` 杀整个进程组
+3. 不要用 `Command::new("kill").spawn()`，它会产生僵尸进程
+
+**教训**：杀进程要杀整个进程组，不能只杀父进程。
+
+### 2. Agent 未传递 abort signal 给工具
+
+**症状**：`agent_cancellation_aborts_long_running_tool` 测试失败。
+
+**原因**：`engine.rs` 的 `execute_tool` 方法调用工具时传了 `signal: None`，工具收不到 abort 信号，无法被取消。
+
+**修复**：
+1. 创建 `tokio::sync::watch::channel`
+2. 启动后台任务监控 `abort_flag`，状态变化时通过 channel 通知
+3. 把 `watch::Receiver` 传递给工具
+
+**教训**：abort/cancel 信号必须端到端传递，不能在中间断掉。
+
+### 3. 测试卡住时如何诊断
+
+```bash
+# 查看进程树
+pstree -p <test_pid>
+
+# 查看线程状态
+cat /proc/<test_pid>/task/*/wchan | sort | uniq -c
+
+# 查看僵尸进程
+ps -eo pid,ppid,stat,comm | grep Z
+```
+
+如果看到大量 `futex_wait_queue`（等锁）或 `do_epoll_wait`（等 I/O），且有僵尸子进程，很可能是上述问题 1 或 2。

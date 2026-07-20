@@ -3,8 +3,8 @@
 //! Mirrors `@earendil-works/pi-coding-agent/src/core/prompt-templates.ts`.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::path::MAIN_SEPARATOR;
+use std::path::{Path, PathBuf};
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -123,7 +123,9 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
                             }
                             _ => {
                                 if let Ok(n) = target.parse::<usize>() {
-                                    args.get(n.wrapping_sub(1)).filter(|s| !s.is_empty()).map(|s| s.as_str())
+                                    args.get(n.wrapping_sub(1))
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.as_str())
                                 } else {
                                     None
                                 }
@@ -140,7 +142,8 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
                         let start_idx = if start > 0 { start - 1 } else { 0 };
                         if parts.len() > 1 {
                             if let Ok(length) = parts[1].parse::<usize>() {
-                                let slice: Vec<&str> = args.iter().skip(start_idx).take(length).map(|s| s.as_str()).collect();
+                                let slice: Vec<&str> =
+                                    args.iter().skip(start_idx).take(length).map(|s| s.as_str()).collect();
                                 result.push_str(&slice.join(" "));
                             } else {
                                 result.push_str(&all_args);
@@ -272,11 +275,7 @@ fn load_template_from_file(file_path: &Path, source: &str, scope: ResourceScope)
     let raw = fs::read_to_string(file_path).ok()?;
     let (frontmatter, body) = parse_frontmatter(&raw);
 
-    let name = file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+    let name = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
 
     let description = frontmatter
         .get("description")
@@ -318,10 +317,12 @@ fn load_templates_from_dir(dir: &Path, source: &str, scope: ResourceScope) -> Ve
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("md") && path.is_file()
-            && let Some(t) = load_template_from_file(&path, source, scope) {
-                templates.push(t);
-            }
+        if path.extension().and_then(|s| s.to_str()) == Some("md")
+            && path.is_file()
+            && let Some(t) = load_template_from_file(&path, source, scope)
+        {
+            templates.push(t);
+        }
     }
 
     templates
@@ -482,7 +483,10 @@ mod tests {
 
     #[test]
     fn parse_mixed_quotes() {
-        assert_eq!(parse_command_args("foo \"bar baz\" 'qux'"), vec!["foo", "bar baz", "qux"]);
+        assert_eq!(
+            parse_command_args("foo \"bar baz\" 'qux'"),
+            vec!["foo", "bar baz", "qux"]
+        );
     }
 
     #[test]
@@ -644,11 +648,7 @@ mod tests {
 
     #[test]
     fn load_template_nonexistent_file() {
-        let result = load_template_from_file(
-            Path::new("/nonexistent/template.md"),
-            "test",
-            ResourceScope::Path,
-        );
+        let result = load_template_from_file(Path::new("/nonexistent/template.md"), "test", ResourceScope::Path);
         assert!(result.is_none());
     }
 

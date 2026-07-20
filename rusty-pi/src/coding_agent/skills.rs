@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -80,14 +80,13 @@ pub fn validate_name(name: &str) -> Vec<String> {
     let mut errors = Vec::new();
 
     if name.len() > MAX_NAME_LENGTH {
-        errors.push(format!(
-            "name exceeds {} characters ({})",
-            MAX_NAME_LENGTH,
-            name.len()
-        ));
+        errors.push(format!("name exceeds {} characters ({})", MAX_NAME_LENGTH, name.len()));
     }
 
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         errors.push("name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)".into());
     }
 
@@ -191,10 +190,7 @@ fn load_skill_from_file(file_path: &Path, source: &str, base_dir: &Path) -> (Opt
 
     let (frontmatter, _body) = parse_frontmatter(&raw);
     let skill_dir = file_path.parent().unwrap_or(Path::new(""));
-    let parent_dir_name = skill_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let parent_dir_name = skill_dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
     // Validate description
     let description = frontmatter.get("description").map(|s| s.as_str());
@@ -251,9 +247,7 @@ struct IgnoreMatcher {
 
 impl IgnoreMatcher {
     fn new() -> Self {
-        Self {
-            patterns: Vec::new(),
-        }
+        Self { patterns: Vec::new() }
     }
 
     fn add_ignore_file(&mut self, path: &Path, root_dir: &Path) {
@@ -333,17 +327,13 @@ impl IgnoreMatcher {
                 if prefix.is_empty() {
                     return path.ends_with(suffix) || path == suffix;
                 }
-                return path.starts_with(prefix) && path.ends_with(suffix)
-                    || path == pattern.trim_start_matches("**/");
+                return path.starts_with(prefix) && path.ends_with(suffix) || path == pattern.trim_start_matches("**/");
             }
         }
 
         // Simple wildcard match: * matches anything except /
         if pattern.contains('*') {
-            let re_pattern = format!(
-                "^{}$",
-                regex::escape(pattern).replace(r"\*", "[^/]*")
-            );
+            let re_pattern = format!("^{}$", regex::escape(pattern).replace(r"\*", "[^/]*"));
             if let Ok(re) = regex::Regex::new(&re_pattern) {
                 return re.is_match(path);
             }
@@ -430,11 +420,7 @@ fn load_skills_from_dir_internal(
     // Second pass: recurse into directories, and optionally load .md files
     for entry in entries {
         // Skip hidden files/dirs
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with('.')
-        {
+        if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
 
@@ -510,7 +496,10 @@ pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
     for skill in &visible {
         lines.push("  <skill>".into());
         lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!("    <description>{}</description>", escape_xml(&skill.description)));
+        lines.push(format!(
+            "    <description>{}</description>",
+            escape_xml(&skill.description)
+        ));
         lines.push(format!(
             "    <location>{}</location>",
             escape_xml(&skill.file_path.to_string_lossy())
@@ -557,7 +546,10 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         all_diagnostics.extend(result.diagnostics);
         for skill in result.skills {
             // Canonicalize to detect duplicates via symlink
-            let real_path = skill.file_path.canonicalize().unwrap_or_else(|_| skill.file_path.clone());
+            let real_path = skill
+                .file_path
+                .canonicalize()
+                .unwrap_or_else(|_| skill.file_path.clone());
 
             if real_path_set.contains(&real_path) {
                 continue;
@@ -578,10 +570,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
 
     if options.include_defaults {
         let user_skills_dir = options.agent_dir.join("skills");
-        let project_skills_dir = options
-            .cwd
-            .join(config_dir_name)
-            .join("skills");
+        let project_skills_dir = options.cwd.join(config_dir_name).join("skills");
 
         let result = load_skills_from_dir_internal(&user_skills_dir, "user", true, None, None);
         add_skills(
@@ -627,10 +616,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         };
 
         if !resolved.exists() {
-            all_diagnostics.push(ResourceDiagnostic::warning(
-                "skill path does not exist",
-                &resolved,
-            ));
+            all_diagnostics.push(ResourceDiagnostic::warning("skill path does not exist", &resolved));
             continue;
         }
 
@@ -695,11 +681,7 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
 
     let rest = &text[7..]; // skip "/skill:"
     let space_pos = rest.find(' ');
-    let skill_name = if let Some(pos) = space_pos {
-        &rest[..pos]
-    } else {
-        rest
-    };
+    let skill_name = if let Some(pos) = space_pos { &rest[..pos] } else { rest };
     let args = if let Some(pos) = space_pos {
         rest[pos + 1..].trim()
     } else {
@@ -858,9 +840,7 @@ mod tests {
 
     #[test]
     fn xml_escapes_special_chars() {
-        let skills = vec![
-            make_skill("test&skill", "description with < & > \" '", false),
-        ];
+        let skills = vec![make_skill("test&skill", "description with < & > \" '", false)];
         let result = format_skills_for_prompt(&skills);
         assert!(result.contains("test&amp;skill"));
         assert!(result.contains("&lt;"));

@@ -2,16 +2,16 @@
 //!
 //! Mirrors the original `@earendil-works/pi-agent-core/src/harness/session/` package.
 
-pub mod types;
-pub mod storage;
-pub mod memory;
 pub mod jsonl;
+pub mod memory;
 #[allow(clippy::module_inception)]
 pub mod session;
+pub mod storage;
+pub mod types;
 
 // Re-exports of key types for convenience.
-pub use types::*;
-pub use storage::*;
+pub use jsonl::{JsonlSessionCreateOptions, JsonlSessionStorage};
 pub use memory::InMemorySessionStorage;
-pub use jsonl::{JsonlSessionStorage, JsonlSessionCreateOptions};
 pub use session::Session;
+pub use storage::*;
+pub use types::*;

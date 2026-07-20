@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use super::skills::{format_skills_for_prompt, Skill};
+use super::skills::{Skill, format_skills_for_prompt};
 
 // ── Options ─────────────────────────────────────────────────────────────────
 
@@ -303,7 +303,10 @@ mod tests {
     fn bash_without_grep_has_file_guideline() {
         let prompt = build_system_prompt(BuildSystemPromptOptions {
             selected_tools: vec!["bash".into(), "read".into()],
-            tool_snippets: vec![("bash".into(), "Run commands".into()), ("read".into(), "Read files".into())],
+            tool_snippets: vec![
+                ("bash".into(), "Run commands".into()),
+                ("read".into(), "Read files".into()),
+            ],
             cwd: PathBuf::from("/test"),
             ..Default::default()
         });

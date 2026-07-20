@@ -2,11 +2,11 @@
 //!
 //! Mirrors the structure of `@earendil-works/pi-agent-core`.
 
-pub mod types;
 pub mod engine;
 pub mod session;
+pub mod types;
 
 // Re-exports for convenience.
-pub use types::*;
 pub use engine::*;
 pub use session::*;
+pub use types::*;
