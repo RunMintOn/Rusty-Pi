@@ -412,18 +412,19 @@ impl<O: FrontendOutput> PrintFrontend<O> {
             .map(|d| format!(" in {:.1}s", d.as_secs_f64()))
             .unwrap_or_default();
 
-        let is_failure = result.is_error || result.exit_code.is_some() || result.timed_out || result.aborted;
+        let nonzero_exit_code = result.exit_code.filter(|code| *code != 0);
+        let is_failure = result.is_error || nonzero_exit_code.is_some() || result.timed_out || result.aborted;
 
         if saw_stream {
             // Streaming output has already shown the result content. Only the
             // stateful completion summary is rendered, including error state.
             let summary = if is_failure {
-                if let Some(code) = result.exit_code {
-                    format!("  ❌ {} exit code {}{}\n", name, code, duration_str)
+                if result.aborted {
+                    format!("  ⏹ {} aborted{}\n", name, duration_str)
                 } else if result.timed_out {
                     format!("  ⏰ {} timed out{}\n", name, duration_str)
-                } else if result.aborted {
-                    format!("  ⏹ {} aborted{}\n", name, duration_str)
+                } else if let Some(code) = nonzero_exit_code {
+                    format!("  ❌ {} exit code {}{}\n", name, code, duration_str)
                 } else {
                     format!("  ❌ {} error{}\n", name, duration_str)
                 }
@@ -439,12 +440,12 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                 .filter(|text| !text.is_empty())
                 .unwrap_or("unknown error");
             let display = truncate_chars(error_text, 80);
-            let prefix = if let Some(code) = result.exit_code {
-                format!("  ❌ {} exit code {}{}", name, code, duration_str)
+            let prefix = if result.aborted {
+                format!("  ⏹ {} aborted{}", name, duration_str)
             } else if result.timed_out {
                 format!("  ⏰ {} timed out{}", name, duration_str)
-            } else if result.aborted {
-                format!("  ⏹ {} aborted{}", name, duration_str)
+            } else if let Some(code) = nonzero_exit_code {
+                format!("  ❌ {} exit code {}{}", name, code, duration_str)
             } else {
                 format!("  ❌ {} error{}", name, duration_str)
             };
@@ -1019,6 +1020,193 @@ mod tests {
     }
 
     #[test]
+    fn zero_exit_code_without_streaming_is_success() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolStarted {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_zero".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_zero".into(),
+                name: "bash".into(),
+                result: AgentToolResult {
+                    content: vec![Content::Text { text: "success".into() }],
+                    exit_code: Some(0),
+                    is_error: false,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert_eq!(stderr.matches("✅").count(), 1);
+        assert!(!stderr.contains("❌"));
+        assert!(!stderr.contains("exit code 0"));
+        assert_eq!(stderr.matches("success").count(), 1);
+    }
+
+    #[test]
+    fn zero_exit_code_with_streaming_is_success() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolStarted {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_zero_stream".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolOutput {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_zero_stream".into(),
+                stream: ToolOutputStream::Stdout,
+                chunk: "streamed success".into(),
+            })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_zero_stream".into(),
+                name: "bash".into(),
+                result: AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "streamed success".into(),
+                    }],
+                    exit_code: Some(0),
+                    is_error: false,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert_eq!(stderr.matches("streamed success").count(), 1);
+        assert!(stderr.contains("✅ bash done"));
+        assert!(!stderr.contains("❌"));
+        assert!(!stderr.contains("exit code 0"));
+    }
+
+    #[test]
+    fn nonzero_exit_code_is_failure() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_nonzero".into(),
+                name: "bash".into(),
+                result: AgentToolResult {
+                    content: vec![Content::Text { text: "failed".into() }],
+                    exit_code: Some(2),
+                    is_error: true,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert!(stderr.contains("❌"));
+        assert!(stderr.contains("exit code 2"));
+        assert!(!stderr.contains("✅"));
+    }
+
+    #[test]
+    fn timeout_takes_priority_over_exit_code() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_timeout_exit".into(),
+                name: "bash".into(),
+                result: AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "timed out".into(),
+                    }],
+                    exit_code: Some(124),
+                    timed_out: true,
+                    is_error: true,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert!(stderr.contains("timed out"));
+        assert!(!stderr.contains("exit code 124"));
+    }
+
+    #[test]
+    fn abort_takes_priority_over_exit_code() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_abort_exit".into(),
+                name: "bash".into(),
+                result: AgentToolResult {
+                    content: vec![Content::Text { text: "aborted".into() }],
+                    exit_code: Some(130),
+                    aborted: true,
+                    is_error: true,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert!(stderr.contains("aborted"));
+        assert!(!stderr.contains("exit code 130"));
+    }
+
+    #[test]
+    fn generic_error_without_code_or_state_is_failure() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_generic_error".into(),
+                name: "bash".into(),
+                result: AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "generic failure".into(),
+                    }],
+                    is_error: true,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert!(stderr.contains("❌ bash error"));
+        assert!(stderr.contains("generic failure"));
+        assert!(!stderr.contains("✅"));
+    }
+
+    #[test]
     fn print_frontend_stdout_write_error_propagates() {
         let mut frontend = PrintFrontend::with_output(FailingOutput);
         frontend
@@ -1407,6 +1595,49 @@ mod tests {
         assert!(frontend.output().stderr_str().contains("echo"));
         // ToolFinished summary in stderr (the tool emitted streaming output)
         assert!(frontend.output().stderr_str().contains("done"));
+    }
+
+    #[tokio::test]
+    async fn integration_bash_zero_exit_code_is_success() {
+        use crate::agent::engine::Agent;
+        use crate::ai::mock::{MockProvider, MockStep};
+        use std::sync::{Arc, RwLock};
+
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_bash_success".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "printf '\\163\\165\\143\\143\\145\\163\\163'"}),
+                stop_reason: None,
+            },
+            MockStep::Text("Done".into()),
+        ]);
+        let mut agent = Agent::new(
+            Box::new(mock),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let cwd = Arc::new(RwLock::new(std::env::current_dir().unwrap()));
+        agent.add_tool(Box::new(crate::coding_agent::tools::bash::BashTool::new(cwd)));
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+
+        let outcome = drive_print_run(
+            &mut agent,
+            "run a successful bash command",
+            &mut frontend,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, PrintRunOutcome::Finished(StopReason::Stop)));
+        assert_eq!(frontend.output().stderr_str().matches("success").count(), 1);
+        assert!(frontend.output().stderr_str().contains("✅ bash done"));
+        assert!(!frontend.output().stderr_str().contains("❌ bash exit code 0"));
+        assert!(frontend.output().stdout_str().contains("Done"));
+        assert!(!frontend.output().stdout_str().contains("success"));
     }
 
     #[tokio::test]
