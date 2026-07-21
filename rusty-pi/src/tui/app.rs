@@ -1520,54 +1520,236 @@ mod tests {
     // ── Run ID isolation tests ───────────────────────────────────────────
 
     #[test]
-    fn late_event_from_old_run_ignored() {
+    fn late_text_delta_from_old_run_ignored() {
         let mut state = AppState::new((80, 24));
-        // Start run 1
+        // Run A starts and produces text
         state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
-        // Start run 2 (simulating new run after cancel)
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
-        // Late TextDelta from run 1 should be ignored
         state.handle_agent_event(AgentEvent::TextDelta {
             run_id: RunId(1),
-            text: "stale".into(),
+            text: "from A".into(),
         });
-        assert!(state.transcript.is_empty(), "Stale event should be ignored");
+        // Run B starts (simulating a new run after Run A was cancelled externally)
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        // Late TextDelta from Run A arrives after Run B started
+        state.handle_agent_event(AgentEvent::TextDelta {
+            run_id: RunId(1),
+            text: "STALE".into(),
+        });
+        // Transcript should only contain Run A's initial text, not the stale delta
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptEntry::Assistant(s) => assert_eq!(s, "from A", "Stale delta should not be appended"),
+            _ => panic!("Expected Assistant entry"),
+        }
+        // current_run_id should still be Run B
+        assert_eq!(state.current_run_id, Some(RunId(2)));
     }
 
     #[test]
-    fn late_tool_output_from_old_run_ignored() {
+    fn late_tool_output_from_old_run_does_not_pollute() {
         let mut state = AppState::new((80, 24));
+        // Run A starts tool_a and gets some output
         state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
-        // Late ToolOutput from run 1 should be ignored
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            run_id: RunId(1),
+            tool_call_id: "tc_a".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
         state.handle_agent_event(AgentEvent::ToolOutput {
             run_id: RunId(1),
-            tool_call_id: "ghost".into(),
+            tool_call_id: "tc_a".into(),
+            stream: crate::agent::events::ToolOutputStream::Stdout,
+            chunk: "legit data".into(),
+        });
+        // Run B starts (simulating new run) — tool_index is cleared
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            run_id: RunId(2),
+            tool_call_id: "tc_b".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        });
+        // Late ToolOutput from Run A arrives — should be ignored because run_id != current_run_id
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            run_id: RunId(1),
+            tool_call_id: "tc_a".into(),
+            stream: crate::agent::events::ToolOutputStream::Stdout,
+            chunk: "STALE DATA".into(),
+        });
+        // Transcript has 2 entries: tool_a from Run A (with legit data) + tool_b from Run B (empty)
+        assert_eq!(state.transcript.len(), 2, "Should have tool_a and tool_b entries");
+        // tool_b (index 1) should have empty stdout — not polluted by stale event
+        match &state.transcript[1] {
+            TranscriptEntry::Tool { stdout, id, .. } => {
+                assert_eq!(id, "tc_b");
+                assert!(stdout.is_empty(), "tool_b stdout should be empty, not polluted");
+            }
+            _ => panic!("Expected tool_b entry at index 1"),
+        }
+        // tool_a (index 0) should have only the legit data, not the stale chunk
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { stdout, id, .. } => {
+                assert_eq!(id, "tc_a");
+                assert_eq!(stdout, "legit data", "tool_a should only have legit data");
+            }
+            _ => panic!("Expected tool_a entry at index 0"),
+        }
+    }
+
+    #[test]
+    fn late_tool_finished_from_old_run_ignored() {
+        let mut state = AppState::new((80, 24));
+        // Run A starts tool_a
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            run_id: RunId(1),
+            tool_call_id: "tc_a".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        // Run B starts (simulating new run)
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            run_id: RunId(2),
+            tool_call_id: "tc_b".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        });
+        // Late ToolFinished from Run A
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            run_id: RunId(1),
+            tool_call_id: "tc_a".into(),
+            name: "bash".into(),
+            result: crate::agent::types::AgentToolResult {
+                content: vec![],
+                ..Default::default()
+            },
+        });
+        // Run B tool state should be unchanged (tc_b still Running)
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Running),
+            _ => panic!("Expected tool_b entry"),
+        }
+        // current_run_id should still be Run B
+        assert_eq!(state.current_run_id, Some(RunId(2)));
+    }
+
+    #[test]
+    fn late_run_finished_from_old_run_does_not_affect_current() {
+        let mut state = AppState::new((80, 24));
+        // Run A starts
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        // Run B starts (simulating new run)
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        // Late RunFinished from Run A with Stop reason
+        state.handle_agent_event(AgentEvent::RunFinished {
+            run_id: RunId(1),
+            stop_reason: StopReason::Stop,
+        });
+        // current_run_id should still be Run B
+        assert_eq!(state.current_run_id, Some(RunId(2)));
+        // Transcript should be empty (Run A's finish didn't add anything)
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn unknown_run_id_events_ignored() {
+        let mut state = AppState::new((80, 24));
+        // No run started yet — send events with unknown run_id
+        let unknown = RunId(999);
+        let orig_activity = state.activity.clone();
+        let orig_outcome = state.last_outcome.clone();
+        let orig_transcript_len = state.transcript.len();
+        let orig_status = state.status.clone();
+        let orig_quit = state.quit;
+
+        state.handle_agent_event(AgentEvent::TextDelta {
+            run_id: unknown,
+            text: "ghost".into(),
+        });
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            run_id: unknown,
+            tool_call_id: "tc_ghost".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            run_id: unknown,
+            tool_call_id: "tc_ghost".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "data".into(),
         });
-        assert!(state.transcript.is_empty(), "Stale ToolOutput should be ignored");
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            run_id: unknown,
+            tool_call_id: "tc_ghost".into(),
+            name: "bash".into(),
+            result: crate::agent::types::AgentToolResult::default(),
+        });
+        state.handle_agent_event(AgentEvent::ProviderError {
+            run_id: unknown,
+            error: crate::agent::events::ProviderError {
+                reason: StopReason::Error,
+                message: "error".into(),
+            },
+        });
+        state.handle_agent_event(AgentEvent::RunAborted { run_id: unknown });
+        state.handle_agent_event(AgentEvent::RunFinished {
+            run_id: unknown,
+            stop_reason: StopReason::Stop,
+        });
+
+        // AppState should be completely unchanged
+        assert_eq!(state.activity, orig_activity);
+        assert_eq!(state.last_outcome, orig_outcome);
+        assert_eq!(state.transcript.len(), orig_transcript_len);
+        assert_eq!(state.status, orig_status);
+        assert_eq!(state.quit, orig_quit);
+        assert_eq!(state.current_run_id, None);
     }
 
     #[test]
-    fn new_run不受旧run事件影响() {
+    fn late_provider_error_from_old_run_ignored() {
         let mut state = AppState::new((80, 24));
         state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
         state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
-        state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId(2),
-            text: "new".into(),
-        });
-        // Run 1 event should not affect run 2
-        state.handle_agent_event(AgentEvent::TextDelta {
+
+        state.handle_agent_event(AgentEvent::ProviderError {
             run_id: RunId(1),
-            text: "old".into(),
+            error: crate::agent::events::ProviderError {
+                reason: StopReason::Error,
+                message: "stale error".into(),
+            },
         });
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Assistant(s) => assert_eq!(s, "new"),
-            _ => panic!("Expected Assistant entry with 'new'"),
-        }
+        assert!(state.error.is_none(), "Stale provider error should be ignored");
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn late_run_aborted_from_old_run_ignored() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+
+        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId(1) });
+        // Run B's current_run_id should still be RunId(2)
+        assert_eq!(state.current_run_id, Some(RunId(2)));
+        // Transcript should be empty (Run A's abort didn't add anything)
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn late_thinking_delta_from_old_run_ignored() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        let orig_status = state.status.clone();
+
+        state.handle_agent_event(AgentEvent::ThinkingDelta {
+            run_id: RunId(1),
+            text: "thinking...".into(),
+        });
+        assert_eq!(state.status, orig_status, "Stale thinking should not change status");
     }
 
     // ── Snapshot tests ────────────────────────────────────────────────────
