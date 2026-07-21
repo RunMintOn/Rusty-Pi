@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader as StdBufReader};
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
@@ -57,6 +59,119 @@ fn kill_process_group(pgid: Option<u32>) {
     }
 }
 
+#[derive(Default)]
+struct LifecycleCounters {
+    active_readers: AtomicUsize,
+    active_reapers: AtomicUsize,
+}
+
+/// Owns every OS resource created for one bash invocation.
+///
+/// There are no detached threads: the owner retains both reader join handles
+/// and the single reap join handle. Dropping the execution future drops this
+/// owner, which kills the process group before joining all three lifecycle
+/// threads.
+struct ChildLifecycle {
+    pid: u32,
+    pgid: Option<u32>,
+    readers: Vec<JoinHandle<()>>,
+    reap: Option<JoinHandle<()>>,
+}
+
+impl ChildLifecycle {
+    fn new(pid: u32, readers: Vec<JoinHandle<()>>, reap: JoinHandle<()>) -> Self {
+        Self {
+            pid,
+            pgid: Some(pid),
+            readers,
+            reap: Some(reap),
+        }
+    }
+
+    fn kill(&mut self) {
+        debug_assert_ne!(self.pid, 0);
+        kill_process_group(self.pgid.take());
+    }
+
+    fn join_threads(&mut self) -> anyhow::Result<()> {
+        for reader in self.readers.drain(..) {
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("bash reader thread panicked"))?;
+        }
+        if let Some(reap) = self.reap.take() {
+            reap.join().map_err(|_| anyhow::anyhow!("bash reap thread panicked"))?;
+        }
+        self.pgid = None;
+        Ok(())
+    }
+}
+
+impl Drop for ChildLifecycle {
+    fn drop(&mut self) {
+        // This is the future-drop cleanup path. The process group is killed
+        // before joins so blocked pipe reads and waitpid both become finite.
+        self.kill();
+        let _ = self.join_threads();
+    }
+}
+
+fn spawn_reader<R>(
+    reader: R,
+    tx: mpsc::Sender<(ToolOutputStream, String)>,
+    counters: Arc<LifecycleCounters>,
+) -> JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    counters.active_readers.fetch_add(1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let reader = StdBufReader::new(reader);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if tx
+                        .blocking_send((ToolOutputStream::Stdout, format!("{line}\n")))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        counters.active_readers.fetch_sub(1, Ordering::SeqCst);
+    })
+}
+
+fn spawn_stderr_reader<R>(
+    reader: R,
+    tx: mpsc::Sender<(ToolOutputStream, String)>,
+    counters: Arc<LifecycleCounters>,
+) -> JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    counters.active_readers.fetch_add(1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let reader = StdBufReader::new(reader);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if tx
+                        .blocking_send((ToolOutputStream::Stderr, format!("{line}\n")))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        counters.active_readers.fetch_sub(1, Ordering::SeqCst);
+    })
+}
+
 /// Marker used to detect CWD changes after bash execution.
 const CWD_MARKER: &str = "__RUSTY_PI_PWD__";
 
@@ -64,12 +179,21 @@ const CWD_MARKER: &str = "__RUSTY_PI_PWD__";
 pub struct BashTool {
     /// Shared working directory for command execution.
     shared_cwd: Arc<RwLock<PathBuf>>,
+    lifecycle_counters: Arc<LifecycleCounters>,
 }
 
 impl BashTool {
     /// Create a new bash tool that executes commands in the shared working directory.
     pub fn new(shared_cwd: Arc<RwLock<PathBuf>>) -> Self {
-        Self { shared_cwd }
+        Self {
+            shared_cwd,
+            lifecycle_counters: Arc::new(LifecycleCounters::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn lifecycle_counters(&self) -> Arc<LifecycleCounters> {
+        Arc::clone(&self.lifecycle_counters)
     }
 
     /// Get the current cached working directory.
@@ -154,7 +278,7 @@ impl AgentTool for BashTool {
 
     async fn execute(
         &self,
-        tool_call_id: &str,
+        _tool_call_id: &str,
         params: serde_json::Value,
         context: ToolExecutionContext,
     ) -> anyhow::Result<AgentToolResult> {
@@ -198,9 +322,9 @@ impl AgentTool for BashTool {
         let child_stderr = child.stderr.take();
 
         // Channel for streaming output chunks
-        let (output_tx, mut output_rx) = mpsc::channel::<(ToolOutputStream, String)>(256);
+        let (output_tx, output_rx) = mpsc::channel::<(ToolOutputStream, String)>(256);
         // Channel for the exit code (reap result)
-        let (reap_tx, mut reap_rx) = mpsc::channel::<Option<i32>>(1);
+        let (reap_tx, reap_rx) = mpsc::channel::<Option<i32>>(1);
 
         // Take the event_tx for emitting ToolOutput events
         // Check if already aborted before spawning reader threads
@@ -226,44 +350,33 @@ impl AgentTool for BashTool {
             });
         }
 
-        // ── Spawn reader threads for stdout/stderr ───────────────────────
-        // These OS threads read blocking I/O and send chunks through channels.
-        // They survive tokio runtime shutdown.
+        // ── Spawn owned reader threads for stdout/stderr ─────────────────
+        // These handles are retained by ChildLifecycle. They are never
+        // detached, and are joined after the process group is dead.
+        let mut readers = Vec::with_capacity(2);
         if let Some(stdout) = child_stdout {
-            let tx = output_tx.clone();
-            std::thread::spawn(move || {
-                let reader = StdBufReader::new(stdout);
-                for line in reader.lines() {
-                    match line {
-                        Ok(l) => {
-                            let _ = tx.blocking_send((ToolOutputStream::Stdout, format!("{}\n", l)));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
+            readers.push(spawn_reader(
+                stdout,
+                output_tx.clone(),
+                Arc::clone(&self.lifecycle_counters),
+            ));
         }
         if let Some(stderr) = child_stderr {
-            let tx = output_tx.clone();
-            std::thread::spawn(move || {
-                let reader = StdBufReader::new(stderr);
-                for line in reader.lines() {
-                    match line {
-                        Ok(l) => {
-                            let _ = tx.blocking_send((ToolOutputStream::Stderr, format!("{}\n", l)));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
+            readers.push(spawn_stderr_reader(
+                stderr,
+                output_tx.clone(),
+                Arc::clone(&self.lifecycle_counters),
+            ));
         }
         // Drop the extra sender so the channel closes when all readers finish
         drop(output_tx);
 
-        // ── Spawn reap thread ────────────────────────────────────────────
-        // Blocking waitpid in an OS thread. This thread survives runtime
-        // shutdown and ensures the child is always reaped.
-        std::thread::spawn(move || {
+        // ── Spawn the sole reap thread ───────────────────────────────────
+        // Blocking waitpid in one owned OS thread. No other code waits for
+        // this PID; ChildLifecycle owns and joins this handle.
+        self.lifecycle_counters.active_reapers.fetch_add(1, Ordering::SeqCst);
+        let lifecycle_counters = Arc::clone(&self.lifecycle_counters);
+        let reap_thread = std::thread::spawn(move || {
             let mut status: i32 = 0;
             #[cfg(unix)]
             {
@@ -281,62 +394,80 @@ impl AgentTool for BashTool {
                 let code = child.try_wait().ok().flatten().and_then(|s| s.code());
                 let _ = reap_tx.blocking_send(code);
             }
+            lifecycle_counters.active_reapers.fetch_sub(1, Ordering::SeqCst);
         });
+        let mut lifecycle = ChildLifecycle::new(pid, readers, reap_thread);
+        // Shadow both receivers after the owner is declared. Rust drops these
+        // bindings before `lifecycle`, so a dropped future closes the channel
+        // send paths before joining reader/reap threads.
+        let mut output_rx = output_rx;
+        let mut reap_rx = reap_rx;
 
         // ── Main read loop ────────────────────────────────────────────────
         let mut full_output = String::new();
         let mut timed_out = false;
         let mut aborted_early = false;
-        let mut stdout_done = false;
-        let mut stderr_done = false;
+        let mut output_done = false;
+        let mut reap_done = false;
+        let mut exit_code = None;
 
-        let timeout_dur = bash_params.timeout.filter(|&t| t > 0).map(Duration::from_secs);
+        let timeout_deadline = bash_params
+            .timeout
+            .filter(|&t| t > 0)
+            .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
 
-        while !stdout_done || !stderr_done {
+        while !output_done || !reap_done {
             tokio::select! {
-                msg = output_rx.recv() => {
+                msg = output_rx.recv(), if !output_done => {
                     match msg {
                         Some((stream, chunk)) => {
                             // Emit ToolOutput event through context channel
-                            let _ = context.output_tx.send(ToolOutputEvent {
-                                stream,
-                                chunk: chunk.clone(),
-                            }).await;
+                            if !aborted_early && !timed_out {
+                                let _ = context
+                                    .output_tx
+                                    .send(ToolOutputEvent {
+                                        stream,
+                                        chunk: chunk.clone(),
+                                    })
+                                    .await;
+                            }
                             full_output.push_str(&chunk);
                         }
                         None => {
-                            // Channel closed — both reader threads finished
-                            stdout_done = true;
-                            stderr_done = true;
+                            output_done = true;
                         }
                     }
                 }
-                _ = context.cancellation.cancelled() => {
+                result = reap_rx.recv(), if !reap_done => {
+                    reap_done = true;
+                    exit_code = result.flatten();
+                    // A reaped shell may have descendants holding the pipes.
+                    // Close the process group so the owned readers can join.
+                    if !output_done {
+                        lifecycle.kill();
+                    }
+                }
+                _ = context.cancellation.cancelled(), if !aborted_early && !timed_out => {
                     aborted_early = true;
-                    kill_process_group(Some(pid));
-                    break;
+                    lifecycle.kill();
                 }
                 _ = async {
-                    if let Some(dur) = timeout_dur {
-                        tokio::time::sleep(dur).await;
+                    if let Some(deadline) = timeout_deadline {
+                        tokio::time::sleep_until(deadline).await;
                     } else {
                         std::future::pending::<()>().await;
                     }
-                } => {
+                }, if timeout_deadline.is_some() && !aborted_early && !timed_out => {
                     timed_out = true;
-                    kill_process_group(Some(pid));
-                    break;
+                    lifecycle.kill();
                 }
             }
         }
 
-        // Kill the process group so the blocking waitpid returns quickly.
-        kill_process_group(Some(pid));
-
-        // Await the reap result from the OS thread.
-        let exit_code = tokio::time::timeout(Duration::from_secs(6), async { reap_rx.recv().await.flatten() })
-            .await
-            .unwrap_or(None);
+        // All pipe readers and the sole reaper have completed. Joining here
+        // proves normal execution has no detached lifecycle threads; Drop
+        // performs the same join after future cancellation.
+        lifecycle.join_threads()?;
 
         // Extract CWD marker from output and update shared CWD
         let cleaned_output = self.extract_cwd_and_clean_output(&full_output);
@@ -430,6 +561,7 @@ impl AgentTool for BashTool {
 mod tests {
     use super::*;
     use crate::agent::types::ToolExecutionContext;
+    use std::time::Instant;
     use tokio_util::sync::CancellationToken;
 
     fn tool() -> BashTool {
@@ -701,7 +833,7 @@ mod tests {
     #[tokio::test]
     async fn tool_output_stderr_single_chunk() {
         let (ctx, mut rx) = make_context();
-        let result = tool()
+        let _result = tool()
             .execute("to2", serde_json::json!({"command": "echo err >&2"}), ctx)
             .await
             .unwrap();
@@ -774,10 +906,7 @@ mod tests {
         assert!(result.aborted);
 
         // Drain any events that arrived before cancel
-        let mut count = 0;
-        while let Ok(_ev) = rx.try_recv() {
-            count += 1;
-        }
+        while let Ok(_ev) = rx.try_recv() {}
         // After cancel, no new events should arrive
     }
 
@@ -795,10 +924,7 @@ mod tests {
         assert!(result.timed_out);
 
         // Drain events
-        let mut count = 0;
-        while let Ok(_ev) = rx.try_recv() {
-            count += 1;
-        }
+        while let Ok(_ev) = rx.try_recv() {}
         // Events should have stopped after timeout
     }
 
@@ -951,10 +1077,7 @@ mod tests {
         // (In the new design, output_tx is moved into the tool's execute method,
         // so after the method returns, the sender is dropped.)
         // The receiver can still drain buffered messages.
-        let mut count = 0;
-        while let Some(_ev) = rx.recv().await {
-            count += 1;
-        }
+        while let Some(_ev) = rx.recv().await {}
         // Channel is closed after execute returns
     }
 
@@ -1146,33 +1269,106 @@ mod tests {
         }
     }
 
-    /// Drop the tool future before completion — verify cleanup happens.
+    /// Drop the execution future itself — verify process and thread cleanup.
+    ///
+    /// This deliberately does not use `tokio::spawn`/`JoinHandle::drop`,
+    /// because dropping a Tokio JoinHandle detaches the task and does not drop
+    /// the execution future. A pinned future is polled until it has spawned a
+    /// real process, then dropped in this task so ChildLifecycle::drop runs.
+    #[cfg(unix)]
     #[tokio::test]
     async fn drop_future_cleans_up() {
-        let cancel = CancellationToken::new();
-        let (output_tx, _rx) = tokio::sync::mpsc::channel(256);
-        let ctx = ToolExecutionContext {
+        let shell_pid_file = tempfile::NamedTempFile::new().unwrap();
+        let pid_path = shell_pid_file.path().to_path_buf();
+        let cancellation = CancellationToken::new();
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(256);
+        let context = ToolExecutionContext {
             output_tx,
-            cancellation: cancel.clone(),
+            cancellation,
+        };
+        let bash = tool();
+        let lifecycle_counters = bash.lifecycle_counters();
+        let command = format!(
+            "sh -c 'sleep 30 & child=$!; pgid=$(ps -o pgid= -p $$ | tr -d \" \" ); printf \"%s %s %s\\n\" \"$$\" \"$child\" \"$pgid\" > {}; wait'",
+            pid_path.display()
+        );
+        let mut future = Box::pin(bash.execute("drop_test", serde_json::json!({"command": command}), context));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (shell_pid, child_pid, pgid) = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_path) {
+                let mut pids = contents.split_whitespace();
+                if let (Some(shell), Some(child), Some(pgid)) = (pids.next(), pids.next(), pids.next())
+                    && let (Ok(shell), Ok(child), Ok(pgid)) =
+                        (shell.parse::<u32>(), child.parse::<u32>(), pgid.parse::<u32>())
+                {
+                    assert!(
+                        lifecycle_counters.active_readers.load(Ordering::SeqCst) >= 2,
+                        "both reader threads should be owned while future is pending"
+                    );
+                    assert!(
+                        lifecycle_counters.active_reapers.load(Ordering::SeqCst) >= 1,
+                        "reap thread should be owned while future is pending"
+                    );
+                    assert_ne!(pgid, 0, "the shell must have a process group");
+                    break (shell, child, pgid);
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline, "PID file was not written");
+            tokio::select! {
+                result = &mut future => panic!("long-running future completed unexpectedly: {:?}", result),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
         };
 
-        let handle = tokio::spawn(async move {
-            tool()
-                .execute("drop_test", serde_json::json!({"command": "sleep 30"}), ctx)
-                .await
-        });
+        // Dropping the future invokes ChildLifecycle::drop, which kills the
+        // process group, then joins both readers and the sole reap thread.
+        drop(future);
 
-        // Let it start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while Instant::now() < cleanup_deadline
+            && (process_exists(shell_pid)
+                || process_exists(child_pid)
+                || process_exists(pgid)
+                || lifecycle_counters.active_readers.load(Ordering::SeqCst) != 0
+                || lifecycle_counters.active_reapers.load(Ordering::SeqCst) != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!process_exists(shell_pid), "shell PID {shell_pid} still exists");
+        assert!(!process_exists(child_pid), "child PID {child_pid} still exists");
+        assert!(!process_exists(pgid), "process group leader/PGID {pgid} still exists");
+        assert_eq!(process_state(shell_pid), None, "shell must not remain zombie");
+        assert_eq!(process_state(child_pid), None, "child must not remain zombie");
+        assert_eq!(process_state(pgid), None, "PGID must not remain zombie");
+        assert_eq!(lifecycle_counters.active_readers.load(Ordering::SeqCst), 0);
+        assert_eq!(lifecycle_counters.active_reapers.load(Ordering::SeqCst), 0);
 
-        // Cancel and drop the handle
-        cancel.cancel();
-        drop(handle);
+        let mut events_before = 0;
+        while output_rx.try_recv().is_ok() {
+            events_before += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut events_after = 0;
+        while output_rx.try_recv().is_ok() {
+            events_after += 1;
+        }
+        assert_eq!(
+            events_after, 0,
+            "no ToolOutput may arrive after future drop (before={events_before})"
+        );
+    }
 
-        // Wait briefly — the OS threads should clean up
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
 
-        // If we get here without hanging, the cleanup worked
+    #[cfg(unix)]
+    fn process_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, rest) = stat.rsplit_once(") ")?;
+        rest.chars().next()
     }
 
     /// Verify no zombie processes remain after concurrent execution.
