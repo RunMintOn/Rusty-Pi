@@ -185,6 +185,43 @@ fn real_tui_pty_quit_command() {
 }
 
 #[test]
+fn real_tui_pty_model_without_argument_never_enters_a_picker() {
+    let agent_dir = tempfile::tempdir().expect("temporary agent directory");
+    let mut process = PtyProcess::spawn(agent_dir.path());
+    process.wait_for("Transcript", Duration::from_secs(5));
+    process.send_bytes(b"/model\r");
+    process.wait_for("Use: /model", Duration::from_secs(5));
+    process.send_bytes(b"/quit\r");
+    process.finish();
+}
+
+#[test]
+fn real_tui_pty_context_without_argument_never_enters_a_picker() {
+    let agent_dir = tempfile::tempdir().expect("temporary agent directory");
+    let mut process = PtyProcess::spawn(agent_dir.path());
+    process.wait_for("Transcript", Duration::from_secs(5));
+    process.send_bytes(b"/context\r");
+    process.wait_for("Use: /context", Duration::from_secs(5));
+    process.send_bytes(b"/quit\r");
+    process.finish();
+}
+
+#[test]
+fn real_tui_pty_context_argument_is_async_and_restores_terminal() {
+    let agent_dir = tempfile::tempdir().expect("temporary agent directory");
+    let context_dir = tempfile::tempdir().expect("temporary context directory");
+    let context_path = context_dir.path().join("context file.md");
+    std::fs::write(&context_path, "pty context").expect("write context file");
+    let mut process = PtyProcess::spawn(agent_dir.path());
+    process.wait_for("Transcript", Duration::from_secs(5));
+    let command = format!("/context {}\r", context_path.display());
+    process.send_bytes(command.as_bytes());
+    process.wait_for("Added", Duration::from_secs(5));
+    process.send_bytes(b"/quit\r");
+    process.finish();
+}
+
+#[test]
 fn real_tui_pty_multiline_tool_output_scroll_and_end() {
     let agent_dir = tempfile::tempdir().expect("temporary agent directory");
     let mut process = PtyProcess::spawn_with_tool(

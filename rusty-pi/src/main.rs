@@ -353,7 +353,8 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
     session.agent().set_event_sender(event_tx);
     let mut current_token = tokio_util::sync::CancellationToken::new();
     session.agent().set_abort_flag(current_token.clone());
-    let registry = rusty_pi::coding_agent::repl::default_registry();
+    let registry = rusty_pi::coding_agent::command::builtin_registry();
+    let interaction = rusty_pi::coding_agent::command::UnavailableCommandInteraction;
 
     // Run TUI loop — agent runs inline when a prompt is submitted
     let result = run_tui_loop(
@@ -363,6 +364,7 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
         &registry,
         &mut current_token,
         &mut event_rx,
+        &interaction,
     )
     .await;
 
@@ -384,6 +386,7 @@ async fn run_tui_loop(
     registry: &rusty_pi::coding_agent::command::CommandRegistry,
     current_token: &mut tokio_util::sync::CancellationToken,
     event_rx: &mut tokio::sync::mpsc::Receiver<rusty_pi::agent::events::AgentEvent>,
+    interaction: &dyn rusty_pi::coding_agent::command::CommandInteraction,
 ) -> anyhow::Result<()> {
     use rusty_pi::tui::app::{Action, Effect};
 
@@ -403,24 +406,40 @@ async fn run_tui_loop(
             };
             for effect in effects {
                 match effect {
-                    Effect::RunAgent(prompt) => match registry.dispatch(&prompt, session)? {
-                        rusty_pi::coding_agent::command::DispatchOutcome::Exit => {
-                            let _ = state.update(Action::Quit);
-                        }
-                        rusty_pi::coding_agent::command::DispatchOutcome::Handled(result) => {
-                            let command_effects = state.update(Action::CommandResult(result));
-                            if command_effects.iter().any(|effect| matches!(effect, Effect::Quit)) {
-                                return Ok(());
+                    Effect::SubmitInput(input) => {
+                        match rusty_pi::coding_agent::command::resolve_input(&input, registry, session) {
+                            rusty_pi::coding_agent::command::InputRoute::Command(invocation) => {
+                                state.update(Action::CommandStarted {
+                                    name: invocation.name.clone(),
+                                });
+                                if drive_command_with_ui(terminal, state, session, registry, interaction, invocation)
+                                    .await?
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            rusty_pi::coding_agent::command::InputRoute::AgentPrompt { original, expanded } => {
+                                let prompt_effects = state.update(Action::AgentPromptStarted { original, expanded });
+                                for prompt_effect in prompt_effects {
+                                    if let Effect::RunAgent(prompt) = prompt_effect {
+                                        let new_token = tokio_util::sync::CancellationToken::new();
+                                        session.agent().set_abort_flag(new_token.clone());
+                                        *current_token = new_token;
+                                        run_agent_with_ui(terminal, state, session, current_token, event_rx, prompt)
+                                            .await?;
+                                    }
+                                }
+                            }
+                            rusty_pi::coding_agent::command::InputRoute::UnknownSlash { name } => {
+                                state.update(Action::InputRouteError(format!(
+                                    "Unknown command '/{name}'. Type '/help' for available commands."
+                                )));
                             }
                         }
-                        rusty_pi::coding_agent::command::DispatchOutcome::NotACommand => {
-                            let new_token = tokio_util::sync::CancellationToken::new();
-                            session.agent().set_abort_flag(new_token.clone());
-                            *current_token = new_token;
-                            run_agent_with_ui(terminal, state, session, current_token, event_rx, prompt).await?;
-                        }
-                    },
+                    }
+                    Effect::RunAgent(_) => {}
                     Effect::CancelAgent => current_token.cancel(),
+                    Effect::CancelCommand => {}
                     Effect::Quit => return Ok(()),
                 }
             }
@@ -434,6 +453,78 @@ async fn run_tui_loop(
         // Check if we should quit
         if state.quit {
             return Ok(());
+        }
+    }
+}
+
+/// Drive a command without giving it ownership of the TUI terminal. The
+/// command future is polled alongside key, resize, and redraw work; it is
+/// never detached and no additional runtime or OS thread is created.
+async fn drive_command_with_ui(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    state: &mut rusty_pi::tui::app::AppState,
+    session: &mut PromptSession,
+    registry: &rusty_pi::coding_agent::command::CommandRegistry,
+    interaction: &dyn rusty_pi::coding_agent::command::CommandInteraction,
+    invocation: rusty_pi::coding_agent::command::CommandInvocation,
+) -> anyhow::Result<bool> {
+    use rusty_pi::tui::app::{Action, Effect};
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let mut context = rusty_pi::coding_agent::command::CommandContext::new(session, interaction, cancellation.clone());
+    let command = registry.dispatch(&invocation, &mut context);
+    tokio::pin!(command);
+
+    loop {
+        terminal.draw(|frame| rusty_pi::tui::app::view(frame, state))?;
+        if crossterm::event::poll(std::time::Duration::from_millis(10))? {
+            let event = crossterm::event::read()?;
+            let effects = match event {
+                crossterm::event::Event::Key(key) => state.update(Action::KeyInput(key)),
+                crossterm::event::Event::Paste(text) => state.update(Action::Paste(text)),
+                crossterm::event::Event::Resize(width, height) => state.update(Action::Resize(width, height)),
+                _ => Vec::new(),
+            };
+            for effect in effects {
+                match effect {
+                    Effect::CancelCommand => cancellation.cancel(),
+                    Effect::Quit => {
+                        cancellation.cancel();
+                        return Ok(true);
+                    }
+                    Effect::RunAgent(_) | Effect::SubmitInput(_) | Effect::CancelAgent => {}
+                }
+            }
+        }
+
+        if state.quit {
+            cancellation.cancel();
+            return Ok(true);
+        }
+
+        tokio::select! {
+            result = &mut command => {
+                match result {
+                    Ok(outcome)
+                        if cancellation.is_cancelled()
+                            && outcome.result.is_none()
+                            && outcome.control == rusty_pi::coding_agent::command::CommandControl::Continue =>
+                    {
+                        state.update(Action::CommandCancelled);
+                    }
+                    Ok(outcome) => {
+                        let effects = state.update(Action::CommandCompleted(outcome));
+                        if effects.iter().any(|effect| matches!(effect, Effect::Quit)) {
+                            return Ok(true);
+                        }
+                    }
+                    Err(error) => {
+                        state.update(Action::CommandFailed(error.to_string()));
+                    }
+                }
+                return Ok(state.quit);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(40)) => {}
         }
     }
 }
@@ -471,10 +562,11 @@ async fn run_agent_with_ui(
             for effect in effects {
                 match effect {
                     Effect::CancelAgent => current_token.cancel(),
+                    Effect::CancelCommand => {}
                     Effect::Quit => return Ok(()),
                     // Enter is deliberately unavailable while running, so a
                     // second RunAgent effect cannot be produced here.
-                    Effect::RunAgent(_) => {}
+                    Effect::RunAgent(_) | Effect::SubmitInput(_) => {}
                 }
             }
         }
@@ -489,9 +581,7 @@ async fn run_agent_with_ui(
         tokio::select! {
             result = &mut run => {
                 if let Err(error) = result {
-                    state.update(Action::CommandResult(
-                        rusty_pi::coding_agent::command::CommandResult::Error(error.to_string()),
-                    ));
+                    state.update(Action::InputRouteError(format!("Run failed: {error}")));
                 }
                 while let Ok(event) = event_rx.try_recv() {
                     state.update(Action::AgentEvent(event));

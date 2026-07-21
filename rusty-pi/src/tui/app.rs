@@ -8,7 +8,7 @@
 use crate::agent::events::{AgentEvent, RunId, ToolOutputStream};
 use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
-use crate::coding_agent::command::{CommandHelpItem, CommandResult};
+use crate::coding_agent::command::{CommandControl, CommandHelpItem, CommandOutcome, CommandResult};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -410,8 +410,10 @@ impl Default for ScrollState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityState {
     Idle,
-    Running,
-    Cancelling,
+    AgentRunning,
+    AgentCancelling,
+    CommandRunning,
+    CommandCancelling,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,15 +454,22 @@ pub enum Action {
     Resize(u16, u16),
     Submit,
     Cancel,
+    AgentPromptStarted { original: String, expanded: String },
+    CommandStarted { name: String },
+    CommandCompleted(CommandOutcome),
+    CommandCancelled,
+    CommandFailed(String),
+    InputRouteError(String),
     AgentEvent(AgentEvent),
-    CommandResult(CommandResult),
     Quit,
 }
 
 #[derive(Debug)]
 pub enum Effect {
+    SubmitInput(String),
     RunAgent(String),
     CancelAgent,
+    CancelCommand,
     Quit,
 }
 
@@ -511,11 +520,21 @@ impl AppState {
             }
             Action::Submit => self.submit(),
             Action::Cancel => self.cancel(),
+            Action::AgentPromptStarted { original, expanded } => self.agent_prompt_started(original, expanded),
+            Action::CommandStarted { name } => {
+                self.activity = ActivityState::CommandRunning;
+                self.error = None;
+                self.last_outcome = None;
+                self.status = format!("Command /{name}");
+                Vec::new()
+            }
+            Action::CommandCompleted(outcome) => self.apply_command_outcome(outcome),
+            Action::CommandCancelled => self.command_cancelled(),
+            Action::CommandFailed(message) | Action::InputRouteError(message) => self.command_failed(message),
             Action::AgentEvent(event) => {
                 self.handle_agent_event(event);
                 Vec::new()
             }
-            Action::CommandResult(result) => self.apply_command_result(result),
             Action::Quit => {
                 self.quit = true;
                 vec![Effect::Quit]
@@ -673,8 +692,13 @@ impl AppState {
 
     fn handle_ctrl_c(&mut self) -> Vec<Effect> {
         match self.activity {
-            ActivityState::Running => self.cancel(),
-            ActivityState::Cancelling => Vec::new(),
+            ActivityState::AgentRunning => self.cancel(),
+            ActivityState::AgentCancelling | ActivityState::CommandCancelling => Vec::new(),
+            ActivityState::CommandRunning => {
+                self.activity = ActivityState::CommandCancelling;
+                self.status = "Command cancelling · waiting".into();
+                vec![Effect::CancelCommand]
+            }
             ActivityState::Idle if !self.input.text.is_empty() => {
                 self.input.clear();
                 self.history.cursor = None;
@@ -688,34 +712,84 @@ impl AppState {
 
     fn submit(&mut self) -> Vec<Effect> {
         if self.activity != ActivityState::Idle {
-            self.status = "Running · Enter unavailable · Ctrl+C to cancel".into();
+            self.status = "Busy · Enter unavailable · Ctrl+C to cancel".into();
             return Vec::new();
         }
         let prompt = self.input.text.clone();
         if prompt.trim().is_empty() {
             return Vec::new();
         }
-        self.transcript.push(TranscriptBlock::User { text: prompt.clone() });
-        self.enforce_block_limit();
         self.history.record(&prompt);
         self.input.clear();
         self.focus = Focus::Input;
-        self.activity = ActivityState::Running;
         self.last_outcome = None;
         self.run_tool_error = None;
-        self.status = "Running".into();
-        self.note_new_lines(2);
-        vec![Effect::RunAgent(prompt)]
+        self.status = "Dispatching".into();
+        vec![Effect::SubmitInput(prompt)]
     }
 
     fn cancel(&mut self) -> Vec<Effect> {
-        if self.activity == ActivityState::Running {
-            self.activity = ActivityState::Cancelling;
+        if self.activity == ActivityState::AgentRunning {
+            self.activity = ActivityState::AgentCancelling;
             self.status = "Cancelling · waiting for agent".into();
             vec![Effect::CancelAgent]
         } else {
             Vec::new()
         }
+    }
+
+    fn agent_prompt_started(&mut self, original: String, expanded: String) -> Vec<Effect> {
+        self.transcript.push(TranscriptBlock::User { text: original });
+        self.enforce_block_limit();
+        self.activity = ActivityState::AgentRunning;
+        self.last_outcome = None;
+        self.run_tool_error = None;
+        self.status = "Agent running".into();
+        self.note_new_lines(2);
+        vec![Effect::RunAgent(expanded)]
+    }
+
+    fn apply_command_outcome(&mut self, outcome: CommandOutcome) -> Vec<Effect> {
+        if outcome.control == CommandControl::Quit {
+            self.activity = ActivityState::Idle;
+            self.quit = true;
+            return vec![Effect::Quit];
+        }
+        self.activity = ActivityState::Idle;
+        if let Some(result) = outcome.result {
+            self.apply_command_result(result)
+        } else {
+            self.error = None;
+            self.status = "Ready".into();
+            Vec::new()
+        }
+    }
+
+    fn command_cancelled(&mut self) -> Vec<Effect> {
+        if matches!(
+            self.activity,
+            ActivityState::CommandRunning | ActivityState::CommandCancelling
+        ) {
+            self.activity = ActivityState::Idle;
+            self.error = None;
+            self.status = "Command cancelled".into();
+            self.transcript.push(TranscriptBlock::System {
+                message: "Command cancelled".into(),
+            });
+            self.note_new_lines(2);
+        }
+        Vec::new()
+    }
+
+    fn command_failed(&mut self, message: String) -> Vec<Effect> {
+        self.activity = ActivityState::Idle;
+        let message = sanitize_message(&message);
+        self.error = Some(message.clone());
+        self.status = "Command error".into();
+        self.transcript.push(TranscriptBlock::Error { message });
+        self.note_new_lines(2);
+        self.enforce_block_limit();
+        Vec::new()
     }
 
     pub fn apply_command_result(&mut self, result: CommandResult) -> Vec<Effect> {
@@ -735,9 +809,13 @@ impl AppState {
             CommandResult::ModelChanged { model } => TranscriptBlock::System {
                 message: format!("Switched to {model}"),
             },
-            CommandResult::Sessions(sessions) => TranscriptBlock::System {
+            CommandResult::Sessions { sessions, skipped } => TranscriptBlock::System {
                 message: if sessions.is_empty() {
-                    "No sessions found.".into()
+                    if skipped == 0 {
+                        "No sessions found.".into()
+                    } else {
+                        format!("No sessions found.\nSkipped {skipped} unreadable session files.")
+                    }
                 } else {
                     let mut text = String::from("Available sessions:");
                     for session in sessions {
@@ -746,14 +824,12 @@ impl AppState {
                             session.id, session.model, session.msg_count, session.created
                         ));
                     }
+                    if skipped > 0 {
+                        text.push_str(&format!("\nSkipped {skipped} unreadable session files."));
+                    }
                     text
                 },
             },
-            CommandResult::Quit => {
-                self.quit = true;
-                return vec![Effect::Quit];
-            }
-            CommandResult::Noop => return Vec::new(),
         };
         let line_count = block_line_count(&block);
         self.transcript.push(block);
@@ -772,7 +848,7 @@ impl AppState {
         match event {
             AgentEvent::RunStarted { run_id } => {
                 self.current_run_id = Some(run_id);
-                self.activity = ActivityState::Running;
+                self.activity = ActivityState::AgentRunning;
                 self.tool_index.clear();
                 self.tool_started_at.clear();
                 self.run_tool_error = None;
@@ -940,8 +1016,8 @@ impl AppState {
                 self.finish_assistant_stream();
                 match stop_reason {
                     StopReason::ToolUse => {
-                        self.activity = ActivityState::Running;
-                        self.status = "Running".into();
+                        self.activity = ActivityState::AgentRunning;
+                        self.status = "Agent running".into();
                     }
                     StopReason::Stop => {
                         self.activity = ActivityState::Idle;
@@ -1497,7 +1573,7 @@ fn render_input(frame: &mut Frame, state: &AppState, area: Rect) {
         .min(cursor_line)
         .max(cursor_line.saturating_sub(visible.saturating_sub(1)));
     let active = state.focus == Focus::Input;
-    let title = if state.activity == ActivityState::Running {
+    let title = if state.activity != ActivityState::Idle {
         "Input · draft (Enter unavailable)"
     } else {
         "Input · Enter submit · Ctrl+J newline"
@@ -1524,8 +1600,10 @@ fn render_input(frame: &mut Frame, state: &AppState, area: Rect) {
 fn render_status(frame: &mut Frame, state: &AppState, area: Rect) {
     let activity = match state.activity {
         ActivityState::Idle => "Ready",
-        ActivityState::Running => "Running",
-        ActivityState::Cancelling => "Cancelling",
+        ActivityState::AgentRunning => "Agent running",
+        ActivityState::AgentCancelling => "Agent cancelling",
+        ActivityState::CommandRunning => "Command running",
+        ActivityState::CommandCancelling => "Command cancelling",
     };
     let outcome: Option<String> = state.last_outcome.as_ref().map(|outcome| match outcome {
         RunOutcome::Completed => "Completed".into(),
@@ -1534,7 +1612,7 @@ fn render_status(frame: &mut Frame, state: &AppState, area: Rect) {
         RunOutcome::ToolError(_) => "Tool error".into(),
     });
     let text = if area.width < 40 {
-        if state.activity == ActivityState::Running || state.activity == ActivityState::Cancelling {
+        if state.activity != ActivityState::Idle {
             format!("{activity} · Ctrl+C cancel")
         } else {
             format!("{activity} · Tab focus · Enter submit")
@@ -1722,9 +1800,15 @@ mod tests {
         let mut state = AppState::new((80, 24));
         state.update(Action::Paste("first\nsecond".into()));
         let effects = state.update(Action::KeyInput(key(KeyCode::Enter)));
-        assert!(matches!(effects.as_slice(), [Effect::RunAgent(prompt)] if prompt == "first\nsecond"));
-        assert!(matches!(&state.transcript[0], TranscriptBlock::User { text } if text == "first\nsecond"));
+        assert!(matches!(effects.as_slice(), [Effect::SubmitInput(prompt)] if prompt == "first\nsecond"));
+        assert!(state.transcript.is_empty());
         assert_eq!(state.history.entries, vec!["first\nsecond"]);
+        let effects = state.update(Action::AgentPromptStarted {
+            original: "first\nsecond".into(),
+            expanded: "expanded".into(),
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RunAgent(prompt)] if prompt == "expanded"));
+        assert!(matches!(&state.transcript[0], TranscriptBlock::User { text } if text == "first\nsecond"));
     }
 
     #[test]
@@ -1762,10 +1846,57 @@ mod tests {
         let mut state = AppState::new((80, 24));
         state.input.set_text("first".into());
         assert_eq!(state.update(Action::Submit).len(), 1);
+        state.update(Action::AgentPromptStarted {
+            original: "first".into(),
+            expanded: "first".into(),
+        });
         state.input.set_text("next".into());
         assert!(state.update(Action::KeyInput(key(KeyCode::Enter))).is_empty());
         assert_eq!(state.input.text, "next");
         assert!(state.status.contains("Enter unavailable"));
+    }
+
+    #[test]
+    fn command_lifecycle_never_creates_user_transcript() {
+        let mut state = AppState::new((80, 24));
+        state.input.set_text("/session".into());
+        assert!(matches!(
+            state.update(Action::Submit).as_slice(),
+            [Effect::SubmitInput(input)] if input == "/session"
+        ));
+        assert!(state.transcript.is_empty());
+        state.update(Action::CommandStarted { name: "session".into() });
+        assert_eq!(state.activity, ActivityState::CommandRunning);
+        state.update(Action::CommandCompleted(CommandOutcome {
+            result: Some(CommandResult::Message("info".into())),
+            control: CommandControl::Continue,
+        }));
+        assert_eq!(state.activity, ActivityState::Idle);
+        assert!(matches!(state.transcript.as_slice(), [TranscriptBlock::System { message }] if message == "info"));
+    }
+
+    #[test]
+    fn command_ctrl_c_is_distinct_from_agent_cancellation() {
+        let mut state = AppState::new((80, 24));
+        state.update(Action::CommandStarted {
+            name: "list-sessions".into(),
+        });
+        assert!(matches!(
+            state.update(Action::KeyInput(ctrl('c'))).as_slice(),
+            [Effect::CancelCommand]
+        ));
+        assert_eq!(state.activity, ActivityState::CommandCancelling);
+        state.update(Action::CommandCancelled);
+        state.update(Action::CommandCancelled);
+        assert_eq!(
+            state
+                .transcript
+                .iter()
+                .filter(|block| matches!(block, TranscriptBlock::System { message } if message == "Command cancelled"))
+                .count(),
+            1
+        );
+        assert_eq!(state.activity, ActivityState::Idle);
     }
 
     #[test]
@@ -1774,12 +1905,12 @@ mod tests {
         state.input.set_text("draft".into());
         assert!(state.update(Action::KeyInput(ctrl('c'))).is_empty());
         assert!(state.input.text.is_empty());
-        state.activity = ActivityState::Running;
+        state.activity = ActivityState::AgentRunning;
         assert!(matches!(
             state.update(Action::KeyInput(ctrl('c'))).as_slice(),
             [Effect::CancelAgent]
         ));
-        assert_eq!(state.activity, ActivityState::Cancelling);
+        assert_eq!(state.activity, ActivityState::AgentCancelling);
     }
 
     #[test]
