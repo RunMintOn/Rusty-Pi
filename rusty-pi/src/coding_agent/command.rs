@@ -1650,4 +1650,55 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, CommandOutcome::none());
     }
+
+    #[tokio::test]
+    async fn builtins_do_not_append_messages_or_call_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let context_path = directory.path().join("context.md");
+        tokio::fs::write(&context_path, "context").await.unwrap();
+        let provider = MockProvider::with_models(
+            vec![crate::ai::mock::MockStep::Text("must not run".into())],
+            vec![
+                Model {
+                    id: "mock",
+                    api: "mock",
+                },
+                Model {
+                    id: "codex",
+                    api: "mock",
+                },
+            ],
+        );
+        let captured = provider.captured_requests_arc();
+        let mut session = PromptSession::new(
+            Box::new(provider),
+            Model {
+                id: "mock",
+                api: "mock",
+            },
+            vec![],
+            PathBuf::from("/tmp"),
+            directory.path().to_path_buf(),
+            vec![],
+            vec![],
+            false,
+            None,
+            vec![],
+        );
+        let registry = builtin_registry();
+        let interaction = UnavailableCommandInteraction;
+        for invocation in [
+            CommandInvocation::new("help", ""),
+            CommandInvocation::new("model", "codex"),
+            CommandInvocation::new("context", context_path.to_string_lossy()),
+            CommandInvocation::new("session", ""),
+            CommandInvocation::new("tree", ""),
+            CommandInvocation::new("list-sessions", ""),
+        ] {
+            let mut context = CommandContext::new(&mut session, &interaction, CancellationToken::new());
+            let _ = registry.dispatch(&invocation, &mut context).await.unwrap();
+        }
+        assert_eq!(session.session().count_messages().await.0, 0);
+        assert!(captured.lock().unwrap().is_empty());
+    }
 }
