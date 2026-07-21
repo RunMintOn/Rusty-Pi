@@ -1371,9 +1371,28 @@ mod tests {
         rest.chars().next()
     }
 
+    #[cfg(unix)]
+    fn zombie_pids() -> std::collections::HashSet<u32> {
+        let output = std::process::Command::new("ps")
+            .args(["-eo", "pid=,stat="])
+            .output()
+            .expect("ps must be available for zombie inspection");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse::<u32>().ok()?;
+                let stat = fields.next()?;
+                stat.starts_with('Z').then_some(pid)
+            })
+            .collect()
+    }
+
     /// Verify no zombie processes remain after concurrent execution.
     #[tokio::test]
     async fn no_zombies_after_concurrent() {
+        #[cfg(unix)]
+        let zombies_before = zombie_pids();
         let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
         let t = Arc::new(BashTool::new(shared_cwd));
         let mut handles = Vec::new();
@@ -1392,24 +1411,17 @@ mod tests {
             assert!(!result.is_error);
         }
 
-        // Check for zombie processes (best effort)
+        // Compare against the pre-test snapshot. Other processes in a shared
+        // CI/container environment may already be zombies; only a newly
+        // created zombie is evidence of a lifecycle regression here.
         #[cfg(unix)]
         {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("ps -eo pid,ppid,stat,comm | grep -E 'Z|<defunct>' || true")
-                .output()
-                .unwrap();
-            let zombies = String::from_utf8_lossy(&output.stdout);
-            // Filter for our test processes only
-            let our_zombies: Vec<&str> = zombies
-                .lines()
-                .filter(|l| l.contains("sleep") || l.contains("echo"))
-                .collect();
+            let zombies_after = zombie_pids();
+            let new_zombies: Vec<u32> = zombies_after.difference(&zombies_before).copied().collect();
             assert!(
-                our_zombies.is_empty(),
-                "Should not have zombie processes: {:?}",
-                our_zombies
+                new_zombies.is_empty(),
+                "bash test created zombie processes: {:?}",
+                new_zombies
             );
         }
     }
