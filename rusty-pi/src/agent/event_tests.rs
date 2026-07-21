@@ -4,12 +4,88 @@
 mod tests {
     use crate::agent::engine::Agent;
     use crate::agent::events::AgentEvent;
+    use crate::agent::session::{InMemorySessionStorage, Session, SessionError, SessionStorage};
     use crate::agent::types::{AgentTool, AgentToolResult};
     use crate::ai::mock::{MockProvider, MockStep, MultiToolCallProvider};
-    use crate::ai::providers::Model;
+    use crate::ai::providers::{Model, ProviderApi, ProviderRequestContext, ProviderStream};
     use crate::ai::types::{Content, StopReason, Tool};
     use async_trait::async_trait;
     use std::sync::Arc;
+
+    struct FailingStartProvider;
+
+    #[async_trait]
+    impl ProviderApi for FailingStartProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            _messages: &[crate::ai::types::AgentMessage],
+            _tools: &[&dyn Tool],
+            _system_prompt: Option<&str>,
+            _context: ProviderRequestContext,
+        ) -> anyhow::Result<ProviderStream> {
+            Err(anyhow::anyhow!("provider could not start"))
+        }
+    }
+
+    struct FailingAppendStorage {
+        inner: InMemorySessionStorage,
+        fail_on_append: usize,
+        appends: usize,
+    }
+
+    #[async_trait]
+    impl SessionStorage for FailingAppendStorage {
+        async fn get_metadata(&self) -> crate::agent::session::SessionMetadata {
+            self.inner.get_metadata().await
+        }
+
+        async fn get_leaf_id(&self) -> Option<String> {
+            self.inner.get_leaf_id().await
+        }
+
+        async fn set_leaf_id(&mut self, leaf_id: Option<String>) -> Result<(), SessionError> {
+            self.inner.set_leaf_id(leaf_id).await
+        }
+
+        async fn create_entry_id(&mut self) -> String {
+            self.inner.create_entry_id().await
+        }
+
+        async fn append_entry(&mut self, entry: crate::agent::session::SessionTreeEntry) -> Result<(), SessionError> {
+            if self.appends >= self.fail_on_append {
+                return Err(SessionError::Storage("append deliberately failed".into()));
+            }
+            self.appends += 1;
+            self.inner.append_entry(entry).await
+        }
+
+        async fn get_entry(&self, id: &str) -> Option<crate::agent::session::SessionTreeEntry> {
+            self.inner.get_entry(id).await
+        }
+
+        async fn find_entries(
+            &self,
+            entry_type: crate::agent::session::EntryTypeTag,
+        ) -> Vec<crate::agent::session::SessionTreeEntry> {
+            self.inner.find_entries(entry_type).await
+        }
+
+        async fn get_label(&self, id: &str) -> Option<String> {
+            self.inner.get_label(id).await
+        }
+
+        async fn get_path_to_root(
+            &self,
+            leaf_id: Option<&str>,
+        ) -> Result<Vec<crate::agent::session::SessionTreeEntry>, SessionError> {
+            self.inner.get_path_to_root(leaf_id).await
+        }
+
+        async fn get_entries(&self) -> Vec<crate::agent::session::SessionTreeEntry> {
+            self.inner.get_entries().await
+        }
+    }
 
     fn make_model() -> Model {
         Model {
@@ -92,6 +168,52 @@ mod tests {
                 exit_code: Some(1),
                 ..Default::default()
             })
+        }
+    }
+
+    struct RustErrorStreamingTool;
+
+    impl Tool for RustErrorStreamingTool {
+        fn name(&self) -> &str {
+            "rust_error"
+        }
+
+        fn description(&self) -> &str {
+            "Streams output and then returns a Rust error"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+    }
+
+    #[async_trait]
+    impl AgentTool for RustErrorStreamingTool {
+        fn label(&self) -> &str {
+            "rust_error"
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            context: ToolExecutionContext,
+        ) -> anyhow::Result<AgentToolResult> {
+            context
+                .output_tx
+                .send(crate::agent::types::ToolOutputEvent {
+                    stream: crate::agent::events::ToolOutputStream::Stdout,
+                    chunk: "stdout before failure".into(),
+                })
+                .await?;
+            context
+                .output_tx
+                .send(crate::agent::types::ToolOutputEvent {
+                    stream: crate::agent::events::ToolOutputStream::Stderr,
+                    chunk: "stderr before failure".into(),
+                })
+                .await?;
+            Err(anyhow::anyhow!("deliberate Rust tool failure"))
         }
     }
 
@@ -283,6 +405,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_start_failure_emits_one_terminal_run_failed() {
+        let mut agent = Agent::new(Box::new(FailingStartProvider), make_model());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        agent.set_event_sender(tx);
+
+        let result = agent.run("provider start failure").await;
+        assert!(result.is_err(), "Agent::run must return the provider start error");
+
+        let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
+        agent.set_event_sender(dummy_tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        assert!(matches!(events.first(), Some(AgentEvent::RunStarted { .. })));
+        assert!(
+            matches!(events.last(), Some(AgentEvent::RunFailed { error, .. }) if error.phase == crate::agent::events::AgentRunPhase::ProviderStart)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunAborted { .. } | AgentEvent::RunFailed { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::RunFinished { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_append_failure_emits_one_terminal_run_failed() {
+        let metadata = crate::agent::session::SessionMetadata {
+            id: "failing-session".into(),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            cwd: "/tmp".into(),
+            path: String::new(),
+            parent_session_path: None,
+            metadata: None,
+        };
+        let storage = FailingAppendStorage {
+            inner: InMemorySessionStorage::new(metadata),
+            fail_on_append: 1, // user append succeeds; assistant append fails
+            appends: 0,
+        };
+        let mut agent = Agent::new(Box::new(MockProvider::text("assistant")), make_model());
+        agent.set_session(Session::new(Box::new(storage), Default::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        agent.set_event_sender(tx);
+
+        let result = agent.run("assistant append failure").await;
+        assert!(result.is_err());
+
+        let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
+        agent.set_event_sender(dummy_tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        assert!(matches!(events.first(), Some(AgentEvent::RunStarted { .. })));
+        assert!(
+            matches!(events.last(), Some(AgentEvent::RunFailed { error, .. }) if error.phase == crate::agent::events::AgentRunPhase::Session)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunAborted { .. } | AgentEvent::RunFailed { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn tool_execution_failure_emits_one_run_failed() {
         let mock = MockProvider::new(vec![MockStep::ToolCall {
             id: "tc_missing".into(),
@@ -322,6 +532,82 @@ mod tests {
                 ))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_tool_error_joins_forwarder_before_run_failed() {
+        let mock = MockProvider::new(vec![MockStep::ToolCall {
+            id: "tc_rust_error".into(),
+            name: "rust_error".into(),
+            arguments: serde_json::json!({}),
+            stop_reason: None,
+        }]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        agent.add_tool(Box::new(RustErrorStreamingTool));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        agent.set_event_sender(tx);
+
+        let result = agent.run("stream then fail").await;
+        assert!(result.is_err());
+
+        let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
+        agent.set_event_sender(dummy_tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        let output_positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| matches!(event, AgentEvent::ToolOutput { .. }).then_some(index))
+            .collect();
+        assert_eq!(output_positions.len(), 2);
+        assert!(matches!(
+            events[output_positions[0]],
+            AgentEvent::ToolOutput {
+                stream: crate::agent::events::ToolOutputStream::Stdout,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[output_positions[1]],
+            AgentEvent::ToolOutput {
+                stream: crate::agent::events::ToolOutputStream::Stderr,
+                ..
+            }
+        ));
+        let failed_index = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::RunFailed { .. }))
+            .expect("tool error must emit RunFailed");
+        assert!(output_positions.iter().all(|index| *index < failed_index));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolFinished { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RunFinished { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RunFailed { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events[failed_index + 1..]
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolOutput { .. }))
         );
     }
 

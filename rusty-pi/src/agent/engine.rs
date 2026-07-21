@@ -194,9 +194,9 @@ impl Agent {
 
     /// Run the agent with a prompt. All events are emitted through the event channel.
     ///
-    /// Every `RunStarted` is guaranteed to produce exactly one terminal event
-    /// (`RunFinished`, `RunAborted`, or `RunFailed`). The implementation uses
-    /// a centralized exit path via `finish_run` to enforce this invariant.
+    /// Every `RunStarted` produces exactly one terminal event: `RunFinished`,
+    /// `RunAborted`, or `RunFailed`. Each exit path in `run_inner` emits its
+    /// terminal event before returning the API result.
     pub async fn run(&mut self, prompt: &str) -> Result<()> {
         let now = Self::now_ms();
 
@@ -232,9 +232,10 @@ impl Agent {
         // Run the inner loop, capturing the result
         let result = self.run_inner(run_id, run_token).await;
 
-        // `run_inner` owns terminal event emission for runs that reached
-        // RunStarted. Do not emit another terminal event here: the returned
-        // error is only the API result for the caller.
+        // `run_inner` owns terminal event emission after the initial session
+        // append. That append has its own RunStarted/RunFailed path above.
+        // Do not emit another terminal event here: the returned error is only
+        // the API result for the caller.
         match result {
             Ok(()) => Ok(()),
             Err(e) => Err(e),
@@ -341,17 +342,17 @@ impl Agent {
             let response = acc.build();
 
             // Check for provider error
-            if response.stop_reason == StopReason::Error {
-                if let Some(err_msg) = &response.error_message {
-                    self.emit(AgentEvent::ProviderError {
-                        run_id,
-                        error: ProviderError {
-                            reason: StopReason::Error,
-                            message: err_msg.clone(),
-                        },
-                    })
-                    .await;
-                }
+            if response.stop_reason == StopReason::Error
+                && let Some(err_msg) = &response.error_message
+            {
+                self.emit(AgentEvent::ProviderError {
+                    run_id,
+                    error: ProviderError {
+                        reason: StopReason::Error,
+                        message: err_msg.clone(),
+                    },
+                })
+                .await;
             }
 
             // Extract tool calls as AgentToolCall structs
@@ -556,13 +557,29 @@ impl Agent {
             }
         });
 
-        let result = tool
-            .execute(tool_call_id, args, context)
+        // Do not use `?` here: the context owns the output sender, so the
+        // forwarder must be joined on both the success and Rust-error paths.
+        let tool_result = tool.execute(tool_call_id, args, context).await;
+        let forward_result = forwarder
             .await
-            .with_context(|| format!("Tool '{}' execution failed", tool_name))?;
-
-        // Wait for the forwarder to finish draining output events.
-        let _ = forwarder.await;
+            .map_err(|e| anyhow::anyhow!("Tool output forwarder failed: {}", e));
+        let result = match (tool_result, forward_result) {
+            (Err(tool_error), Err(forward_error)) => {
+                return Err(anyhow::anyhow!(
+                    "Tool '{}' execution failed: {}; {}",
+                    tool_name,
+                    tool_error,
+                    forward_error
+                ));
+            }
+            (Err(tool_error), Ok(())) => {
+                return Err(tool_error).with_context(|| format!("Tool '{}' execution failed", tool_name));
+            }
+            (Ok(_), Err(forward_error)) => {
+                return Err(forward_error).with_context(|| format!("Tool '{}' output forwarding failed", tool_name));
+            }
+            (Ok(result), Ok(())) => result,
+        };
 
         let now = Self::now_ms();
 

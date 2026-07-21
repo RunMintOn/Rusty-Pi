@@ -47,7 +47,7 @@ impl std::fmt::Display for RunId {
 /// Events are emitted in a strict order within a run:
 /// 1. `RunStarted`
 /// 2. Zero or more text/tool events
-/// 3. Exactly one terminal event: `RunFinished` or `RunAborted`
+/// 3. Exactly one terminal event: `RunFinished`, `RunAborted`, or `RunFailed`
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// A new agent run has started.
