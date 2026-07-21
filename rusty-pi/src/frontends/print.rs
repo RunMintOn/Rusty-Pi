@@ -356,7 +356,7 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                 self.output.write_stdout(&format!("Switched to {}\n", model))?;
                 self.output.flush_stdout()
             }
-            CommandResult::Sessions(sessions) => {
+            CommandResult::Sessions { sessions, skipped } => {
                 if sessions.is_empty() {
                     self.output.write_stdout("No sessions found.\n")?;
                 } else {
@@ -368,9 +368,12 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                         ))?;
                     }
                 }
+                if *skipped > 0 {
+                    self.output
+                        .write_stdout(&format!("Skipped {} unreadable session files.\n", skipped))?;
+                }
                 self.output.flush_stdout()
             }
-            CommandResult::Quit | CommandResult::Noop => Ok(()),
         }
     }
 
