@@ -1,6 +1,5 @@
 //! REPL — Read-Eval-Print Loop for interactive chat.
 
-use crate::agent::engine::AbortFlag;
 use crate::ai::types::{AgentMessage, StopReason};
 use crate::coding_agent::command::{
     CommandRegistry, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader, ListSessionsCommand,
@@ -75,71 +74,25 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let mut session = config.session;
 
     match config.prompt {
-        Some(prompt) => run_single_shot(&mut session, &prompt).await,
+        Some(prompt) => {
+            let outcome = run_single_shot(&mut session, &prompt).await?;
+            match outcome {
+                crate::frontends::print::PrintRunOutcome::Finished(StopReason::Error) => {
+                    Err(anyhow::anyhow!("Provider/model error"))
+                }
+                crate::frontends::print::PrintRunOutcome::Finished(StopReason::Aborted)
+                | crate::frontends::print::PrintRunOutcome::Aborted => std::process::exit(130),
+                crate::frontends::print::PrintRunOutcome::Finished(_) => Ok(()),
+                crate::frontends::print::PrintRunOutcome::Failed(e) => Err(anyhow::anyhow!("Run failed: {}", e)),
+            }
+        }
         None => run_repl(&mut session).await,
     }
 }
 
-/// Helper: run an agent with Ctrl+C abort support and event-based output.
-/// Returns `true` if the run was aborted, `false` otherwise.
-async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
-    // Expand templates/skills before borrowing agent
-    let expanded = session.expand(prompt);
-
-    let agent = session.agent();
-    let abort_token: AbortFlag = CancellationToken::new();
-    agent.set_abort_flag(abort_token.clone());
-
-    // Set up event channel
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
-    agent.set_event_sender(event_tx);
-
-    let mut frontend = PrintFrontend::new();
-    let mut was_aborted = false;
-
-    // Run the agent future
-    let run_future = session.agent().run(&expanded);
-    tokio::pin!(run_future);
-
-    loop {
-        tokio::select! {
-            result = &mut run_future => {
-                // Agent finished (success or error)
-                if let Err(e) = result {
-                    eprintln!("\n[error] {}", e);
-                }
-                // Drain remaining events
-                while let Ok(event) = event_rx.try_recv() {
-                    let _ = frontend.handle_event(&event);
-                }
-                break;
-            }
-            event = event_rx.recv() => {
-                if let Some(event) = event {
-                    let _ = frontend.handle_event(&event);
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\n⏹ Ctrl+C — cancelling...");
-                abort_token.cancel();
-                was_aborted = true;
-                // Don't break yet — wait for the agent to finish
-            }
-        }
-    }
-
-    // Clean up: drain any late events
-    while let Ok(event) = event_rx.try_recv() {
-        let _ = frontend.handle_event(&event);
-    }
-
-    was_aborted
-}
-
-/// Run a single prompt and print the response, then exit.
-/// Uses PrintFrontend for event-based output with proper exit codes.
-async fn run_single_shot(session: &mut PromptSession, prompt: &str) -> Result<()> {
-    use crate::frontends::print::PrintRunOutcome;
+/// Helper: run an agent with Ctrl+C abort support using the Print Run Driver.
+/// Returns the run outcome.
+async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> crate::frontends::print::PrintRunOutcome {
     use crate::frontends::print::{PrintFrontend, RealOutput, drive_print_run};
 
     let expanded = session.expand(prompt);
@@ -147,27 +100,23 @@ async fn run_single_shot(session: &mut PromptSession, prompt: &str) -> Result<()
     let run_token = CancellationToken::new();
     let mut frontend = PrintFrontend::<RealOutput>::new();
 
-    let outcome = drive_print_run(agent, &expanded, &mut frontend, run_token).await;
+    drive_print_run(agent, &expanded, &mut frontend, run_token).await
+}
 
-    match outcome {
-        PrintRunOutcome::Finished(reason) => {
-            if matches!(reason, StopReason::Error | StopReason::Aborted) {
-                // Non-zero exit code for error/abort in single-shot mode
-                Ok(())
-            } else {
-                Ok(())
-            }
-        }
-        PrintRunOutcome::Aborted => {
-            // User cancelled — exit code 130
-            std::process::exit(130);
-        }
-        PrintRunOutcome::Failed(error) => {
-            // Internal failure — non-zero exit code
-            eprintln!("[error] {}", error);
-            Err(anyhow::anyhow!("Run failed: {}", error))
-        }
-    }
+/// Run a single prompt and print the response, then exit.
+/// Uses PrintFrontend for event-based output with proper exit codes.
+async fn run_single_shot(
+    session: &mut PromptSession,
+    prompt: &str,
+) -> Result<crate::frontends::print::PrintRunOutcome> {
+    use crate::frontends::print::{PrintFrontend, RealOutput, drive_print_run};
+
+    let expanded = session.expand(prompt);
+    let agent = session.agent();
+    let run_token = CancellationToken::new();
+    let mut frontend = PrintFrontend::<RealOutput>::new();
+
+    Ok(drive_print_run(agent, &expanded, &mut frontend, run_token).await)
 }
 
 /// Resolve history path given a home directory string.
@@ -250,9 +199,9 @@ async fn run_repl_with(
             }
         }
 
-        let aborted = run_with_abort(session, &trimmed).await;
+        let outcome = run_with_abort(session, &trimmed).await;
 
-        if !aborted {
+        if !matches!(outcome, crate::frontends::print::PrintRunOutcome::Aborted) {
             let agent = session.agent();
             let msgs = agent.messages().await;
             if let Some(AgentMessage::Assistant(a)) = msgs.last()

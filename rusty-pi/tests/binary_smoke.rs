@@ -8,7 +8,7 @@
 //! These are deliberately not PTY tests. Real terminal behavior lives in
 //! `tests/pty_smoke.rs`.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -209,6 +209,152 @@ fn process_exits_cleanly_no_hang() {
         None => {
             child.kill().ok();
             panic!("Process did not exit within timeout — possible hang");
+        }
+    }
+}
+
+// ── Single-shot stdout/stderr separation tests ────────────────────────
+
+#[test]
+fn single_shot_text_only_stdout_only() {
+    let mut cmd = Command::new(binary_path());
+    cmd.arg("-p").arg("mock").arg("hello");
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn");
+    let exit = wait_with_timeout(&mut child, Duration::from_secs(10));
+
+    let stdout = child
+        .stdout
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            buf
+        })
+        .unwrap_or_default();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            buf
+        })
+        .unwrap_or_default();
+
+    match exit {
+        Some(status) => {
+            assert!(status.success(), "Should exit 0, got: {:?}", status);
+            // stdout should contain assistant text
+            assert!(
+                stdout.contains("mock"),
+                "stdout should contain assistant response, got: {}",
+                stdout
+            );
+            // stderr should be empty for text-only mock response
+            assert!(
+                stderr.is_empty() || stderr.chars().all(|c| c == '\n'),
+                "stderr should be empty for text-only response, got: {:?}",
+                stderr
+            );
+        }
+        None => {
+            child.kill().ok();
+            panic!("Single-shot did not exit within timeout");
+        }
+    }
+}
+
+#[test]
+fn single_shot_tool_call_stderr_has_diagnostics() {
+    let mut cmd = Command::new(binary_path());
+    cmd.arg("-p").arg("mock");
+    cmd.env("RUSTY_PI_MOCK_TOOL", "echo tool-output");
+    cmd.arg("run a tool");
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn");
+    let exit = wait_with_timeout(&mut child, Duration::from_secs(10));
+
+    let stdout = child
+        .stdout
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            buf
+        })
+        .unwrap_or_default();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            buf
+        })
+        .unwrap_or_default();
+
+    match exit {
+        Some(status) => {
+            assert!(status.success(), "Should exit 0, got: {:?}", status);
+            // stdout should contain the final assistant text
+            assert!(
+                stdout.contains("Mock tool round complete"),
+                "stdout should contain final response, got: {}",
+                stdout
+            );
+            // stderr should contain tool diagnostics
+            assert!(
+                stderr.contains("bash") || stderr.contains("tool"),
+                "stderr should contain tool diagnostics, got: {}",
+                stderr
+            );
+        }
+        None => {
+            child.kill().ok();
+            panic!("Single-shot tool call did not exit within timeout");
+        }
+    }
+}
+
+#[test]
+fn single_shot_invalid_provider_is_nonzero_and_stdout_clean() {
+    let mut cmd = Command::new(binary_path());
+    cmd.arg("-p").arg("not-a-provider").arg("hello");
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn");
+    let exit = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let stdout = child
+        .stdout
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            buf
+        })
+        .unwrap_or_default();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).unwrap();
+            buf
+        })
+        .unwrap_or_default();
+
+    match exit {
+        Some(status) => {
+            assert_ne!(status.code(), Some(0), "Invalid provider must fail");
+            assert!(stdout.is_empty(), "stdout must not contain diagnostics: {stdout:?}");
+            assert!(!stderr.is_empty(), "stderr must contain the provider error");
+        }
+        None => {
+            child.kill().ok();
+            panic!("Invalid-provider invocation did not exit within timeout");
         }
     }
 }

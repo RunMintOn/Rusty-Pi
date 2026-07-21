@@ -138,6 +138,16 @@ mod tests {
             }
             _ => panic!("Expected RunFinished, got: {:?}", last),
         }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunAborted { .. } | AgentEvent::RunFailed { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     // ── Single tool call event sequence ──
@@ -260,6 +270,59 @@ mod tests {
             }
             _ => panic!("Expected RunFinished with Error, got: {:?}", last),
         }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunAborted { .. } | AgentEvent::RunFailed { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_execution_failure_emits_one_run_failed() {
+        let mock = MockProvider::new(vec![MockStep::ToolCall {
+            id: "tc_missing".into(),
+            name: "missing_tool".into(),
+            arguments: serde_json::json!({}),
+            stop_reason: None,
+        }]);
+        let mut agent = Agent::new(Box::new(mock), make_model());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        agent.set_event_sender(tx);
+
+        let result = agent.run("invoke missing tool").await;
+        assert!(result.is_err());
+
+        let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
+        agent.set_event_sender(dummy_tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        let failures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::RunFailed { error, .. } => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].phase, crate::agent::events::AgentRunPhase::ToolExecution);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunAborted { .. } | AgentEvent::RunFailed { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     // ── Tool error event sequence ──

@@ -232,24 +232,12 @@ impl Agent {
         // Run the inner loop, capturing the result
         let result = self.run_inner(run_id, run_token).await;
 
-        // Centralized terminal event emission
+        // `run_inner` owns terminal event emission for runs that reached
+        // RunStarted. Do not emit another terminal event here: the returned
+        // error is only the API result for the caller.
         match result {
             Ok(()) => Ok(()),
-            Err(e) => {
-                let err_msg = format!("{}", e);
-                // Don't emit RunFailed if the run was already aborted
-                if !self.abort.is_cancelled() {
-                    self.emit(AgentEvent::RunFailed {
-                        run_id,
-                        error: crate::agent::events::AgentRunError {
-                            phase: crate::agent::events::AgentRunPhase::AgentLoop,
-                            message: err_msg.clone(),
-                        },
-                    })
-                    .await;
-                }
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 

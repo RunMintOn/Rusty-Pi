@@ -187,6 +187,22 @@ impl<O: FrontendOutput> PrintFrontend<O> {
         &mut self.output
     }
 
+    /// Report an agent error that arrived without a corresponding event.
+    ///
+    /// Normal agent failures are represented by `AgentEvent::RunFailed` and
+    /// therefore go through `handle_event`. This fallback is for failures
+    /// that happen before the event stream is initialized; it still uses the
+    /// configured sink rather than writing to a global stderr handle.
+    pub fn report_run_error(&mut self, error: &AgentRunError) -> io::Result<()> {
+        if !self.terminal_event_seen {
+            self.terminal_event_seen = true;
+            self.output
+                .write_stderr(&format!("\n❌ Run failed [{}]: {}\n", error.phase, error.message))?;
+            self.output.flush_stderr()?;
+        }
+        Ok(())
+    }
+
     /// Process a single agent event.
     ///
     /// Events from a stale RunId are ignored. Duplicate terminal events
@@ -218,7 +234,7 @@ impl<O: FrontendOutput> PrintFrontend<O> {
             } if self.accepts(*run_id) => {
                 // Don't create duplicate state for the same tool_call_id
                 if !self.tool_states.contains_key(tool_call_id) {
-                    let args_str = if arguments.is_object() && arguments.as_object().map_or(false, |m| m.is_empty()) {
+                    let args_str = if arguments.is_object() && arguments.as_object().is_some_and(|m| m.is_empty()) {
                         String::new()
                     } else {
                         format!(" {}", arguments)
@@ -360,10 +376,7 @@ impl<O: FrontendOutput> PrintFrontend<O> {
 
     /// Print tool finished with dedup logic.
     fn print_tool_finished(&mut self, tool_call_id: &str, name: &str, result: &AgentToolResult) -> io::Result<()> {
-        let saw_stream = self
-            .tool_states
-            .get(tool_call_id)
-            .map_or(false, |s| s.saw_stream_output);
+        let saw_stream = self.tool_states.get(tool_call_id).is_some_and(|s| s.saw_stream_output);
         let duration = self.tool_states.get(tool_call_id).map(|s| s.started_at.elapsed());
 
         if result.is_error {
@@ -478,14 +491,7 @@ pub async fn drive_print_run<O: FrontendOutput>(
         tokio::select! {
             result = &mut run_future => {
                 // Agent finished
-                match result {
-                    Ok(()) => {}
-                    Err(e) => {
-                        if outcome.is_none() {
-                            eprintln!("\n[error] {}", e);
-                        }
-                    }
-                }
+                // (errors are captured as RunFailed events by the agent)
                 // Drain remaining events
                 while let Ok(event) = event_rx.try_recv() {
                     let _ = frontend.handle_event(&event);
@@ -500,6 +506,22 @@ pub async fn drive_print_run<O: FrontendOutput>(
                             outcome = Some(PrintRunOutcome::Failed(error.clone()));
                         }
                         _ => {}
+                    }
+                }
+                // If no terminal event was seen, the agent failed before
+                // emitting one (e.g. session error before RunStarted).
+                // Report through the frontend output sink.
+                if outcome.is_none() {
+                    if let Err(e) = result {
+                        let error = crate::agent::events::AgentRunError {
+                            phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                            message: e.to_string(),
+                        };
+                        let _ = frontend.report_run_error(&error);
+                        outcome = Some(PrintRunOutcome::Failed(error));
+                    } else {
+                        // Agent returned Ok but no terminal event — shouldn't happen
+                        outcome = Some(PrintRunOutcome::Aborted);
                     }
                 }
                 break;
@@ -969,6 +991,19 @@ mod tests {
     }
 
     #[test]
+    fn print_frontend_report_run_error_uses_output_sink() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .report_run_error(&AgentRunError {
+                phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                message: "internal failure".into(),
+            })
+            .unwrap();
+        assert!(frontend.output().stdout.is_empty());
+        assert!(frontend.output().stderr_str().contains("internal failure"));
+    }
+
+    #[test]
     fn print_frontend_tool_finished找不到started_shows_summary() {
         let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
         frontend
@@ -990,5 +1025,230 @@ mod tests {
             .unwrap();
         let stderr = frontend.output().stderr_str();
         assert!(stderr.contains("read"));
+    }
+
+    // ── Integration tests: MockProvider → Agent → AgentEvent → drive_print_run → MemoryOutput ──
+
+    #[tokio::test]
+    async fn integration_plain_response() {
+        use crate::agent::engine::Agent;
+        use crate::ai::mock::MockProvider;
+
+        let mock = MockProvider::text("Hello from integration test");
+        let mut agent = Agent::new(
+            Box::new(mock),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        let token = CancellationToken::new();
+
+        let outcome = drive_print_run(&mut agent, "hi", &mut frontend, token).await;
+
+        assert!(matches!(outcome, PrintRunOutcome::Finished(_)));
+        assert_eq!(frontend.output().stdout_str().trim_end(), "Hello from integration test");
+        assert!(frontend.output().stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn integration_tool_call_and_output() {
+        use crate::agent::engine::Agent;
+        use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionContext};
+        use crate::ai::mock::{MockProvider, MockStep};
+        use crate::ai::types::{Content, Tool};
+        use async_trait::async_trait;
+
+        struct EchoTool;
+        impl Tool for EchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "Echoes"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]})
+            }
+        }
+        #[async_trait]
+        impl AgentTool for EchoTool {
+            fn label(&self) -> &str {
+                "echo"
+            }
+            async fn execute(
+                &self,
+                _id: &str,
+                params: serde_json::Value,
+                ctx: ToolExecutionContext,
+            ) -> anyhow::Result<AgentToolResult> {
+                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let _ = ctx
+                    .output_tx
+                    .send(crate::agent::types::ToolOutputEvent {
+                        stream: ToolOutputStream::Stdout,
+                        chunk: format!("echo: {text}\n"),
+                    })
+                    .await;
+                Ok(AgentToolResult {
+                    content: vec![Content::Text {
+                        text: format!("echo: {}", text),
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+
+        let mock = MockProvider::new(vec![
+            MockStep::ToolCall {
+                id: "tc_1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text": "hello"}),
+                stop_reason: None,
+            },
+            MockStep::Text("Done".into()),
+        ]);
+        let mut agent = Agent::new(
+            Box::new(mock),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        agent.add_tool(Box::new(EchoTool));
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        let token = CancellationToken::new();
+
+        let outcome = drive_print_run(&mut agent, "echo hello", &mut frontend, token).await;
+
+        assert!(matches!(outcome, PrintRunOutcome::Finished(_)));
+        // TextDelta goes to stdout
+        assert!(frontend.output().stdout_str().contains("Done"));
+        // ToolStarted goes to stderr
+        assert!(frontend.output().stderr_str().contains("echo"));
+        // ToolFinished summary in stderr (the tool emitted streaming output)
+        assert!(frontend.output().stderr_str().contains("done"));
+    }
+
+    #[tokio::test]
+    async fn integration_provider_error() {
+        use crate::agent::engine::Agent;
+        use crate::ai::mock::{MockProvider, MockStep};
+
+        let mock = MockProvider::new(vec![MockStep::Error("API error".into())]);
+        let mut agent = Agent::new(
+            Box::new(mock),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        let token = CancellationToken::new();
+
+        let outcome = drive_print_run(&mut agent, "trigger error", &mut frontend, token).await;
+
+        assert!(matches!(outcome, PrintRunOutcome::Finished(_)));
+        assert!(frontend.output().stderr_str().contains("Provider error"));
+        assert!(frontend.output().stderr_str().contains("API error"));
+    }
+
+    #[tokio::test]
+    async fn integration_cancellation() {
+        use crate::agent::engine::Agent;
+        use crate::ai::mock::{MockProvider, MockStep};
+
+        let mock = MockProvider::new(vec![MockStep::Text("never".into())]);
+        let mut agent = Agent::new(
+            Box::new(mock),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        let token = CancellationToken::new();
+
+        // Pre-cancel to simulate immediate cancellation
+        token.cancel();
+
+        let outcome = drive_print_run(&mut agent, "cancel me", &mut frontend, token).await;
+
+        assert!(matches!(outcome, PrintRunOutcome::Aborted));
+        assert!(frontend.output().stderr_str().contains("aborted"));
+    }
+
+    #[tokio::test]
+    async fn integration_sequential_runs_state_isolation() {
+        use crate::agent::engine::Agent;
+        use crate::ai::mock::MockProvider;
+
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+
+        // First run
+        let mut agent1 = Agent::new(
+            Box::new(MockProvider::text("first response")),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let token1 = CancellationToken::new();
+        let outcome1 = drive_print_run(&mut agent1, "first", &mut frontend, token1).await;
+        assert!(matches!(outcome1, PrintRunOutcome::Finished(_)));
+        let stdout1 = frontend.output().stdout_str();
+        assert!(stdout1.contains("first response"));
+
+        // Second run — frontend state should be reset by RunStarted
+        frontend.output_mut().clear();
+        let mut agent2 = Agent::new(
+            Box::new(MockProvider::text("second response")),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let token2 = CancellationToken::new();
+        let outcome2 = drive_print_run(&mut agent2, "second", &mut frontend, token2).await;
+        assert!(matches!(outcome2, PrintRunOutcome::Finished(_)));
+        let stdout2 = frontend.output().stdout_str();
+        assert!(stdout2.contains("second response"));
+        // First response must not leak into second run's output
+        assert!(!stdout2.contains("first response"));
+    }
+
+    #[tokio::test]
+    async fn integration_cancel_then_succeed() {
+        use crate::agent::engine::Agent;
+        use crate::ai::mock::MockProvider;
+
+        let mut agent1 = Agent::new(
+            Box::new(MockProvider::text("never")),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+
+        // Cancel first run
+        let token1 = CancellationToken::new();
+        token1.cancel();
+        let outcome1 = drive_print_run(&mut agent1, "cancel me", &mut frontend, token1).await;
+        assert!(matches!(outcome1, PrintRunOutcome::Aborted));
+
+        // Second run should succeed
+        let mut agent2 = Agent::new(
+            Box::new(MockProvider::text("recovered")),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let token2 = CancellationToken::new();
+        let outcome2 = drive_print_run(&mut agent2, "go", &mut frontend, token2).await;
+        assert!(matches!(outcome2, PrintRunOutcome::Finished(_)));
+        assert!(frontend.output().stdout_str().contains("recovered"));
     }
 }
