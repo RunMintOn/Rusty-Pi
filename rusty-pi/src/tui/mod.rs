@@ -1,7 +1,7 @@
-//! Terminal User Interface (placeholder).
+//! Terminal User Interface.
 //!
 //! Mirrors the structure of `@earendil-works/pi-tui`.
-//! Will be populated when interactive mode is implemented in later phases.
 
 pub mod app;
 pub mod print_frontend;
+pub mod terminal_guard;
