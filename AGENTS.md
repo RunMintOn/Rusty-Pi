@@ -94,7 +94,17 @@ Single-context repo. See `docs/agents/domain.md`.
 
 **教训**：abort/cancel 信号必须端到端传递，不能在中间断掉。
 
-### 3. 测试卡住时如何诊断
+### 3. tokio::process::Child::drop 不调用 waitpid
+
+**症状**：并行 `cargo test` 50%+ 概率挂死，单线程正常。`ps` 显示 zombie `sh` 进程，主线程卡在 `do_wait`。
+
+**原因**：`tokio::process::Child::drop` 只 detach 不 reaping。Runtime 被 drop 后 SIGCHLD handler 也失效，zombie 无人清理。
+
+**修复**：用 `std::process::Command` + OS 线程 blocking `waitpid`，完全绕过 tokio 进程管理。
+
+**防范**：spawn 子进程的工具一律用 `std::process::Command`，不用 `tokio::process::Command`。
+
+### 4. 测试卡住时如何诊断
 
 ```bash
 # 查看进程树
