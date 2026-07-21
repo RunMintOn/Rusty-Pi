@@ -800,6 +800,9 @@ impl Command for ListSessionsCommand {
         use crate::agent::session::jsonl::JsonlSessionStorage;
         use crate::agent::session::storage::SessionStorage;
 
+        if context.cancelled() {
+            return Ok(CommandOutcome::none());
+        }
         let sessions_dir = context.session.agent_dir().join("sessions");
         let directory = match tokio::fs::read_dir(&sessions_dir).await {
             Ok(directory) => directory,
