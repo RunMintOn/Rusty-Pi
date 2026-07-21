@@ -1,6 +1,6 @@
 //! REPL — Read-Eval-Print Loop for interactive chat.
 
-use crate::ai::types::{AgentMessage, StopReason};
+use crate::ai::types::StopReason;
 use crate::coding_agent::command::{
     CommandRegistry, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader, ListSessionsCommand,
     ModelCommand, QuitCommand, SessionCommand, TreeCommand,
@@ -11,7 +11,7 @@ use crate::frontends::PrintFrontend;
 use anyhow::Result;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 /// Run configuration for the CLI.
@@ -92,15 +92,18 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
 /// Helper: run an agent with Ctrl+C abort support using the Print Run Driver.
 /// Returns the run outcome.
-async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> crate::frontends::print::PrintRunOutcome {
-    use crate::frontends::print::{PrintFrontend, RealOutput, drive_print_run};
+async fn run_with_abort<O: crate::frontends::print::FrontendOutput>(
+    session: &mut PromptSession,
+    prompt: &str,
+    frontend: &mut crate::frontends::print::PrintFrontend<O>,
+) -> std::io::Result<crate::frontends::print::PrintRunOutcome> {
+    use crate::frontends::print::drive_print_run;
 
     let expanded = session.expand(prompt);
     let agent = session.agent();
     let run_token = CancellationToken::new();
-    let mut frontend = PrintFrontend::<RealOutput>::new();
 
-    drive_print_run(agent, &expanded, &mut frontend, run_token).await
+    drive_print_run(agent, &expanded, frontend, run_token).await
 }
 
 /// Run a single prompt and print the response, then exit.
@@ -116,7 +119,7 @@ async fn run_single_shot(
     let run_token = CancellationToken::new();
     let mut frontend = PrintFrontend::<RealOutput>::new();
 
-    Ok(drive_print_run(agent, &expanded, &mut frontend, run_token).await)
+    Ok(drive_print_run(agent, &expanded, &mut frontend, run_token).await?)
 }
 
 /// Resolve history path given a home directory string.
@@ -153,15 +156,25 @@ async fn run_repl_with(
     session: &mut PromptSession,
     registry: &CommandRegistry,
     reader: &mut dyn LineReader,
-    history_path: &PathBuf,
+    history_path: &Path,
+) -> Result<()> {
+    let mut frontend = PrintFrontend::new();
+    run_repl_with_frontend(session, registry, reader, history_path, &mut frontend).await
+}
+
+/// Core REPL loop with an injectable frontend output sink for tests.
+async fn run_repl_with_frontend<O: crate::frontends::print::FrontendOutput>(
+    session: &mut PromptSession,
+    registry: &CommandRegistry,
+    reader: &mut dyn LineReader,
+    history_path: &Path,
+    frontend: &mut PrintFrontend<O>,
 ) -> Result<()> {
     let meta = session.session().get_metadata().await;
     let model = session.model().id;
     let banner = startup_banner("rusty-pi", model, &meta.id);
     println!("{}", banner);
     println!("Type '/help' for commands\n");
-
-    let mut frontend = PrintFrontend::new();
 
     loop {
         let line = match reader.readline("> ") {
@@ -191,7 +204,7 @@ async fn run_repl_with(
         match registry.dispatch(&trimmed, session)? {
             DispatchOutcome::Exit => break,
             DispatchOutcome::Handled(result) => {
-                let _ = frontend.handle_command_result(&result);
+                frontend.handle_command_result(&result)?;
                 continue;
             }
             DispatchOutcome::NotACommand => {
@@ -199,18 +212,9 @@ async fn run_repl_with(
             }
         }
 
-        let outcome = run_with_abort(session, &trimmed).await;
-
-        if !matches!(outcome, crate::frontends::print::PrintRunOutcome::Aborted) {
-            let agent = session.agent();
-            let msgs = agent.messages().await;
-            if let Some(AgentMessage::Assistant(a)) = msgs.last()
-                && a.stop_reason == StopReason::Error
-                && let Some(err) = &a.error_message
-            {
-                eprintln!("[error] {}", err);
-            }
-        }
+        // Agent-visible output is rendered only by drive_print_run through
+        // the frontend. Do not reconstruct errors from session messages.
+        let _outcome = run_with_abort(session, &trimmed, frontend).await?;
         println!();
     }
 
@@ -310,6 +314,53 @@ mod tests {
 
         assert!(reader.history.contains(&"hello agent".to_string()));
         assert!(reader.history.contains(&"/exit".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_error_in_repl_is_rendered_once_by_the_event_path() {
+        let provider = crate::ai::mock::MockProvider::new(vec![crate::ai::mock::MockStep::Error("API error".into())]);
+        let model = crate::ai::providers::Model {
+            id: "mock",
+            api: "mock",
+        };
+        let mut session = PromptSession::new(
+            Box::new(provider),
+            model,
+            vec![],
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/.pi/agent"),
+            vec![],
+            vec![],
+            false,
+            None,
+            vec![],
+        );
+        let registry = default_registry();
+        let mut reader = MockLineReader::new(vec!["trigger provider error".into(), "/exit".into()]);
+        let mut frontend = PrintFrontend::with_output(crate::frontends::print::MemoryOutput::new());
+        let history = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        run_repl_with_frontend(&mut session, &registry, &mut reader, &history, &mut frontend)
+            .await
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert_eq!(stderr.matches("API error").count(), 1);
+        assert_eq!(stderr.matches("Provider error").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn repl_propagates_command_result_output_failure() {
+        let mut session = mock_session();
+        let registry = default_registry();
+        let mut reader = MockLineReader::new(vec!["/help".into()]);
+        let mut frontend = PrintFrontend::with_output(crate::frontends::print::FailingOutput);
+        let history = PathBuf::from("/tmp/.pi/agent/repl-history.txt");
+
+        let error = run_repl_with_frontend(&mut session, &registry, &mut reader, &history, &mut frontend)
+            .await
+            .expect_err("command output failure must not be swallowed");
+        assert!(error.to_string().contains("stdout write failed"));
     }
 
     #[tokio::test]

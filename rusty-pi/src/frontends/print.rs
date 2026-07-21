@@ -9,6 +9,7 @@ use crate::agent::events::{AgentEvent, AgentRunError, RunId, ToolOutputStream};
 use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
 use crate::coding_agent::command::CommandResult;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Instant;
@@ -128,6 +129,8 @@ pub struct ToolState {
     pub started_at: Instant,
     /// Whether streaming output was observed for this tool.
     pub saw_stream_output: bool,
+    /// Whether the completion event for this tool has been rendered.
+    pub finished: bool,
 }
 
 // ── Stateful PrintFrontend ──────────────────────────────────────────────────
@@ -217,12 +220,12 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                 self.terminal_event_seen = false;
                 Ok(())
             }
-            AgentEvent::TextDelta { run_id, text } if self.accepts(*run_id) => {
+            AgentEvent::TextDelta { run_id, text } if self.accepts_active(*run_id) => {
                 self.assistant_output_started = true;
                 self.output.write_stdout(text)?;
                 self.output.flush_stdout()
             }
-            AgentEvent::ThinkingDelta { run_id, text } if self.accepts(*run_id) => {
+            AgentEvent::ThinkingDelta { run_id, text } if self.accepts_active(*run_id) => {
                 self.output.write_stderr(&format!("[thinking] {}", text))?;
                 self.output.flush_stderr()
             }
@@ -231,7 +234,7 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                 tool_call_id,
                 name,
                 arguments,
-            } if self.accepts(*run_id) => {
+            } if self.accepts_active(*run_id) => {
                 // Don't create duplicate state for the same tool_call_id
                 if !self.tool_states.contains_key(tool_call_id) {
                     let args_str = if arguments.is_object() && arguments.as_object().is_some_and(|m| m.is_empty()) {
@@ -247,6 +250,7 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                             name: name.clone(),
                             started_at: Instant::now(),
                             saw_stream_output: false,
+                            finished: false,
                         },
                     );
                 }
@@ -257,19 +261,20 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                 tool_call_id,
                 stream,
                 chunk,
-            } if self.accepts(*run_id) => {
+            } if self.accepts_active(*run_id) => {
                 // Mark that this tool has produced streaming output
-                if let Some(state) = self.tool_states.get_mut(tool_call_id) {
+                let Some(state) = self.tool_states.get_mut(tool_call_id) else {
+                    // Output without a start event is stale or malformed. It
+                    // must not resurrect a tool lifecycle.
+                    return Ok(());
+                };
+                if !state.finished {
                     state.saw_stream_output = true;
-                }
-                match stream {
-                    ToolOutputStream::Stdout => {
-                        self.output.write_stderr(chunk)?;
-                        self.output.flush_stderr()?;
-                    }
-                    ToolOutputStream::Stderr => {
-                        self.output.write_stderr(chunk)?;
-                        self.output.flush_stderr()?;
+                    match stream {
+                        ToolOutputStream::Stdout | ToolOutputStream::Stderr => {
+                            self.output.write_stderr(chunk)?;
+                            self.output.flush_stderr()?;
+                        }
                     }
                 }
                 Ok(())
@@ -279,8 +284,8 @@ impl<O: FrontendOutput> PrintFrontend<O> {
                 tool_call_id,
                 name,
                 result,
-            } if self.accepts(*run_id) => self.print_tool_finished(tool_call_id, name, result),
-            AgentEvent::ProviderError { run_id, error } if self.accepts(*run_id) => {
+            } if self.accepts_active(*run_id) => self.print_tool_finished(tool_call_id, name, result),
+            AgentEvent::ProviderError { run_id, error } if self.accepts_active(*run_id) => {
                 self.output
                     .write_stderr(&format!("\n❌ Provider error: {}", error.message))?;
                 self.output.flush_stderr()
@@ -374,80 +379,109 @@ impl<O: FrontendOutput> PrintFrontend<O> {
         self.current_run_id == Some(run_id)
     }
 
+    /// Returns true for events that may still produce output in the current run.
+    fn accepts_active(&self, run_id: RunId) -> bool {
+        self.accepts(run_id) && !self.terminal_event_seen
+    }
+
     /// Print tool finished with dedup logic.
     fn print_tool_finished(&mut self, tool_call_id: &str, name: &str, result: &AgentToolResult) -> io::Result<()> {
-        let saw_stream = self.tool_states.get(tool_call_id).is_some_and(|s| s.saw_stream_output);
-        let duration = self.tool_states.get(tool_call_id).map(|s| s.started_at.elapsed());
-
-        if result.is_error {
-            let error_text = result
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    crate::ai::types::Content::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .next()
-                .unwrap_or("unknown error");
-
-            let duration_str = duration
-                .map(|d| format!(" in {:.1}s", d.as_secs_f64()))
-                .unwrap_or_default();
-
-            if let Some(code) = result.exit_code {
-                self.output.write_stderr(&format!(
-                    "  ❌ {} exit code {}{} — {}\n",
-                    name, code, duration_str, error_text
-                ))?;
-            } else if result.timed_out {
-                self.output
-                    .write_stderr(&format!("  ⏰ {} timed out{} — {}\n", name, duration_str, error_text))?;
-            } else if result.aborted {
-                self.output
-                    .write_stderr(&format!("  ⏹ {} aborted{} — {}\n", name, duration_str, error_text))?;
-            } else {
-                self.output
-                    .write_stderr(&format!("  ❌ {} error{} — {}\n", name, duration_str, error_text))?;
+        let (saw_stream, duration) = match self.tool_states.get_mut(tool_call_id) {
+            Some(state) if state.finished => return Ok(()),
+            Some(state) => {
+                state.finished = true;
+                (state.saw_stream_output, Some(state.started_at.elapsed()))
             }
+            None => {
+                // A completion without a start is still rendered once, but it
+                // establishes a finished state so later output cannot leak.
+                self.tool_states.insert(
+                    tool_call_id.to_string(),
+                    ToolState {
+                        name: name.to_string(),
+                        started_at: Instant::now(),
+                        saw_stream_output: false,
+                        finished: true,
+                    },
+                );
+                (false, None)
+            }
+        };
+
+        let duration_str = duration
+            .map(|d| format!(" in {:.1}s", d.as_secs_f64()))
+            .unwrap_or_default();
+
+        let is_failure = result.is_error || result.exit_code.is_some() || result.timed_out || result.aborted;
+
+        if saw_stream {
+            // Streaming output has already shown the result content. Only the
+            // stateful completion summary is rendered, including error state.
+            let summary = if is_failure {
+                if let Some(code) = result.exit_code {
+                    format!("  ❌ {} exit code {}{}\n", name, code, duration_str)
+                } else if result.timed_out {
+                    format!("  ⏰ {} timed out{}\n", name, duration_str)
+                } else if result.aborted {
+                    format!("  ⏹ {} aborted{}\n", name, duration_str)
+                } else {
+                    format!("  ❌ {} error{}\n", name, duration_str)
+                }
+            } else {
+                format!("  ✅ {} done{}\n", name, duration_str)
+            };
+            self.output.write_stderr(&summary)?;
             self.output.flush_stderr()
-        } else if saw_stream {
-            // Tool already produced streaming output — show only summary
-            let duration_str = duration
-                .map(|d| format!(" in {:.1}s", d.as_secs_f64()))
-                .unwrap_or_default();
-            self.output
-                .write_stderr(&format!("  ✅ {} done{}\n", name, duration_str))?;
+        } else if is_failure {
+            // Without streaming, show a bounded first-line error summary.
+            let error_text = first_text(result)
+                .and_then(|text| text.lines().next())
+                .filter(|text| !text.is_empty())
+                .unwrap_or("unknown error");
+            let display = truncate_chars(error_text, 80);
+            let prefix = if let Some(code) = result.exit_code {
+                format!("  ❌ {} exit code {}{}", name, code, duration_str)
+            } else if result.timed_out {
+                format!("  ⏰ {} timed out{}", name, duration_str)
+            } else if result.aborted {
+                format!("  ⏹ {} aborted{}", name, duration_str)
+            } else {
+                format!("  ❌ {} error{}", name, duration_str)
+            };
+            self.output.write_stderr(&format!("{} — {}\n", prefix, display))?;
             self.output.flush_stderr()
         } else {
-            // No streaming output — show first line of result
-            let output_line = result
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    crate::ai::types::Content::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .next()
-                .unwrap_or("");
-
-            let first_line = output_line.lines().next().unwrap_or("");
-            if !first_line.is_empty() {
-                let display = if first_line.len() > 80 {
-                    format!("{}...", &first_line[..77])
-                } else {
-                    first_line.to_string()
-                };
-                let duration_str = duration
-                    .map(|d| format!(" in {:.1}s", d.as_secs_f64()))
-                    .unwrap_or_default();
-                self.output
-                    .write_stderr(&format!("  ✅ {}{}: {}\n", name, duration_str, display))?;
-                self.output.flush_stderr()
-            } else {
-                Ok(())
-            }
+            // No streaming output — show a bounded first line of the result.
+            let summary = match first_text(result).and_then(|text| text.lines().next()) {
+                Some(first_line) if !first_line.is_empty() => {
+                    let display = truncate_chars(first_line, 80);
+                    format!("  ✅ {}{}: {}\n", name, duration_str, display)
+                }
+                _ => format!("  ✅ {} done{}\n", name, duration_str),
+            };
+            self.output.write_stderr(&summary)?;
+            self.output.flush_stderr()
         }
     }
+}
+
+fn first_text(result: &AgentToolResult) -> Option<&str> {
+    result.content.iter().find_map(|content| match content {
+        crate::ai::types::Content::Text { text } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// Truncate text without ever splitting a UTF-8 code point.
+fn truncate_chars<'a>(text: &'a str, max_chars: usize) -> Cow<'a, str> {
+    if text.chars().count() <= max_chars {
+        return Cow::Borrowed(text);
+    }
+    if max_chars <= 3 {
+        return Cow::Owned(text.chars().take(max_chars).collect());
+    }
+    let prefix: String = text.chars().take(max_chars - 3).collect();
+    Cow::Owned(format!("{}...", prefix))
 }
 
 // ── Print Run Driver ────────────────────────────────────────────────────────
@@ -469,19 +503,21 @@ pub enum PrintRunOutcome {
 /// - Ctrl+C cancellation
 /// - PrintFrontend output
 ///
-/// Returns [`PrintRunOutcome`] indicating how the run ended.
+/// Returns [`PrintRunOutcome`] indicating how the run ended. Output failures
+/// are returned after the agent future has settled.
 pub async fn drive_print_run<O: FrontendOutput>(
     agent: &mut crate::agent::engine::Agent,
     prompt: &str,
     frontend: &mut PrintFrontend<O>,
     run_token: CancellationToken,
-) -> PrintRunOutcome {
+) -> io::Result<PrintRunOutcome> {
     // Set up event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
     agent.set_event_sender(event_tx);
     agent.set_abort_flag(run_token.clone());
 
     let mut outcome = None;
+    let mut output_error: Option<io::Error> = None;
 
     // Run the agent future
     let run_future = agent.run(prompt);
@@ -494,7 +530,12 @@ pub async fn drive_print_run<O: FrontendOutput>(
                 // (errors are captured as RunFailed events by the agent)
                 // Drain remaining events
                 while let Ok(event) = event_rx.try_recv() {
-                    let _ = frontend.handle_event(&event);
+                    if output_error.is_none()
+                        && let Err(error) = frontend.handle_event(&event)
+                    {
+                        run_token.cancel();
+                        output_error = Some(error);
+                    }
                     match &event {
                         AgentEvent::RunFinished { stop_reason, .. } => {
                             outcome = Some(PrintRunOutcome::Finished(stop_reason.clone()));
@@ -509,7 +550,7 @@ pub async fn drive_print_run<O: FrontendOutput>(
                     }
                 }
                 // If no terminal event was seen, the agent failed before
-                // emitting one (e.g. session error before RunStarted).
+                // reaching one of its normal terminal-event paths.
                 // Report through the frontend output sink.
                 if outcome.is_none() {
                     if let Err(e) = result {
@@ -517,7 +558,11 @@ pub async fn drive_print_run<O: FrontendOutput>(
                             phase: crate::agent::events::AgentRunPhase::AgentLoop,
                             message: e.to_string(),
                         };
-                        let _ = frontend.report_run_error(&error);
+                        if output_error.is_none()
+                            && let Err(output) = frontend.report_run_error(&error)
+                        {
+                            output_error = Some(output);
+                        }
                         outcome = Some(PrintRunOutcome::Failed(error));
                     } else {
                         // Agent returned Ok but no terminal event — shouldn't happen
@@ -528,7 +573,14 @@ pub async fn drive_print_run<O: FrontendOutput>(
             }
             event = event_rx.recv() => {
                 if let Some(event) = event {
-                    let _ = frontend.handle_event(&event);
+                    if output_error.is_none()
+                        && let Err(error) = frontend.handle_event(&event)
+                    {
+                        // Keep the agent alive until it settles. Its provider
+                        // and tool tasks own their cleanup obligations.
+                        run_token.cancel();
+                        output_error = Some(error);
+                    }
                     match &event {
                         AgentEvent::RunFinished { stop_reason, .. } => {
                             outcome = Some(PrintRunOutcome::Finished(stop_reason.clone()));
@@ -552,7 +604,11 @@ pub async fn drive_print_run<O: FrontendOutput>(
         }
     }
 
-    outcome.unwrap_or(PrintRunOutcome::Aborted)
+    if let Some(error) = output_error {
+        Err(error)
+    } else {
+        Ok(outcome.unwrap_or(PrintRunOutcome::Aborted))
+    }
 }
 
 #[cfg(test)]
@@ -1027,6 +1083,228 @@ mod tests {
         assert!(stderr.contains("read"));
     }
 
+    #[test]
+    fn duplicate_tool_finished_emits_one_summary() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolStarted {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_duplicate".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        let finished = AgentEvent::ToolFinished {
+            run_id: RunId::new(1),
+            tool_call_id: "tc_duplicate".into(),
+            name: "bash".into(),
+            result: AgentToolResult::default(),
+        };
+        frontend.handle_event(&finished).unwrap();
+        frontend.handle_event(&finished).unwrap();
+
+        assert_eq!(frontend.output().stderr_str().matches("✅").count(), 1);
+    }
+
+    #[test]
+    fn tool_output_after_finished_is_ignored() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolStarted {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_late".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_late".into(),
+                name: "bash".into(),
+                result: AgentToolResult::default(),
+            })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolOutput {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_late".into(),
+                stream: ToolOutputStream::Stdout,
+                chunk: "late output must not render".into(),
+            })
+            .unwrap();
+
+        assert!(!frontend.output().stderr_str().contains("late output"));
+    }
+
+    #[test]
+    fn two_different_tools_both_render_completion() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        for (id, name) in [("tc_a", "read"), ("tc_b", "bash")] {
+            frontend
+                .handle_event(&AgentEvent::ToolStarted {
+                    run_id: RunId::new(1),
+                    tool_call_id: id.into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({}),
+                })
+                .unwrap();
+            frontend
+                .handle_event(&AgentEvent::ToolFinished {
+                    run_id: RunId::new(1),
+                    tool_call_id: id.into(),
+                    name: name.into(),
+                    result: AgentToolResult::default(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(frontend.output().stderr_str().matches("✅").count(), 2);
+        assert!(frontend.output().stderr_str().contains("read"));
+        assert!(frontend.output().stderr_str().contains("bash"));
+    }
+
+    #[test]
+    fn streamed_error_content_is_not_repeated_in_completion() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolStarted {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_error".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolOutput {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_error".into(),
+                stream: ToolOutputStream::Stderr,
+                chunk: "streamed failure details".into(),
+            })
+            .unwrap();
+        frontend
+            .handle_event(&AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: "tc_error".into(),
+                name: "bash".into(),
+                result: AgentToolResult {
+                    content: vec![Content::Text {
+                        text: "streamed failure details".into(),
+                    }],
+                    is_error: true,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        let stderr = frontend.output().stderr_str();
+        assert_eq!(stderr.matches("streamed failure details").count(), 1);
+        assert!(stderr.contains("❌ bash error"));
+    }
+
+    #[test]
+    fn streamed_timeout_and_abort_render_status_without_repeating_content() {
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        frontend
+            .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+            .unwrap();
+        for (id, content, timed_out, aborted) in [
+            ("tc_timeout", "timeout details", true, false),
+            ("tc_abort", "abort details", false, true),
+        ] {
+            frontend
+                .handle_event(&AgentEvent::ToolStarted {
+                    run_id: RunId::new(1),
+                    tool_call_id: id.into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .unwrap();
+            frontend
+                .handle_event(&AgentEvent::ToolOutput {
+                    run_id: RunId::new(1),
+                    tool_call_id: id.into(),
+                    stream: ToolOutputStream::Stderr,
+                    chunk: format!("{content}\n"),
+                })
+                .unwrap();
+            frontend
+                .handle_event(&AgentEvent::ToolFinished {
+                    run_id: RunId::new(1),
+                    tool_call_id: id.into(),
+                    name: "bash".into(),
+                    result: AgentToolResult {
+                        content: vec![Content::Text { text: content.into() }],
+                        is_error: true,
+                        timed_out,
+                        aborted,
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+        }
+
+        let stderr = frontend.output().stderr_str();
+        assert_eq!(stderr.matches("timeout details").count(), 1);
+        assert_eq!(stderr.matches("abort details").count(), 1);
+        assert_eq!(stderr.matches("timed out").count(), 1);
+        assert_eq!(stderr.matches("aborted").count(), 1);
+    }
+
+    #[test]
+    fn tool_finished_summary_truncates_unicode_safely() {
+        let cases = [
+            "这是一个很长的中文工具输出，用来验证摘要不会在 UTF-8 字节中间截断".repeat(4),
+            "😀😃😄😁😆😅😂🤣😊😇".repeat(10),
+            "ASCII 混合文本 😀 with multibyte characters".repeat(3),
+        ];
+        for text in cases {
+            let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+            frontend
+                .handle_event(&AgentEvent::RunStarted { run_id: RunId::new(1) })
+                .unwrap();
+            frontend
+                .handle_event(&AgentEvent::ToolFinished {
+                    run_id: RunId::new(1),
+                    tool_call_id: "tc_unicode".into(),
+                    name: "read".into(),
+                    result: AgentToolResult {
+                        content: vec![Content::Text { text }],
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+            let stderr = frontend.output().stderr_str();
+            let summary = stderr.lines().last().unwrap_or_default();
+            assert!(summary.chars().count() <= 80 + "  ✅ read: ".chars().count());
+            assert!(std::str::from_utf8(&frontend.output().stderr).is_ok());
+        }
+    }
+
+    #[test]
+    fn truncate_chars_handles_boundaries_and_multibyte_text() {
+        assert_eq!(truncate_chars("short", 80).as_ref(), "short");
+        assert_eq!(truncate_chars("exact", 5).as_ref(), "exact");
+        assert_eq!(truncate_chars("abcdef", 6).as_ref(), "abcdef");
+        assert_eq!(truncate_chars("abcdefg", 6).as_ref(), "abc...");
+        assert_eq!(truncate_chars(&"界".repeat(100), 80).chars().count(), 80);
+        assert_eq!(truncate_chars(&"😀".repeat(100), 80).chars().count(), 80);
+        assert!(truncate_chars(&"😀".repeat(100), 80).ends_with("..."));
+    }
+
     // ── Integration tests: MockProvider → Agent → AgentEvent → drive_print_run → MemoryOutput ──
 
     #[tokio::test]
@@ -1047,7 +1325,7 @@ mod tests {
 
         let outcome = drive_print_run(&mut agent, "hi", &mut frontend, token).await;
 
-        assert!(matches!(outcome, PrintRunOutcome::Finished(_)));
+        assert!(matches!(outcome, Ok(PrintRunOutcome::Finished(_))));
         assert_eq!(frontend.output().stdout_str().trim_end(), "Hello from integration test");
         assert!(frontend.output().stderr.is_empty());
     }
@@ -1122,7 +1400,7 @@ mod tests {
 
         let outcome = drive_print_run(&mut agent, "echo hello", &mut frontend, token).await;
 
-        assert!(matches!(outcome, PrintRunOutcome::Finished(_)));
+        assert!(matches!(outcome, Ok(PrintRunOutcome::Finished(_))));
         // TextDelta goes to stdout
         assert!(frontend.output().stdout_str().contains("Done"));
         // ToolStarted goes to stderr
@@ -1149,9 +1427,74 @@ mod tests {
 
         let outcome = drive_print_run(&mut agent, "trigger error", &mut frontend, token).await;
 
-        assert!(matches!(outcome, PrintRunOutcome::Finished(_)));
+        assert!(matches!(outcome, Ok(PrintRunOutcome::Finished(_))));
         assert!(frontend.output().stderr_str().contains("Provider error"));
         assert!(frontend.output().stderr_str().contains("API error"));
+    }
+
+    #[tokio::test]
+    async fn output_failure_cancels_and_settles_agent_before_returning_error() {
+        use crate::agent::engine::Agent;
+        use crate::ai::providers::{Model, ProviderApi, ProviderRequestContext, ProviderStream};
+        use crate::ai::stream::StreamEvent;
+        use crate::ai::types::{AgentMessage, Tool};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CleanupProvider {
+            settled: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl ProviderApi for CleanupProvider {
+            async fn stream(
+                &self,
+                _model: &Model,
+                _messages: &[AgentMessage],
+                _tools: &[&dyn Tool],
+                _system_prompt: Option<&str>,
+                context: ProviderRequestContext,
+            ) -> anyhow::Result<ProviderStream> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let cancellation = context.cancellation.child_token();
+                let worker_cancellation = cancellation.clone();
+                let settled = self.settled.clone();
+                let worker = tokio::spawn(async move {
+                    let _ = tx
+                        .send(StreamEvent::TextDelta {
+                            delta: "this write fails".into(),
+                        })
+                        .await;
+                    worker_cancellation.cancelled().await;
+                    settled.store(true, Ordering::SeqCst);
+                });
+                Ok(ProviderStream::new(rx, worker, cancellation))
+            }
+        }
+
+        let settled = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new(
+            Box::new(CleanupProvider {
+                settled: settled.clone(),
+            }),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+        );
+        let token = CancellationToken::new();
+        let mut frontend = PrintFrontend::with_output(FailingOutput);
+
+        let error = drive_print_run(&mut agent, "fail output", &mut frontend, token.clone())
+            .await
+            .expect_err("frontend I/O failure must be returned");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(token.is_cancelled());
+        assert!(
+            settled.load(Ordering::SeqCst),
+            "provider producer must settle before return"
+        );
     }
 
     #[tokio::test]
@@ -1175,7 +1518,7 @@ mod tests {
 
         let outcome = drive_print_run(&mut agent, "cancel me", &mut frontend, token).await;
 
-        assert!(matches!(outcome, PrintRunOutcome::Aborted));
+        assert!(matches!(outcome, Ok(PrintRunOutcome::Aborted)));
         assert!(frontend.output().stderr_str().contains("aborted"));
     }
 
@@ -1196,7 +1539,7 @@ mod tests {
         );
         let token1 = CancellationToken::new();
         let outcome1 = drive_print_run(&mut agent1, "first", &mut frontend, token1).await;
-        assert!(matches!(outcome1, PrintRunOutcome::Finished(_)));
+        assert!(matches!(outcome1, Ok(PrintRunOutcome::Finished(_))));
         let stdout1 = frontend.output().stdout_str();
         assert!(stdout1.contains("first response"));
 
@@ -1211,7 +1554,7 @@ mod tests {
         );
         let token2 = CancellationToken::new();
         let outcome2 = drive_print_run(&mut agent2, "second", &mut frontend, token2).await;
-        assert!(matches!(outcome2, PrintRunOutcome::Finished(_)));
+        assert!(matches!(outcome2, Ok(PrintRunOutcome::Finished(_))));
         let stdout2 = frontend.output().stdout_str();
         assert!(stdout2.contains("second response"));
         // First response must not leak into second run's output
@@ -1236,7 +1579,7 @@ mod tests {
         let token1 = CancellationToken::new();
         token1.cancel();
         let outcome1 = drive_print_run(&mut agent1, "cancel me", &mut frontend, token1).await;
-        assert!(matches!(outcome1, PrintRunOutcome::Aborted));
+        assert!(matches!(outcome1, Ok(PrintRunOutcome::Aborted)));
 
         // Second run should succeed
         let mut agent2 = Agent::new(
@@ -1248,7 +1591,7 @@ mod tests {
         );
         let token2 = CancellationToken::new();
         let outcome2 = drive_print_run(&mut agent2, "go", &mut frontend, token2).await;
-        assert!(matches!(outcome2, PrintRunOutcome::Finished(_)));
+        assert!(matches!(outcome2, Ok(PrintRunOutcome::Finished(_))));
         assert!(frontend.output().stdout_str().contains("recovered"));
     }
 }
