@@ -104,7 +104,7 @@ Single-context repo. See `docs/agents/domain.md`.
 
 **防范**：spawn 子进程的工具一律用 `std::process::Command`，不用 `tokio::process::Command`。
 
-### 4. 测试卡住时如何诊断
+### 5. 测试卡住时如何诊断
 
 ```bash
 # 查看进程树
@@ -118,3 +118,29 @@ ps -eo pid,ppid,stat,comm | grep Z
 ```
 
 如果看到大量 `futex_wait_queue`（等锁）或 `do_epoll_wait`（等 I/O），且有僵尸子进程，很可能是上述问题 1 或 2。
+
+## Architecture Decisions
+
+### AgentEvent + RunId 隔离
+
+每个 `AgentEvent` 都携带 `run_id: RunId`（单调递增 u64）。TUI 根据 `current_run_id` 过滤事件，防止旧 run 的迟到事件污染新 run 的 transcript。
+
+### ToolExecutionContext 替代 configure_streaming
+
+工具不再通过 `configure_streaming()` 共享 sender。每次执行接收独立的 `ToolExecutionContext`，包含：
+- `output_tx: mpsc::Sender<ToolOutputEvent>` — 流式输出通道
+- `cancellation: CancellationToken` — 取消信号
+
+这样同一工具实例可以安全地并发执行。
+
+### CancellationToken 直接传递
+
+取消信号通过 `CancellationToken` 树直接传递。不再使用 watch channel 转发。工具内部通过 `tokio::select!` 直接等待 `context.cancellation.cancelled()`。
+
+### ActivityState + RunOutcome 分离
+
+TUI 状态模型分为：
+- `ActivityState`：当前活动（Idle / Running / Cancelling）
+- `RunOutcome`：上一轮结果（Completed / Aborted / ProviderError / ToolError）
+
+这样 `RunAborted` 事件不会被立即覆盖为 `Idle`，UI 可以观察到 aborted 状态。

@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::agent::engine::Agent;
-    use crate::agent::events::AgentEvent;
+    use crate::agent::events::{AgentEvent, RunId};
     use crate::agent::types::{AgentTool, AgentToolResult};
     use crate::ai::mock::{MockProvider, MockStep, MultiToolCallProvider};
     use crate::ai::providers::Model;
@@ -17,6 +17,8 @@ mod tests {
             api: "mock",
         }
     }
+
+    use crate::agent::types::ToolExecutionContext;
 
     struct EchoTool;
 
@@ -45,7 +47,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             params: serde_json::Value,
-            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+            _context: ToolExecutionContext,
         ) -> anyhow::Result<AgentToolResult> {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
             Ok(AgentToolResult {
@@ -80,7 +82,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             _params: serde_json::Value,
-            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+            _context: ToolExecutionContext,
         ) -> anyhow::Result<AgentToolResult> {
             Ok(AgentToolResult {
                 content: vec![Content::Text {
@@ -119,7 +121,7 @@ mod tests {
         let events = collect_events(&mut agent, "Hi").await;
 
         assert!(!events.is_empty());
-        assert!(matches!(&events[0], AgentEvent::RunStarted));
+        assert!(matches!(&events[0], AgentEvent::RunStarted { .. }));
 
         // Should have at least one TextDelta
         let text_deltas: Vec<&AgentEvent> = events
@@ -131,7 +133,7 @@ mod tests {
         // Last event should be RunFinished with Stop
         let last = events.last().unwrap();
         match last {
-            AgentEvent::RunFinished { stop_reason } => {
+            AgentEvent::RunFinished { stop_reason, .. } => {
                 assert_eq!(*stop_reason, StopReason::Stop);
             }
             _ => panic!("Expected RunFinished, got: {:?}", last),
@@ -156,13 +158,13 @@ mod tests {
 
         let events = collect_events(&mut agent, "echo hello").await;
 
-        assert!(matches!(&events[0], AgentEvent::RunStarted));
+        assert!(matches!(&events[0], AgentEvent::RunStarted { .. }));
 
         let tool_started = events.iter().find(|e| matches!(e, AgentEvent::ToolStarted { .. }));
         assert!(tool_started.is_some(), "Should have ToolStarted");
         match tool_started.unwrap() {
-            AgentEvent::ToolStarted { id, name, .. } => {
-                assert_eq!(id, "tc_1");
+            AgentEvent::ToolStarted { tool_call_id, name, .. } => {
+                assert_eq!(tool_call_id, "tc_1");
                 assert_eq!(name, "echo");
             }
             _ => unreachable!(),
@@ -171,8 +173,13 @@ mod tests {
         let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
         assert!(tool_finished.is_some(), "Should have ToolFinished");
         match tool_finished.unwrap() {
-            AgentEvent::ToolFinished { id, name, result } => {
-                assert_eq!(id, "tc_1");
+            AgentEvent::ToolFinished {
+                tool_call_id,
+                name,
+                result,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "tc_1");
                 assert_eq!(name, "echo");
                 assert!(!result.is_error);
             }
@@ -224,7 +231,7 @@ mod tests {
         let ids: Vec<&str> = tool_started
             .iter()
             .map(|e| match e {
-                AgentEvent::ToolStarted { id, .. } => id.as_str(),
+                AgentEvent::ToolStarted { tool_call_id, .. } => tool_call_id.as_str(),
                 _ => unreachable!(),
             })
             .collect();
@@ -241,14 +248,14 @@ mod tests {
 
         let events = collect_events(&mut agent, "trigger error").await;
 
-        assert!(matches!(&events[0], AgentEvent::RunStarted));
+        assert!(matches!(&events[0], AgentEvent::RunStarted { .. }));
 
         let provider_error = events.iter().find(|e| matches!(e, AgentEvent::ProviderError { .. }));
         assert!(provider_error.is_some(), "Should have ProviderError event");
 
         let last = events.last().unwrap();
         match last {
-            AgentEvent::RunFinished { stop_reason } => {
+            AgentEvent::RunFinished { stop_reason, .. } => {
                 assert_eq!(*stop_reason, StopReason::Error);
             }
             _ => panic!("Expected RunFinished with Error, got: {:?}", last),
@@ -276,8 +283,13 @@ mod tests {
         let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
         assert!(tool_finished.is_some());
         match tool_finished.unwrap() {
-            AgentEvent::ToolFinished { id, name, result } => {
-                assert_eq!(id, "tc_fail");
+            AgentEvent::ToolFinished {
+                tool_call_id,
+                name,
+                result,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "tc_fail");
                 assert_eq!(name, "fail");
                 assert!(result.is_error);
             }
@@ -299,14 +311,15 @@ mod tests {
 
         let events = collect_events(&mut agent, "cancel me").await;
 
-        assert!(matches!(&events[0], AgentEvent::RunStarted));
+        assert!(matches!(&events[0], AgentEvent::RunStarted { .. }));
         let last = events.last().unwrap();
         assert!(
             matches!(
                 last,
-                AgentEvent::RunAborted
+                AgentEvent::RunAborted { .. }
                     | AgentEvent::RunFinished {
-                        stop_reason: StopReason::Aborted
+                        stop_reason: StopReason::Aborted,
+                        ..
                     }
             ),
             "Expected RunAborted or RunFinished(Aborted), got: {:?}",
@@ -338,8 +351,13 @@ mod tests {
         let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
         assert!(tool_finished.is_some());
         match tool_finished.unwrap() {
-            AgentEvent::ToolFinished { id, name, result } => {
-                assert_eq!(id, "tc_timeout");
+            AgentEvent::ToolFinished {
+                tool_call_id,
+                name,
+                result,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "tc_timeout");
                 assert_eq!(name, "bash");
                 assert!(result.is_error);
             }
@@ -377,8 +395,11 @@ mod tests {
 
         // All ToolOutput events should have the correct tool call ID
         for ev in &tool_outputs {
-            if let AgentEvent::ToolOutput { id, stream, .. } = ev {
-                assert_eq!(id, "tc_out1");
+            if let AgentEvent::ToolOutput {
+                tool_call_id, stream, ..
+            } = ev
+            {
+                assert_eq!(tool_call_id, "tc_out1");
                 assert_eq!(*stream, crate::agent::events::ToolOutputStream::Stdout);
             }
         }
@@ -510,11 +531,11 @@ mod tests {
 
         // Collect ToolOutput events and verify IDs don't cross
         for ev in &events {
-            if let AgentEvent::ToolOutput { id, .. } = ev {
+            if let AgentEvent::ToolOutput { tool_call_id, .. } = ev {
                 assert!(
-                    id == "tc_a" || id == "tc_b",
+                    tool_call_id == "tc_a" || tool_call_id == "tc_b",
                     "Tool ID should be tc_a or tc_b, got: {}",
-                    id
+                    tool_call_id
                 );
             }
         }
@@ -601,7 +622,7 @@ mod tests {
         assert!(
             matches!(
                 last,
-                AgentEvent::RunAborted | AgentEvent::ToolFinished { .. } | AgentEvent::RunFinished { .. }
+                AgentEvent::RunAborted { .. } | AgentEvent::ToolFinished { .. } | AgentEvent::RunFinished { .. }
             ),
             "Last event should be terminal: {:?}",
             last

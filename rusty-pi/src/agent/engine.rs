@@ -1,8 +1,8 @@
 //! Agent — the core loop that drives LLM ↔ tool interactions.
 
-use crate::agent::events::{AgentEvent, ProviderError};
+use crate::agent::events::{AgentEvent, ProviderError, RunId};
 use crate::agent::session::Session;
-use crate::agent::types::{AgentTool, AgentToolResult};
+use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionContext, ToolOutputEvent};
 use crate::ai::providers::{Model, ProviderApi};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{
@@ -60,6 +60,8 @@ pub struct Agent {
     abort: AbortFlag,
     /// Optional event sender for unified event stream.
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    /// Monotonic counter for generating RunIds.
+    run_counter: u64,
 }
 
 impl Agent {
@@ -78,6 +80,7 @@ impl Agent {
             on_tool_end: None,
             abort: CancellationToken::new(),
             event_tx: None,
+            run_counter: 0,
         }
     }
 
@@ -208,6 +211,10 @@ impl Agent {
     pub async fn run(&mut self, prompt: &str) -> Result<()> {
         let now = Self::now_ms();
 
+        // Generate a unique RunId for this run
+        self.run_counter += 1;
+        let run_id = RunId(self.run_counter);
+
         let user_msg = AgentMessage::User(UserMessage {
             content: MessageContent::Text(prompt.to_string()),
             timestamp: now,
@@ -222,7 +229,7 @@ impl Agent {
         let run_token = self.abort.child_token();
 
         // Emit RunStarted
-        self.emit(AgentEvent::RunStarted).await;
+        self.emit(AgentEvent::RunStarted { run_id }).await;
 
         for round in 0..=self.config.max_tool_rounds {
             let tool_refs = self.tool_refs();
@@ -260,7 +267,7 @@ impl Agent {
                     .append_message(AgentMessage::Assistant(msg))
                     .await
                     .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
-                self.emit(AgentEvent::RunAborted).await;
+                self.emit(AgentEvent::RunAborted { run_id }).await;
                 return Ok(());
             }
 
@@ -273,7 +280,11 @@ impl Agent {
                 // Fire streaming callback for text deltas
                 if let StreamEvent::TextDelta { ref delta } = event {
                     // Emit through event channel
-                    self.emit(AgentEvent::TextDelta { text: delta.clone() }).await;
+                    self.emit(AgentEvent::TextDelta {
+                        run_id,
+                        text: delta.clone(),
+                    })
+                    .await;
 
                     // Also fire legacy callback
                     if let Some(ref mut cb) = self.on_text {
@@ -305,7 +316,7 @@ impl Agent {
                     .append_message(AgentMessage::Assistant(msg))
                     .await
                     .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
-                self.emit(AgentEvent::RunAborted).await;
+                self.emit(AgentEvent::RunAborted { run_id }).await;
                 return Ok(());
             }
 
@@ -315,6 +326,7 @@ impl Agent {
             if response.stop_reason == StopReason::Error {
                 if let Some(err_msg) = &response.error_message {
                     self.emit(AgentEvent::ProviderError {
+                        run_id,
                         error: ProviderError {
                             reason: StopReason::Error,
                             message: err_msg.clone(),
@@ -360,6 +372,7 @@ impl Agent {
             match response.stop_reason {
                 StopReason::Stop | StopReason::Length | StopReason::Error | StopReason::Aborted => {
                     self.emit(AgentEvent::RunFinished {
+                        run_id,
                         stop_reason: response.stop_reason,
                     })
                     .await;
@@ -374,14 +387,15 @@ impl Agent {
                     for call in &tool_calls {
                         // Emit ToolStarted
                         self.emit(AgentEvent::ToolStarted {
-                            id: call.id.clone(),
+                            run_id,
+                            tool_call_id: call.id.clone(),
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
                         })
                         .await;
 
                         let (tool_result, terminate) = self
-                            .execute_tool(&call.id, &call.name, call.arguments.clone(), &run_token)
+                            .execute_tool(run_id, &call.id, &call.name, call.arguments.clone(), &run_token)
                             .await
                             .with_context(|| format!("Tool '{}' execution failed", call.name))?;
 
@@ -405,7 +419,8 @@ impl Agent {
                             _ => AgentToolResult::default(),
                         };
                         self.emit(AgentEvent::ToolFinished {
-                            id: call.id.clone(),
+                            run_id,
+                            tool_call_id: call.id.clone(),
                             name: call.name.clone(),
                             result: result_for_event,
                         })
@@ -421,6 +436,7 @@ impl Agent {
                     }
                     if any_terminate {
                         self.emit(AgentEvent::RunFinished {
+                            run_id,
                             stop_reason: StopReason::Stop,
                         })
                         .await;
@@ -434,8 +450,15 @@ impl Agent {
     }
 
     /// Execute a tool and return (AgentMessage, terminate_flag).
+    ///
+    /// Creates a per-execution [`ToolExecutionContext`] with:
+    /// - A child token of `run_token` for direct cancellation.
+    /// - An independent output channel for streaming chunks.
+    ///
+    /// ToolOutput events are forwarded to the agent's event channel.
     async fn execute_tool(
         &self,
+        run_id: RunId,
         tool_call_id: &str,
         tool_name: &str,
         args: serde_json::Value,
@@ -455,28 +478,40 @@ impl Agent {
 
         let start_ms = Self::now_ms();
 
-        // Create a watch channel to relay cancellation to the tool.
-        // The tool uses this to detect when it should stop early.
-        let (signal_tx, signal_rx) = tokio::sync::watch::channel(false);
-        let token = run_token.clone();
-        let signal_handle = tokio::spawn(async move {
-            // Wait for cancellation and relay it through the watch channel.
-            token.cancelled().await;
-            let _ = signal_tx.send(true);
+        // Create a per-execution context with its own cancellation token and output channel.
+        let tool_token = run_token.child_token();
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<ToolOutputEvent>(256);
+        let context = ToolExecutionContext {
+            output_tx,
+            cancellation: tool_token,
+        };
+
+        // Spawn a task to forward ToolOutput events to the agent's event channel.
+        let event_tx_clone = self.event_tx.clone();
+        let fwd_tool_call_id = tool_call_id.to_string();
+        let fwd_run_id = run_id;
+        let forwarder = tokio::spawn(async move {
+            while let Some(evt) = output_rx.recv().await {
+                if let Some(ref tx) = event_tx_clone {
+                    let _ = tx
+                        .send(AgentEvent::ToolOutput {
+                            run_id: fwd_run_id,
+                            tool_call_id: fwd_tool_call_id.clone(),
+                            stream: evt.stream,
+                            chunk: evt.chunk,
+                        })
+                        .await;
+                }
+            }
         });
 
-        // Configure streaming output for tools that support it
-        if let Some(ref tx) = self.event_tx {
-            tool.configure_streaming(tx.clone());
-        }
-
         let result = tool
-            .execute(tool_call_id, args, Some(signal_rx))
+            .execute(tool_call_id, args, context)
             .await
             .with_context(|| format!("Tool '{}' execution failed", tool_name))?;
 
-        // Abort the signal relay task since the tool has finished.
-        signal_handle.abort();
+        // Wait for the forwarder to finish draining output events.
+        let _ = forwarder.await;
 
         let end_ms = Self::now_ms();
         let duration_ms = (end_ms - start_ms) as u64;
@@ -568,7 +603,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             params: serde_json::Value,
-            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+            _context: ToolExecutionContext,
         ) -> anyhow::Result<AgentToolResult> {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
             Ok(AgentToolResult {
@@ -782,7 +817,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             _params: serde_json::Value,
-            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+            _context: ToolExecutionContext,
         ) -> anyhow::Result<AgentToolResult> {
             Ok(AgentToolResult {
                 content: vec![Content::Text { text: "done".into() }],
@@ -953,7 +988,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             params: serde_json::Value,
-            signal: Option<tokio::sync::watch::Receiver<bool>>,
+            context: ToolExecutionContext,
         ) -> anyhow::Result<AgentToolResult> {
             let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
             match action {
@@ -978,10 +1013,8 @@ mod tests {
                     ..Default::default()
                 }),
                 "abort" => {
-                    // Check if already aborted
-                    if let Some(rx) = &signal
-                        && *rx.borrow()
-                    {
+                    // Check if already aborted via context token
+                    if context.cancellation.is_cancelled() {
                         return Ok(AgentToolResult {
                             content: vec![Content::Text { text: "aborted".into() }],
                             is_error: true,
@@ -1344,7 +1377,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             params: serde_json::Value,
-            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+            _context: ToolExecutionContext,
         ) -> anyhow::Result<AgentToolResult> {
             let kind = params.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             match kind {

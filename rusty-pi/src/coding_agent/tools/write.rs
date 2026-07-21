@@ -4,7 +4,7 @@
 //! Creates parent directories, handles abort signals, and serializes writes
 //! to the same file path via a mutation queue.
 
-use crate::agent::types::{AgentTool, AgentToolResult};
+use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionContext};
 use crate::ai::types::{Content, Tool};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -113,20 +113,19 @@ impl AgentTool for WriteTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        signal: Option<tokio::sync::watch::Receiver<bool>>,
+        _context: ToolExecutionContext,
     ) -> anyhow::Result<AgentToolResult> {
         let write_params: WriteParams =
             serde_json::from_value(params).map_err(|e| anyhow::anyhow!("Invalid write parameters: {}", e))?;
 
         let absolute_path = resolve_to_cwd(&write_params.path, &self.cwd());
         let path = Path::new(&absolute_path);
+        let cancellation = _context.cancellation.clone();
 
         // Use the mutation queue to serialize writes to this file
         with_file_mutation_queue(&absolute_path, || async {
             // Check abort
-            if let Some(rx) = &signal
-                && *rx.borrow()
-            {
+            if cancellation.is_cancelled() {
                 return Ok(AgentToolResult {
                     content: vec![Content::Text {
                         text: "Operation aborted".into(),
@@ -144,9 +143,7 @@ impl AgentTool for WriteTool {
             }
 
             // Check abort after IO
-            if let Some(rx) = &signal
-                && *rx.borrow()
-            {
+            if cancellation.is_cancelled() {
                 return Ok(AgentToolResult {
                     content: vec![Content::Text {
                         text: "Operation aborted".into(),
@@ -180,8 +177,18 @@ impl AgentTool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::types::ToolExecutionContext;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
+    use tokio_util::sync::CancellationToken;
+
+    fn make_context() -> ToolExecutionContext {
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(1);
+        ToolExecutionContext {
+            output_tx,
+            cancellation: CancellationToken::new(),
+        }
+    }
 
     /// Create a WriteTool with a temp directory as cwd.
     async fn tool_and_temp() -> (WriteTool, Arc<TokioMutex<tempfile::TempDir>>) {
@@ -201,7 +208,7 @@ mod tests {
             .execute(
                 "c1",
                 serde_json::json!({"path": "test.txt", "content": "hello world"}),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -234,7 +241,7 @@ mod tests {
             .execute(
                 "c2",
                 serde_json::json!({"path": "existing.txt", "content": "new content"}),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -259,7 +266,7 @@ mod tests {
             .execute(
                 "c3",
                 serde_json::json!({"path": "sub/dir/nested/file.txt", "content": "nested"}),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -281,7 +288,12 @@ mod tests {
     async fn write_abort() {
         let (tool, tmp) = tool_and_temp().await;
         let _dir = tmp.lock().await.path().to_string_lossy().to_string();
-        let (tx, rx) = tokio::sync::watch::channel(false);
+        let cancellation = CancellationToken::new();
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = ToolExecutionContext {
+            output_tx,
+            cancellation: cancellation.clone(),
+        };
         let tool_instance = tool;
 
         let handle = tokio::spawn(async move {
@@ -289,12 +301,12 @@ mod tests {
                 .execute(
                     "c4",
                     serde_json::json!({"path": "aborted.txt", "content": "should not appear"}),
-                    Some(rx),
+                    ctx,
                 )
                 .await
         });
 
-        tx.send(true).ok();
+        cancellation.cancel();
 
         let result = handle.await.unwrap().unwrap();
         let text = match &result.content[0] {

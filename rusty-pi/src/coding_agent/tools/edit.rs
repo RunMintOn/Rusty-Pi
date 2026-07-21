@@ -3,7 +3,7 @@
 //! Mirrors the original `@earendil-works/pi-coding-agent/src/core/tools/edit.ts`
 //! and `edit-diff.ts`.
 
-use crate::agent::types::{AgentTool, AgentToolResult};
+use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionContext};
 use crate::ai::types::{Content, Tool};
 use crate::coding_agent::tools::write::with_file_mutation_queue;
 use async_trait::async_trait;
@@ -503,7 +503,7 @@ impl AgentTool for EditTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        signal: Option<tokio::sync::watch::Receiver<bool>>,
+        _context: ToolExecutionContext,
     ) -> anyhow::Result<AgentToolResult> {
         let edit_params: EditParams = prepare_edit_arguments(&params).map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -516,12 +516,11 @@ impl AgentTool for EditTool {
                 .to_string()
         };
         let path_buf = Path::new(&absolute_path).to_path_buf();
+        let cancellation = _context.cancellation.clone();
 
         with_file_mutation_queue(&absolute_path, || async {
             // Check abort
-            if let Some(rx) = &signal
-                && *rx.borrow()
-            {
+            if cancellation.is_cancelled() {
                 return Ok(AgentToolResult {
                     content: vec![Content::Text {
                         text: "Operation aborted".into(),
@@ -542,9 +541,7 @@ impl AgentTool for EditTool {
                 .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", edit_params.path, e))?;
 
             // Check abort after IO
-            if let Some(rx) = &signal
-                && *rx.borrow()
-            {
+            if cancellation.is_cancelled() {
                 return Ok(AgentToolResult {
                     content: vec![Content::Text {
                         text: "Operation aborted".into(),
@@ -600,8 +597,18 @@ impl AgentTool for EditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::types::ToolExecutionContext;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
+    use tokio_util::sync::CancellationToken;
+
+    fn make_context() -> ToolExecutionContext {
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(1);
+        ToolExecutionContext {
+            output_tx,
+            cancellation: CancellationToken::new(),
+        }
+    }
 
     async fn tool_and_temp() -> (EditTool, Arc<TokioMutex<tempfile::TempDir>>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -627,7 +634,7 @@ mod tests {
                     "path": "test.txt",
                     "edits": [{"oldText": "foo bar", "newText": "baz qux"}]
                 }),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -663,7 +670,7 @@ mod tests {
                         {"oldText": "line three", "newText": "changed three"}
                     ]
                 }),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -693,7 +700,7 @@ mod tests {
                     "path": "nope.txt",
                     "edits": [{"oldText": "nonexistent text", "newText": "replacement"}]
                 }),
-                None,
+                make_context(),
             )
             .await;
 
@@ -718,7 +725,7 @@ mod tests {
                     "path": "dup.txt",
                     "edits": [{"oldText": "repeat", "newText": "changed"}]
                 }),
-                None,
+                make_context(),
             )
             .await;
 
@@ -743,7 +750,7 @@ mod tests {
                     "path": "crlf.txt",
                     "edits": [{"oldText": "world", "newText": "mars"}]
                 }),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -778,7 +785,7 @@ mod tests {
                     "path": "bom.txt",
                     "edits": [{"oldText": "hello world", "newText": "goodbye"}]
                 }),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -811,7 +818,7 @@ mod tests {
                     "path": "fuzzy.txt",
                     "edits": [{"oldText": "it's fine", "newText": "it's changed"}]
                 }),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -844,7 +851,7 @@ mod tests {
                         {"oldText": "world fine", "newText": "earth"}
                     ]
                 }),
-                None,
+                make_context(),
             )
             .await;
 
@@ -858,7 +865,12 @@ mod tests {
     async fn edit_abort() {
         let (tool, tmp) = tool_and_temp().await;
         let _dir = tmp.lock().await.path().to_string_lossy().to_string();
-        let (tx, rx) = tokio::sync::watch::channel(false);
+        let cancellation = CancellationToken::new();
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = ToolExecutionContext {
+            output_tx,
+            cancellation: cancellation.clone(),
+        };
 
         let handle = tokio::spawn(async move {
             tool.execute(
@@ -867,12 +879,12 @@ mod tests {
                     "path": "any.txt",
                     "edits": [{"oldText": "x", "newText": "y"}]
                 }),
-                Some(rx),
+                ctx,
             )
             .await
         });
 
-        tx.send(true).ok();
+        cancellation.cancel();
 
         let result = handle.await.unwrap().unwrap();
         let text = match &result.content[0] {
@@ -897,7 +909,7 @@ mod tests {
                     "path": "diff_test.txt",
                     "edits": [{"oldText": "BBB", "newText": "XXX"}]
                 }),
-                None,
+                make_context(),
             )
             .await
             .unwrap();

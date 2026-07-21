@@ -164,16 +164,43 @@ MockProvider → agent loop → bash tool (real) → result → MockProvider
 - 每个测试覆盖一个具体的场景（一个文本响应、一个 tool call、一次错误）
 - 使用 mock provider 的预设响应来覆盖正常流程、边界情况和错误路径
 
+## Current Scope
+
+### 已完成
+
+- Agent 核心 loop（LLM ↔ tool 交互）
+- 两个 LLM provider（OpenAI Codex、DeepSeek）
+- Bash tool（含并行安全、CWD 持久化、流式输出）
+- Read / Write / Edit tool
+- REPL 模式（支持 Ctrl+C 取消、多轮对话）
+- JSONL session 持久化
+- Prompt Templates & Skills 加载
+- System Prompt 构建（tools/guidelines/skills/context）
+- PrintFrontend（bare-terminal 事件消费层）
+- 最小 Ratatui TUI（transcript + input + status bar）
+- AgentEvent 事件边界（含 RunId 隔离、ToolExecutionContext）
+- CancellationToken 端到端传递
+- TestBackend 和 snapshot 测试
+- Slash commands（/help, /exit, /quit, /model, /context, /session, /tree, /list-sessions）
+
+### 当前非目标
+
+- 文件树 UI
+- 完整 Markdown 渲染
+- diff 编辑器
+- 主题系统
+- 鼠标交互
+- 图像预览
+- 插件 UI
+- 完整复刻 TypeScript TUI
+- PTY smoke test（需要 terminal 库支持，待后续补充）
+
 ## Out of Scope
 
-- 交互式 TUI（interactive mode + theme 系统）
 - 扩展系统（动态加载 extension）
-- ~~JSONL session 持久化（先内存 session）~~ ✅ 已完成
-- 非 bash 工具（read、write、edit、grep、find、ls）
 - 除 Codex 和 DeepSeek 外的其他 LLM providers（Anthropic、Google、Bedrock、Mistral 等）
 - Orchestrator（IPC 编排器）
 - Session compaction / summarization
-- Session 管理（/resume、/fork、/tree 等交互命令）
 
 ## Further Notes
 

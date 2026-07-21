@@ -28,19 +28,19 @@ impl PrintFrontend {
     /// Process a single agent event, writing appropriate output to the terminal.
     pub fn handle_event(&self, event: &AgentEvent) {
         match event {
-            AgentEvent::RunStarted => {
+            AgentEvent::RunStarted { .. } => {
                 // No output needed for run start
             }
-            AgentEvent::TextDelta { text } => {
+            AgentEvent::TextDelta { text, .. } => {
                 print!("{}", text);
                 let _ = io::stdout().flush();
             }
-            AgentEvent::ThinkingDelta { text } => {
+            AgentEvent::ThinkingDelta { text, .. } => {
                 // Thinking content goes to stderr (not mixed with response)
                 eprint!("[thinking] {}", text);
                 let _ = io::stderr().flush();
             }
-            AgentEvent::ToolStarted { id: _, name, arguments } => {
+            AgentEvent::ToolStarted { name, arguments, .. } => {
                 if self.verbose {
                     let args_str = if arguments.is_object() && arguments.as_object().unwrap().is_empty() {
                         String::new()
@@ -53,7 +53,7 @@ impl PrintFrontend {
                 }
                 let _ = io::stdout().flush();
             }
-            AgentEvent::ToolOutput { id: _, stream, chunk } => {
+            AgentEvent::ToolOutput { stream, chunk, .. } => {
                 match stream {
                     ToolOutputStream::Stdout => {
                         print!("{}", chunk);
@@ -65,18 +65,18 @@ impl PrintFrontend {
                 let _ = io::stdout().flush();
                 let _ = io::stderr().flush();
             }
-            AgentEvent::ToolFinished { id: _, name: _, result } => {
+            AgentEvent::ToolFinished { result, .. } => {
                 self.print_tool_result(result);
             }
-            AgentEvent::ProviderError { error } => {
+            AgentEvent::ProviderError { error, .. } => {
                 eprintln!("\n❌ Provider error: {}", error.message);
                 let _ = io::stderr().flush();
             }
-            AgentEvent::RunAborted => {
+            AgentEvent::RunAborted { .. } => {
                 eprintln!("\n⏹ Run aborted");
                 let _ = io::stderr().flush();
             }
-            AgentEvent::RunFinished { stop_reason } => {
+            AgentEvent::RunFinished { stop_reason, .. } => {
                 match stop_reason {
                     StopReason::Stop => {
                         // Normal completion, no extra output
@@ -174,16 +174,22 @@ mod tests {
 
     #[test]
     fn print_frontend_handles_text_delta() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         // Just verify it doesn't panic
-        frontend.handle_event(&AgentEvent::TextDelta { text: "hello".into() });
+        frontend.handle_event(&AgentEvent::TextDelta {
+            run_id: RunId(1),
+            text: "hello".into(),
+        });
     }
 
     #[test]
     fn print_frontend_handles_tool_started() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolStarted {
-            id: "tc_1".into(),
+            run_id: RunId(1),
+            tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
         });
@@ -191,9 +197,11 @@ mod tests {
 
     #[test]
     fn print_frontend_handles_tool_finished_ok() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolFinished {
-            id: "tc_1".into(),
+            run_id: RunId(1),
+            tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: AgentToolResult {
                 content: vec![Content::Text {
@@ -206,9 +214,11 @@ mod tests {
 
     #[test]
     fn print_frontend_handles_tool_finished_error() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolFinished {
-            id: "tc_1".into(),
+            run_id: RunId(1),
+            tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: AgentToolResult {
                 content: vec![Content::Text {
@@ -223,8 +233,10 @@ mod tests {
 
     #[test]
     fn print_frontend_handles_provider_error() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ProviderError {
+            run_id: RunId(1),
             error: ProviderError {
                 reason: StopReason::Error,
                 message: "API limit exceeded".into(),
@@ -234,28 +246,34 @@ mod tests {
 
     #[test]
     fn print_frontend_handles_run_aborted() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
-        frontend.handle_event(&AgentEvent::RunAborted);
+        frontend.handle_event(&AgentEvent::RunAborted { run_id: RunId(1) });
     }
 
     #[test]
     fn print_frontend_handles_run_finished() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::RunFinished {
+            run_id: RunId(1),
             stop_reason: StopReason::Stop,
         });
     }
 
     #[test]
     fn print_frontend_non_verbose_hides_details() {
+        use crate::agent::events::RunId;
         let frontend = PrintFrontend::with_verbose(false);
         frontend.handle_event(&AgentEvent::ToolStarted {
-            id: "tc_1".into(),
+            run_id: RunId(1),
+            tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
         });
         frontend.handle_event(&AgentEvent::ToolFinished {
-            id: "tc_1".into(),
+            run_id: RunId(1),
+            tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: AgentToolResult {
                 content: vec![Content::Text {

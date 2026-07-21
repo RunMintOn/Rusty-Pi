@@ -206,12 +206,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_cwd = Arc::new(RwLock::new(cwd.clone()));
 
-    let mut bash_tool = BashTool::new(shared_cwd.clone());
-    bash_tool.on_output(|chunk| {
-        use std::io::Write;
-        let _ = write!(std::io::stdout(), "{}", chunk);
-        let _ = std::io::stdout().flush();
-    });
+    let bash_tool = BashTool::new(shared_cwd.clone());
     let read_tool = ReadTool::new(shared_cwd.clone());
     let write_tool = WriteTool::new(shared_cwd.clone());
     let edit_tool = EditTool::new(shared_cwd.clone());

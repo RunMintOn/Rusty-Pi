@@ -5,7 +5,7 @@
 //! On macOS, applies NFD / AM-PM / curly-quote path fallbacks for files
 //! whose user-typed path doesn't match the filesystem's decomposed form.
 
-use crate::agent::types::{AgentTool, AgentToolResult};
+use crate::agent::types::{AgentTool, AgentToolResult, ToolExecutionContext};
 use crate::ai::types::{Content, Tool};
 use crate::coding_agent::tools::mime::detect_image_mime_type_from_file;
 use crate::coding_agent::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncate_head};
@@ -177,15 +177,13 @@ impl AgentTool for ReadTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        signal: Option<tokio::sync::watch::Receiver<bool>>,
+        _context: ToolExecutionContext,
     ) -> anyhow::Result<AgentToolResult> {
         let read_params: ReadParams =
             serde_json::from_value(params).map_err(|e| anyhow::anyhow!("Invalid read parameters: {}", e))?;
 
         // Check abort signal
-        if let Some(rx) = &signal
-            && *rx.borrow()
-        {
+        if _context.cancellation.is_cancelled() {
             return Ok(AgentToolResult {
                 content: vec![Content::Text {
                     text: "Operation aborted".into(),
@@ -206,9 +204,7 @@ impl AgentTool for ReadTool {
         }
 
         // Check abort after IO
-        if let Some(rx) = &signal
-            && *rx.borrow()
-        {
+        if _context.cancellation.is_cancelled() {
             return Ok(AgentToolResult {
                 content: vec![Content::Text {
                     text: "Operation aborted".into(),
@@ -319,6 +315,16 @@ impl AgentTool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::types::ToolExecutionContext;
+    use tokio_util::sync::CancellationToken;
+
+    fn make_context() -> ToolExecutionContext {
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(1);
+        ToolExecutionContext {
+            output_tx,
+            cancellation: CancellationToken::new(),
+        }
+    }
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -341,7 +347,7 @@ mod tests {
             .execute(
                 "c1",
                 serde_json::json!({"path": "src/coding_agent/tools/read.rs"}),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -359,7 +365,7 @@ mod tests {
             .execute(
                 "c2",
                 serde_json::json!({"path": "src/coding_agent/tools/read.rs", "offset": 1}),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -376,7 +382,7 @@ mod tests {
             .execute(
                 "c3",
                 serde_json::json!({"path": "src/coding_agent/tools/read.rs", "offset": 1, "limit": 5}),
-                None,
+                make_context(),
             )
             .await
             .unwrap();
@@ -396,7 +402,11 @@ mod tests {
     #[tokio::test]
     async fn read_file_not_found() {
         let result = tool()
-            .execute("c4", serde_json::json!({"path": "nonexistent_file.txt"}), None)
+            .execute(
+                "c4",
+                serde_json::json!({"path": "nonexistent_file.txt"}),
+                make_context(),
+            )
             .await;
         assert!(result.is_err(), "Should error on nonexistent file");
     }
@@ -407,7 +417,7 @@ mod tests {
             .execute(
                 "c5",
                 serde_json::json!({"path": "src/coding_agent/tools/read.rs", "offset": 999999}),
-                None,
+                make_context(),
             )
             .await;
         assert!(result.is_err(), "Should error on offset beyond end of file");
@@ -415,20 +425,21 @@ mod tests {
 
     #[tokio::test]
     async fn read_abort() {
-        let (tx, rx) = tokio::sync::watch::channel(false);
+        let cancellation = CancellationToken::new();
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = ToolExecutionContext {
+            output_tx,
+            cancellation: cancellation.clone(),
+        };
         let tool_instance = tool();
 
         let handle = tokio::spawn(async move {
             tool_instance
-                .execute(
-                    "c6",
-                    serde_json::json!({"path": "src/coding_agent/tools/read.rs"}),
-                    Some(rx),
-                )
+                .execute("c6", serde_json::json!({"path": "src/coding_agent/tools/read.rs"}), ctx)
                 .await
         });
 
-        tx.send(true).ok();
+        cancellation.cancel();
 
         let result = handle.await.unwrap().unwrap();
         let text = match &result.content[0] {
@@ -464,7 +475,7 @@ mod tests {
         tokio::fs::write(&file_path, &png_bytes).await.unwrap();
 
         let result = tool
-            .execute("c_img", serde_json::json!({"path": "test.png"}), None)
+            .execute("c_img", serde_json::json!({"path": "test.png"}), make_context())
             .await
             .unwrap();
 
@@ -519,7 +530,7 @@ mod tests {
         tokio::fs::write(&file_path, &jpeg_bytes).await.unwrap();
 
         let result = tool
-            .execute("c_jpg", serde_json::json!({"path": "test.jpg"}), None)
+            .execute("c_jpg", serde_json::json!({"path": "test.jpg"}), make_context())
             .await
             .unwrap();
 
@@ -543,7 +554,7 @@ mod tests {
         tokio::fs::write(&file_path, "hello world\n").await.unwrap();
 
         let result = tool
-            .execute("c_txt", serde_json::json!({"path": "plain.txt"}), None)
+            .execute("c_txt", serde_json::json!({"path": "plain.txt"}), make_context())
             .await
             .unwrap();
 
@@ -608,7 +619,7 @@ mod tests {
 
         // Read using existing tool that resolves via cwd
         let result = tool
-            .execute("c_nfc", serde_json::json!({"path": &nfc_name}), None)
+            .execute("c_nfc", serde_json::json!({"path": &nfc_name}), make_context())
             .await
             .unwrap();
         let text = match &result.content[0] {

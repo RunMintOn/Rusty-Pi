@@ -2,11 +2,41 @@
 //!
 //! Mirrors `@earendil-works/pi-agent-core/src/types.ts`.
 
-use crate::agent::events::AgentEvent;
+use crate::agent::events::ToolOutputStream;
 use crate::ai::types::{Content, Tool};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+// ── ToolExecutionContext ────────────────────────────────────────────────────
+
+/// Per-execution context passed to [`AgentTool::execute`].
+///
+/// Each tool invocation receives its own context with:
+/// - An independent output channel for streaming chunks.
+/// - An independent cancellation token (child of the run token).
+///
+/// This replaces the old `configure_streaming()` pattern where a shared
+/// sender was stored on the tool instance, creating concurrency risks.
+#[derive(Debug)]
+pub struct ToolExecutionContext {
+    /// Send streaming output chunks (stdout/stderr) through this channel.
+    /// Tools that don't produce streaming output can ignore this.
+    pub output_tx: mpsc::Sender<ToolOutputEvent>,
+    /// Per-execution cancellation token. Cancelling this stops the tool.
+    /// This is a child of the run-level token.
+    pub cancellation: CancellationToken,
+}
+
+/// A streaming output chunk emitted by a tool during execution.
+#[derive(Debug, Clone)]
+pub struct ToolOutputEvent {
+    /// Which stream this chunk came from.
+    pub stream: ToolOutputStream,
+    /// The text content of this chunk.
+    pub chunk: String,
+}
 
 /// Execution mode for a tool — sequential or parallel.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -65,6 +95,11 @@ impl Default for AgentToolResult {
 ///
 /// Mirrors `AgentTool` in the original `@earendil-works/pi-agent-core/src/types.ts`.
 /// This extends the base `Tool` trait (schema-only) with execution capabilities.
+///
+/// Each invocation receives an independent [`ToolExecutionContext`], so:
+/// - The same tool instance can be executed concurrently without interference.
+/// - Streaming output goes through the context's channel, not shared state.
+/// - Cancellation is handled via the context's token, not a watch channel.
 #[async_trait]
 pub trait AgentTool: Tool + Send + Sync {
     /// Human-readable label for UI display.
@@ -77,22 +112,24 @@ pub trait AgentTool: Tool + Send + Sync {
     }
 
     /// Execute the tool call. Throw on failure instead of encoding errors in `content`.
+    ///
+    /// The `context` provides:
+    /// - `output_tx`: for streaming stdout/stderr chunks (optional — tools that
+    ///   don't stream can ignore it).
+    /// - `cancellation`: a token that is cancelled when the run is aborted.
+    ///   Check `context.cancellation.is_cancelled()` or use
+    ///   `tokio::select!` with `context.cancellation.cancelled()`.
     async fn execute(
         &self,
         tool_call_id: &str,
         params: serde_json::Value,
-        signal: Option<tokio::sync::watch::Receiver<bool>>,
+        context: ToolExecutionContext,
     ) -> anyhow::Result<AgentToolResult>;
 
     /// Per-tool execution mode override.
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Sequential
     }
-
-    /// Configure streaming output for this tool execution.
-    /// Called before `execute()` to set up the event channel for ToolOutput events.
-    /// Default implementation does nothing (tools that don't stream output).
-    fn configure_streaming(&self, _event_tx: mpsc::Sender<AgentEvent>) {}
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -133,7 +170,7 @@ mod tests {
             &self,
             _tool_call_id: &str,
             _params: serde_json::Value,
-            _signal: Option<tokio::sync::watch::Receiver<bool>>,
+            _context: ToolExecutionContext,
         ) -> anyhow::Result<AgentToolResult> {
             Ok(AgentToolResult {
                 content: vec![Content::Text { text: "ok".into() }],
@@ -149,8 +186,13 @@ mod tests {
         assert_eq!(tool.description(), "A test tool");
         assert_eq!(tool.label(), "test");
 
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let context = ToolExecutionContext {
+            output_tx,
+            cancellation: CancellationToken::new(),
+        };
         let result = tool
-            .execute("call_1", serde_json::json!({"input": "hello"}), None)
+            .execute("call_1", serde_json::json!({"input": "hello"}), context)
             .await
             .unwrap();
         assert_eq!(result.content.len(), 1);
