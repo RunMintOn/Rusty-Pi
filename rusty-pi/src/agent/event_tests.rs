@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::agent::engine::Agent;
-    use crate::agent::events::{AgentEvent, RunId};
+    use crate::agent::events::AgentEvent;
     use crate::agent::types::{AgentTool, AgentToolResult};
     use crate::ai::mock::{MockProvider, MockStep, MultiToolCallProvider};
     use crate::ai::providers::Model;

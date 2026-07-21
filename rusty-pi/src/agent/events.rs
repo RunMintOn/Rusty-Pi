@@ -13,9 +13,22 @@ use crate::ai::types::StopReason;
 /// from a cancelled run that arrive after a new run has started.
 ///
 /// Internally implemented as a monotonically increasing `u64` wrapped
-/// in a newtype for type safety.
+/// in a newtype for type safety. The inner value is private; use
+/// [`RunId::new`] to construct and [`RunId::get`] to inspect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RunId(pub u64);
+pub struct RunId(u64);
+
+impl RunId {
+    /// Create a new RunId from a raw integer.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Get the underlying integer value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 impl std::fmt::Display for RunId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,7 +115,7 @@ mod tests {
     #[test]
     fn agent_event_is_clone() {
         let event = AgentEvent::TextDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: "hello".into(),
         };
         let cloned = event.clone();
@@ -119,18 +132,23 @@ mod tests {
 
     #[test]
     fn run_id_display() {
-        assert_eq!(RunId(42).to_string(), "run-42");
+        assert_eq!(RunId::new(42).to_string(), "run-42");
+    }
+
+    #[test]
+    fn run_id_get_returns_value_without_exposing_field() {
+        assert_eq!(RunId::new(42).get(), 42);
     }
 
     #[test]
     fn run_id_equality() {
-        assert_eq!(RunId(1), RunId(1));
-        assert_ne!(RunId(1), RunId(2));
+        assert_eq!(RunId::new(1), RunId::new(1));
+        assert_ne!(RunId::new(1), RunId::new(2));
     }
 
     #[test]
     fn run_id_ordering() {
-        assert!(RunId(1) < RunId(2));
-        assert!(RunId(10) > RunId(5));
+        assert!(RunId::new(1) < RunId::new(2));
+        assert!(RunId::new(10) > RunId::new(5));
     }
 }

@@ -213,7 +213,7 @@ impl Agent {
 
         // Generate a unique RunId for this run
         self.run_counter += 1;
-        let run_id = RunId(self.run_counter);
+        let run_id = RunId::new(self.run_counter);
 
         let user_msg = AgentMessage::User(UserMessage {
             content: MessageContent::Text(prompt.to_string()),
