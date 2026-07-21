@@ -318,11 +318,11 @@ async fn main() -> anyhow::Result<()> {
 
 /// Launch the Ratatui TUI frontend.
 async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
-    // Setup terminal
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    // TerminalGuard owns all terminal state transitions. Its Drop path also
+    // restores the terminal if the event loop returns an error or panics.
+    let mut guard =
+        rusty_pi::tui::terminal_guard::TerminalGuard::new(rusty_pi::tui::terminal_guard::CrosstermTerminal::new())?;
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let size = terminal.size()?;
@@ -330,27 +330,30 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
 
     // Create agent and event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
-    let mut agent = session.into_agent();
-    agent.set_event_sender(event_tx);
+    let mut session = session;
+    session.agent().set_event_sender(event_tx);
     let mut current_token = tokio_util::sync::CancellationToken::new();
-    agent.set_abort_flag(current_token.clone());
+    session.agent().set_abort_flag(current_token.clone());
+    let registry = rusty_pi::coding_agent::repl::default_registry();
 
     // Run TUI loop — agent runs inline when a prompt is submitted
     let result = run_tui_loop(
         &mut terminal,
         &mut app_state,
-        &mut agent,
+        &mut session,
+        &registry,
         &mut current_token,
         &mut event_rx,
     )
     .await;
 
-    // Restore terminal
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    result
+    drop(terminal);
+    let restore_result = guard.restore();
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// TUI event loop.
@@ -359,7 +362,8 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
 async fn run_tui_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     state: &mut rusty_pi::tui::app::AppState,
-    agent: &mut rusty_pi::agent::engine::Agent,
+    session: &mut PromptSession,
+    registry: &rusty_pi::coding_agent::command::CommandRegistry,
     current_token: &mut tokio_util::sync::CancellationToken,
     event_rx: &mut tokio::sync::mpsc::Receiver<rusty_pi::agent::events::AgentEvent>,
 ) -> anyhow::Result<()> {
@@ -379,12 +383,25 @@ async fn run_tui_loop(
                 for effect in effects {
                     match effect {
                         Effect::RunAgent(prompt) => {
-                            // Create fresh token for this run
-                            let new_token = tokio_util::sync::CancellationToken::new();
-                            agent.set_abort_flag(new_token.clone());
-                            *current_token = new_token;
-                            // Run agent inline — events flow through the channel
-                            let _ = agent.run(&prompt).await;
+                            match registry.dispatch(&prompt, session)? {
+                                rusty_pi::coding_agent::command::DispatchOutcome::Exit => {
+                                    let _ = state.update(Action::Quit);
+                                }
+                                rusty_pi::coding_agent::command::DispatchOutcome::Handled(result) => {
+                                    let command_effects = state.update(Action::CommandResult(result));
+                                    if command_effects.iter().any(|effect| matches!(effect, Effect::Quit)) {
+                                        return Ok(());
+                                    }
+                                }
+                                rusty_pi::coding_agent::command::DispatchOutcome::NotACommand => {
+                                    // Create fresh token for this run
+                                    let new_token = tokio_util::sync::CancellationToken::new();
+                                    session.agent().set_abort_flag(new_token.clone());
+                                    *current_token = new_token;
+                                    // Run agent inline — events flow through the channel
+                                    let _ = session.agent().run(&prompt).await;
+                                }
+                            }
                         }
                         Effect::CancelAgent => {
                             current_token.cancel();
