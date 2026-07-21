@@ -6,7 +6,7 @@
 - Actual initial HEAD: `f3f1d7ad177b983a1ddca6a9b1932d125971b927` (`MAINTENANCE.md` documentation-only commit), accepted by the user before implementation.
 - Initial branch: `master`.
 - Initial status: ` M .gitignore` only.
-- Implementation HEAD before this evidence document: `0103f0e`.
+- Implementation HEAD before this evidence document: `a68faf5`.
 - Final delivery HEAD: see `git rev-parse HEAD`; this document is tracked separately from production changes.
 - `.gitignore` was never staged, changed, restored, or committed.
 
@@ -122,20 +122,20 @@ cargo test --locked: exit 0
 Final suite counts:
 
 ```text
-discovered: 467
-executed:   466
-passed:     466
+discovered: 468
+executed:   467
+passed:     467
 failed:     0
 ignored:    1
 ```
 
-Breakdown: 441 library tests, 7 binary tests, 10 binary smoke tests, 7 PTY tests, 1 passing doctest, 1 ignored doctest. No new Clippy warning category was introduced; existing historical warnings remain and were not hidden with new `allow` attributes.
+Breakdown: 442 library tests, 7 binary tests, 10 binary smoke tests, 7 PTY tests, 1 passing doctest, 1 ignored doctest. No new Clippy warning category was introduced; existing historical warnings remain and were not hidden with new `allow` attributes.
 
 Repeated validation:
 
 ```text
 Full suite:             10 consecutive runs, all passed
-Command/resolver:       30 consecutive runs, all passed (39 tests/run)
+Command/resolver:       30 consecutive runs, all passed (40 tests/run)
 TUI lifecycle/state:     30 consecutive runs, all passed (24 tests/run)
 PTY:                    30 consecutive runs, all passed (7 tests/run)
 Race/hang observed:     none after the cancellation pre-check fix
@@ -158,6 +158,9 @@ Residual tasks/processes: none observed
 
 0103f0e fix(commands): honor cancellation before session listing
   Prevents a pre-cancelled list command from returning an empty result.
+
+a68faf5 test(commands): cover builtin session isolation
+  Verifies built-ins do not append conversation messages or call the provider.
 ```
 
 ## M. Deviations
