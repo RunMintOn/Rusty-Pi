@@ -10,6 +10,7 @@
 use crate::agent::events::{AgentEvent, RunId};
 use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
+use crate::coding_agent::command::{CommandHelpItem, CommandResult};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -120,6 +121,8 @@ pub enum Action {
     Cancel,
     /// An event from the agent.
     AgentEvent(AgentEvent),
+    /// A structured slash-command result.
+    CommandResult(CommandResult),
     /// Quit the application.
     Quit,
 }
@@ -301,6 +304,9 @@ impl AppState {
             Action::AgentEvent(event) => {
                 self.handle_agent_event(event);
             }
+            Action::CommandResult(result) => {
+                effects.extend(self.apply_command_result(result));
+            }
             Action::Quit => {
                 self.quit = true;
                 effects.push(Effect::Quit);
@@ -308,6 +314,62 @@ impl AppState {
         }
 
         effects
+    }
+
+    /// Apply a command result without letting the command write to a terminal.
+    ///
+    /// Command output is represented as transcript content so the same result
+    /// can be rendered by Ratatui or another frontend.
+    pub fn apply_command_result(&mut self, result: CommandResult) -> Vec<Effect> {
+        self.activity = ActivityState::Idle;
+        self.error = None;
+
+        match result {
+            CommandResult::Message(message) => {
+                self.transcript.push(TranscriptEntry::System(message));
+                self.status = "Ready".into();
+                Vec::new()
+            }
+            CommandResult::Error(message) => {
+                self.error = Some(message.clone());
+                self.transcript.push(TranscriptEntry::ProviderError(message));
+                self.status = "Error".into();
+                Vec::new()
+            }
+            CommandResult::Help(items) => {
+                self.transcript.push(TranscriptEntry::System(format_help(&items)));
+                self.status = "Ready".into();
+                Vec::new()
+            }
+            CommandResult::ModelChanged { model } => {
+                self.transcript
+                    .push(TranscriptEntry::System(format!("Switched to {model}")));
+                self.status = "Ready".into();
+                Vec::new()
+            }
+            CommandResult::Sessions(sessions) => {
+                let text = if sessions.is_empty() {
+                    "No sessions found.".to_string()
+                } else {
+                    let mut text = String::from("Available sessions:");
+                    for session in sessions {
+                        text.push_str(&format!(
+                            "\n  {} | model: {} | msgs: {} | created: {}",
+                            session.id, session.model, session.msg_count, session.created
+                        ));
+                    }
+                    text
+                };
+                self.transcript.push(TranscriptEntry::System(text));
+                self.status = "Ready".into();
+                Vec::new()
+            }
+            CommandResult::Quit => {
+                self.quit = true;
+                vec![Effect::Quit]
+            }
+            CommandResult::Noop => Vec::new(),
+        }
     }
 
     /// Handle an agent event by updating the transcript.
@@ -506,6 +568,14 @@ impl AppState {
     }
 }
 
+fn format_help(items: &[CommandHelpItem]) -> String {
+    let mut output = String::from("Commands:");
+    for item in items {
+        output.push_str(&format!("\n  /{:<12} {}", item.name, item.description));
+    }
+    output
+}
+
 // ── view ────────────────────────────────────────────────────────────────────
 
 /// Render the application state to a terminal frame.
@@ -684,10 +754,33 @@ fn render_status(frame: &mut Frame, state: &AppState, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::mock::MockProvider;
+    use crate::ai::providers::Model;
+    use crate::coding_agent::command::{CommandRegistry, DispatchOutcome, ExitCommand, HelpCommand, QuitCommand};
+    use crate::coding_agent::prompt_session::PromptSession;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use std::path::PathBuf;
 
     fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn command_session() -> PromptSession {
+        PromptSession::new(
+            Box::new(MockProvider::text("mock")),
+            Model {
+                id: "mock",
+                api: "mock",
+            },
+            vec![],
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/.pi/agent"),
+            vec![],
+            vec![],
+            false,
+            None,
+            vec![],
+        )
     }
 
     #[test]
@@ -697,6 +790,56 @@ mod tests {
         assert!(state.input.is_empty());
         assert!(state.transcript.is_empty());
         assert!(!state.quit);
+    }
+
+    #[test]
+    fn help_command_is_rendered_into_ratatui_transcript() {
+        let mut registry = CommandRegistry::new();
+        registry.register(Box::new(HelpCommand));
+        registry.register(Box::new(ExitCommand));
+        let mut session = command_session();
+        let outcome = registry.dispatch("/help", &mut session).unwrap();
+        let mut state = AppState::new((80, 24));
+        if let DispatchOutcome::Handled(result) = outcome {
+            state.update(Action::CommandResult(result));
+        } else {
+            panic!("/help should be handled");
+        }
+        let output = render_state(&state);
+        assert!(output.contains("Commands:"));
+        assert!(output.contains("/help"));
+        assert_eq!(state.activity, ActivityState::Idle);
+    }
+
+    #[test]
+    fn quit_command_produces_ratatui_quit_effect() {
+        let mut registry = CommandRegistry::new();
+        registry.register(Box::new(QuitCommand));
+        let mut session = command_session();
+        let outcome = registry.dispatch("/quit", &mut session).unwrap();
+        let mut state = AppState::new((80, 24));
+        let effects = match outcome {
+            DispatchOutcome::Exit => state.update(Action::Quit),
+            other => panic!("expected exit, got {other:?}"),
+        };
+        assert!(state.quit);
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::Quit)));
+    }
+
+    #[test]
+    fn unknown_command_is_rendered_as_structured_ratatui_error() {
+        let registry = CommandRegistry::new();
+        let mut session = command_session();
+        let outcome = registry.dispatch("/unknown", &mut session).unwrap();
+        let mut state = AppState::new((80, 24));
+        if let DispatchOutcome::Handled(result) = outcome {
+            state.update(Action::CommandResult(result));
+        } else {
+            panic!("unknown command should be handled as an error");
+        }
+        let output = render_state(&state);
+        assert!(output.contains("Unknown command"));
+        assert!(state.error.is_some());
     }
 
     #[test]
@@ -785,12 +928,12 @@ mod tests {
     #[test]
     fn app_state_cancel_sets_cancelling() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.activity = ActivityState::Running;
         let _effects = state.update(Action::Cancel);
         assert_eq!(state.activity, ActivityState::Cancelling);
         // RunAborted event transitions to Idle with Aborted outcome
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
         assert_eq!(state.activity, ActivityState::Idle);
         assert_eq!(state.last_outcome, Some(RunOutcome::Aborted));
     }
@@ -805,13 +948,13 @@ mod tests {
     #[test]
     fn app_state_text_delta_appends() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: "hello".into(),
         });
         state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: " world".into(),
         });
         assert_eq!(state.transcript.len(), 1);
@@ -824,9 +967,9 @@ mod tests {
     #[test]
     fn app_state_tool_started_creates_entry() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
@@ -851,15 +994,15 @@ mod tests {
     #[test]
     fn app_state_tool_finished_updates_entry() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
@@ -885,10 +1028,10 @@ mod tests {
     #[test]
     fn app_state_run_finished_sets_idle() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.activity = ActivityState::Running;
         state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             stop_reason: StopReason::Stop,
         });
         assert_eq!(state.activity, ActivityState::Idle);
@@ -1065,9 +1208,9 @@ mod tests {
     fn render_aborted() {
         let mut state = AppState::new((80, 24));
         // Set up run_id so events are accepted
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
         let output = render_state(&state);
         assert!(output.contains("Aborted") || output.contains("abort"));
     }
@@ -1133,9 +1276,9 @@ mod tests {
     #[test]
     fn transcript_tool_started_creates_tool_entry() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
@@ -1161,15 +1304,15 @@ mod tests {
     #[test]
     fn transcript_stdout_only_goes_to_stdout() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "hello\n".into(),
@@ -1186,15 +1329,15 @@ mod tests {
     #[test]
     fn transcript_stderr_only_goes_to_stderr() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             stream: crate::agent::events::ToolOutputStream::Stderr,
             chunk: "err msg\n".into(),
@@ -1211,15 +1354,15 @@ mod tests {
     #[test]
     fn transcript_assistant_text_does_not_mix_with_tool() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: "some text".into(),
         });
         assert_eq!(state.transcript.len(), 2);
@@ -1238,10 +1381,10 @@ mod tests {
     #[test]
     fn transcript_tool_output_does_not_create_assistant_entry() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         // ToolOutput for an unknown ID should create a Tool entry, not Assistant
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "orphan".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "data".into(),
@@ -1256,15 +1399,15 @@ mod tests {
     #[test]
     fn transcript_tool_finished_updates_original_no_duplicate() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
@@ -1284,27 +1427,27 @@ mod tests {
     #[test]
     fn transcript_two_tools_outputs_do_not_cross() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_b".into(),
             name: "read".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "alpha".into(),
         });
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_b".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "beta".into(),
@@ -1322,17 +1465,17 @@ mod tests {
     #[test]
     fn transcript_unknown_tool_id_does_not_panic() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         // Output for an ID that was never started
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "ghost".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "data".into(),
         });
         // Finish for an ID that was never started
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "ghost2".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult::default(),
@@ -1343,15 +1486,15 @@ mod tests {
     #[test]
     fn transcript_timeout_maps_to_timed_out() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_to".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_to".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
@@ -1369,15 +1512,15 @@ mod tests {
     #[test]
     fn transcript_abort_maps_to_aborted() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_ab".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_ab".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
@@ -1395,15 +1538,15 @@ mod tests {
     #[test]
     fn transcript_nonzero_exit_maps_to_failed() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_err".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_err".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
@@ -1421,15 +1564,15 @@ mod tests {
     #[test]
     fn transcript_success_maps_to_succeeded() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_ok".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_ok".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
@@ -1449,18 +1592,18 @@ mod tests {
     fn run_started_sets_running() {
         let mut state = AppState::new((80, 24));
         state.activity = ActivityState::Idle;
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         // RunStarted sets current_run_id and clears the tool index
-        assert_eq!(state.current_run_id, Some(RunId(1)));
+        assert_eq!(state.current_run_id, Some(RunId::new(1)));
         assert!(state.tool_index.is_empty());
     }
 
     #[test]
     fn run_aborted_preserves_outcome() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
         assert_eq!(state.activity, ActivityState::Idle);
         assert_eq!(state.last_outcome, Some(RunOutcome::Aborted));
         assert_eq!(state.status, "Aborted");
@@ -1469,10 +1612,10 @@ mod tests {
     #[test]
     fn run_finished_stop_sets_completed() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.activity = ActivityState::Running;
         state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             stop_reason: StopReason::Stop,
         });
         assert_eq!(state.activity, ActivityState::Idle);
@@ -1483,9 +1626,9 @@ mod tests {
     #[test]
     fn provider_error_not_overwritten_by_stop() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ProviderError {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             error: crate::agent::events::ProviderError {
                 reason: StopReason::Error,
                 message: "limit exceeded".into(),
@@ -1493,7 +1636,7 @@ mod tests {
         });
         assert_eq!(state.last_outcome, None); // ProviderError doesn't set last_outcome
         state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             stop_reason: StopReason::Error,
         });
         assert_eq!(
@@ -1505,15 +1648,15 @@ mod tests {
     #[test]
     fn new_run_clears_tool_index() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "old_tc".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         assert!(!state.tool_index.is_empty());
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
         assert!(state.tool_index.is_empty());
     }
 
@@ -1523,16 +1666,16 @@ mod tests {
     fn late_text_delta_from_old_run_ignored() {
         let mut state = AppState::new((80, 24));
         // Run A starts and produces text
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: "from A".into(),
         });
         // Run B starts (simulating a new run after Run A was cancelled externally)
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
         // Late TextDelta from Run A arrives after Run B started
         state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: "STALE".into(),
         });
         // Transcript should only contain Run A's initial text, not the stale delta
@@ -1542,37 +1685,37 @@ mod tests {
             _ => panic!("Expected Assistant entry"),
         }
         // current_run_id should still be Run B
-        assert_eq!(state.current_run_id, Some(RunId(2)));
+        assert_eq!(state.current_run_id, Some(RunId::new(2)));
     }
 
     #[test]
     fn late_tool_output_from_old_run_does_not_pollute() {
         let mut state = AppState::new((80, 24));
         // Run A starts tool_a and gets some output
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "legit data".into(),
         });
         // Run B starts (simulating new run) — tool_index is cleared
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(2),
+            run_id: RunId::new(2),
             tool_call_id: "tc_b".into(),
             name: "read".into(),
             arguments: serde_json::json!({}),
         });
         // Late ToolOutput from Run A arrives — should be ignored because run_id != current_run_id
         state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             stream: crate::agent::events::ToolOutputStream::Stdout,
             chunk: "STALE DATA".into(),
@@ -1601,24 +1744,24 @@ mod tests {
     fn late_tool_finished_from_old_run_ignored() {
         let mut state = AppState::new((80, 24));
         // Run A starts tool_a
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         // Run B starts (simulating new run)
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
         state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId(2),
+            run_id: RunId::new(2),
             tool_call_id: "tc_b".into(),
             name: "read".into(),
             arguments: serde_json::json!({}),
         });
         // Late ToolFinished from Run A
         state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_a".into(),
             name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
@@ -1632,23 +1775,23 @@ mod tests {
             _ => panic!("Expected tool_b entry"),
         }
         // current_run_id should still be Run B
-        assert_eq!(state.current_run_id, Some(RunId(2)));
+        assert_eq!(state.current_run_id, Some(RunId::new(2)));
     }
 
     #[test]
     fn late_run_finished_from_old_run_does_not_affect_current() {
         let mut state = AppState::new((80, 24));
         // Run A starts
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         // Run B starts (simulating new run)
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
         // Late RunFinished from Run A with Stop reason
         state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             stop_reason: StopReason::Stop,
         });
         // current_run_id should still be Run B
-        assert_eq!(state.current_run_id, Some(RunId(2)));
+        assert_eq!(state.current_run_id, Some(RunId::new(2)));
         // Transcript should be empty (Run A's finish didn't add anything)
         assert!(state.transcript.is_empty());
     }
@@ -1657,7 +1800,7 @@ mod tests {
     fn unknown_run_id_events_ignored() {
         let mut state = AppState::new((80, 24));
         // No run started yet — send events with unknown run_id
-        let unknown = RunId(999);
+        let unknown = RunId::new(999);
         let orig_activity = state.activity.clone();
         let orig_outcome = state.last_outcome.clone();
         let orig_transcript_len = state.transcript.len();
@@ -1711,11 +1854,11 @@ mod tests {
     #[test]
     fn late_provider_error_from_old_run_ignored() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
 
         state.handle_agent_event(AgentEvent::ProviderError {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             error: crate::agent::events::ProviderError {
                 reason: StopReason::Error,
                 message: "stale error".into(),
@@ -1728,12 +1871,12 @@ mod tests {
     #[test]
     fn late_run_aborted_from_old_run_ignored() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
 
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId(1) });
-        // Run B's current_run_id should still be RunId(2)
-        assert_eq!(state.current_run_id, Some(RunId(2)));
+        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
+        // Run B's current_run_id should still be RunId::new(2)
+        assert_eq!(state.current_run_id, Some(RunId::new(2)));
         // Transcript should be empty (Run A's abort didn't add anything)
         assert!(state.transcript.is_empty());
     }
@@ -1741,12 +1884,12 @@ mod tests {
     #[test]
     fn late_thinking_delta_from_old_run_ignored() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(2) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
         let orig_status = state.status.clone();
 
         state.handle_agent_event(AgentEvent::ThinkingDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: "thinking...".into(),
         });
         assert_eq!(state.status, orig_status, "Stale thinking should not change status");
@@ -1835,9 +1978,9 @@ mod tests {
     #[test]
     fn snapshot_aborted() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
         state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId(1) });
+        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
         let output = render_state(&state);
         insta::assert_snapshot!(output);
     }

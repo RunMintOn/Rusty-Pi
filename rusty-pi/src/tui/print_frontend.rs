@@ -6,6 +6,7 @@
 use crate::agent::events::{AgentEvent, ToolOutputStream};
 use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
+use crate::coding_agent::command::CommandResult;
 use std::io::{self, Write};
 
 /// A frontend that prints agent events to stdout/stderr.
@@ -99,6 +100,35 @@ impl PrintFrontend {
         }
     }
 
+    /// Render a structured slash-command result for the print frontend.
+    pub fn handle_command_result(&self, result: &CommandResult) {
+        match result {
+            CommandResult::Message(message) => println!("{message}"),
+            CommandResult::Error(message) => eprintln!("{message}"),
+            CommandResult::Help(items) => {
+                println!("\n  Commands:");
+                for item in items {
+                    println!("    /{:<12} {}", item.name, item.description);
+                }
+            }
+            CommandResult::ModelChanged { model } => println!("Switched to {model}"),
+            CommandResult::Sessions(sessions) => {
+                if sessions.is_empty() {
+                    println!("No sessions found.");
+                } else {
+                    println!("Available sessions:");
+                    for session in sessions {
+                        println!(
+                            "  {} | model: {} | msgs: {} | created: {}",
+                            session.id, session.model, session.msg_count, session.created
+                        );
+                    }
+                }
+            }
+            CommandResult::Quit | CommandResult::Noop => {}
+        }
+    }
+
     /// Print tool result details.
     fn print_tool_result(&self, result: &AgentToolResult) {
         if !self.verbose {
@@ -178,7 +208,7 @@ mod tests {
         let frontend = PrintFrontend::new();
         // Just verify it doesn't panic
         frontend.handle_event(&AgentEvent::TextDelta {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             text: "hello".into(),
         });
     }
@@ -188,7 +218,7 @@ mod tests {
         use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
@@ -200,7 +230,7 @@ mod tests {
         use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: AgentToolResult {
@@ -217,7 +247,7 @@ mod tests {
         use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: AgentToolResult {
@@ -236,7 +266,7 @@ mod tests {
         use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ProviderError {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             error: ProviderError {
                 reason: StopReason::Error,
                 message: "API limit exceeded".into(),
@@ -248,7 +278,7 @@ mod tests {
     fn print_frontend_handles_run_aborted() {
         use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
-        frontend.handle_event(&AgentEvent::RunAborted { run_id: RunId(1) });
+        frontend.handle_event(&AgentEvent::RunAborted { run_id: RunId::new(1) });
     }
 
     #[test]
@@ -256,7 +286,7 @@ mod tests {
         use crate::agent::events::RunId;
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::RunFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             stop_reason: StopReason::Stop,
         });
     }
@@ -266,13 +296,13 @@ mod tests {
         use crate::agent::events::RunId;
         let frontend = PrintFrontend::with_verbose(false);
         frontend.handle_event(&AgentEvent::ToolStarted {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
         });
         frontend.handle_event(&AgentEvent::ToolFinished {
-            run_id: RunId(1),
+            run_id: RunId::new(1),
             tool_call_id: "tc_1".into(),
             name: "bash".into(),
             result: AgentToolResult {
@@ -283,5 +313,14 @@ mod tests {
             },
         });
         // Should not panic even in non-verbose mode
+    }
+
+    #[test]
+    fn print_frontend_consumes_command_results() {
+        let frontend = PrintFrontend::new();
+        frontend.handle_command_result(&CommandResult::Help(vec![]));
+        frontend.handle_command_result(&CommandResult::Message("message".into()));
+        frontend.handle_command_result(&CommandResult::Error("error".into()));
+        frontend.handle_command_result(&CommandResult::Quit);
     }
 }

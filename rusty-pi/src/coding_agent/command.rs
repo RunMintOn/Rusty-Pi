@@ -5,7 +5,7 @@
 //!
 //! Commands return [`CommandResult`] — a structured enum that the frontend
 //! (PrintFrontend or Ratatui) renders appropriately. Commands never write
-//! directly to stdout/stderr.
+//! directly to the terminal.
 
 use crate::coding_agent::prompt_session::PromptSession;
 use crate::format::OutputFormatter;
@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 /// Structured result returned by every slash command.
 ///
 /// The frontend is responsible for rendering this into user-visible output.
-/// Commands must never write to stdout/stderr directly.
+/// Commands must never write to the terminal directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandResult {
     /// A plain text message to display.
