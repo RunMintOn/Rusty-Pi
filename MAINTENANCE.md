@@ -105,11 +105,14 @@ Skill frontmatter：
 | `reference/` 在 worktree 中不存在 | `ls reference/` 报错 | 参考代码只在基础仓库 |
 | test filter 返回 0 测试 | 完整路径过滤不匹配 | 用模块名短名 `cargo test openai_codex` |
 | bash timeout 测试日志中有 kill 输出 | 测试打印 `kill: no such process` | 无害，测试预期行为 |
-| `Content` 没有 `Display` | 不能 `result.content[0].to_string()` | 必须模式匹配 |
+| `Content` 没有 `Display` | 不能 `result.content[0].to_string()` | 必须模式匹配，见下方代码段 |
+| `drive_print_run` 返回 `Result` | 编译错误：`?` 不匹配 | 现返回 `io::Result<PrintRunOutcome>`，输出失败时带 Err |
+| ToolOutput 在 ToolFinished 后出现 | stale output 渲染到 stderr | `ToolState.finished` 拦截 + `accepts_active()` 过滤 terminal 后事件 |
+| `exit_code: Some(0)` 被误判为 failure | Tool 成功时显示 `❌ bash exit code 0` | 非零才判 failure，见下方代码段 |
 
-### `Content` 没有 `Display`
+### 关键代码模式
 
-`ai::types::Content` 枚举没有实现 `Display`/`ToString`。测试中不能直接 `assert!(result.content[0].to_string()...)`，必须用模式匹配：
+**`Content` 没有 `Display`，测试中取值必须模式匹配：**
 
 ```rust
 let text = match &result.content[0] {
@@ -118,12 +121,47 @@ let text = match &result.content[0] {
 };
 ```
 
+
+**`exit_code: Some(0)` 判为成功：**
+
+```rust
+let nonzero_exit_code = result.exit_code.filter(|code| *code != 0);
+let is_failure = result.is_error
+    || nonzero_exit_code.is_some()
+    || result.timed_out
+    || result.aborted;
+```
+优先级：`aborted` > `timed_out` > `non-zero exit` > `generic error`。
+
+**Tool forwarder JoinHandle 必须在成功和错误两个路径上都 await：**
+
+```rust
+let tool_result = tool.execute(...).await;
+let forward_result = forwarder.await;
+let result = match (tool_result, forward_result) { ... };
+```
+错误路径用 `?` 会跳过 forwarder.await，留下 detached task。
+
+**UTF-8 安全截断（`truncate_chars`）：**
+
+`fn truncate_chars(text: &str, max_chars: usize) -> Cow<'_, str>` — 按字符数截断并追加 `...`，避免 byte slice panic。
+
 ## 更新 Reference
 
 ```bash
 cd reference/earendil-works-pi
 git fetch --depth 1 && git reset --hard origin/main && rm -rf .git
 ```
+
+## 诊断辅助
+
+papercuts（踩坑记录）按项目路径归类保存在 `~/.pi/papercuts.md`。脚本查询当前项目的 papercuts：
+
+```bash
+./tools/find-papercuts.sh
+```
+
+该脚本解析 `~/.pi/papercuts.md` 的 `##` 分隔条目，提取 `**Path:**` 字段后与目标路径（默认 PWD）做归一化比较。
 
 ## Git 陷阱
 
