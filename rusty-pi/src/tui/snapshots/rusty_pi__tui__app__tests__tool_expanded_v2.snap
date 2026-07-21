@@ -1,17 +1,17 @@
 ---
 source: src/tui/app.rs
-expression: output
+expression: render_state(&tool)
 ---
 ┌Transcript────────────────────────────────────────────────────────────────────┐
-│你 好 世 界  🌍  café résumé                                                       │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
-│                                                                              │
+│▼ bash  success · exit 0                                                      │
+│Arguments:                                                                    │
+│  {                                                                           │
+│    "command": "ls"                                                           │
+│  }                                                                           │
+│stdout:                                                                       │
+│  listed file                                                                 │
+│stderr:                                                                       │
+│  warning                                                                     │
 │                                                                              │
 │                                                                              │
 │                                                                              │
@@ -22,7 +22,7 @@ expression: output
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌Input─────────────────────────────────────────────────────────────────────────┐
+┌Input · draft (Enter unavailable)─────────────────────────────────────────────┐
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
-Ready
+mock/mock | Running | Transcript · Space expand · i input · End latest | bash ·

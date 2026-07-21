@@ -10,7 +10,7 @@ use rusty_pi::agent::session::SessionStorage;
 use rusty_pi::agent::session::jsonl::{JsonlSessionCreateOptions, JsonlSessionStorage};
 use rusty_pi::agent::session::session::{Session, SessionContextBuildOptions};
 use rusty_pi::agent::session::types::iso_timestamp;
-use rusty_pi::ai::mock::MockProvider;
+use rusty_pi::ai::mock::{MockProvider, MockStep};
 use rusty_pi::ai::providers::deepseek::{DEEPSEEK_MODELS, DeepSeekProvider};
 use rusty_pi::ai::providers::openai_codex::{OPENAI_CODEX_MODELS, OpenAICodexProvider};
 use rusty_pi::ai::providers::{Model, ProviderApi};
@@ -107,13 +107,30 @@ struct Cli {
 
 fn build_provider(name: &str, model_id: Option<&str>) -> anyhow::Result<(Box<dyn ProviderApi>, Model)> {
     match name {
-        "mock" => Ok((
-            Box::new(MockProvider::text("Hello from rusty-pi! I'm a mock LLM provider.")),
-            Model {
-                id: "mock",
-                api: "mock",
-            },
-        )),
+        "mock" => {
+            // PTY smoke tests can request one deterministic tool round without
+            // introducing a second provider or making an online call.
+            let provider = if let Ok(command) = std::env::var("RUSTY_PI_MOCK_TOOL") {
+                MockProvider::new(vec![
+                    MockStep::ToolCall {
+                        id: "mock-tool".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": command}),
+                        stop_reason: None,
+                    },
+                    MockStep::Text("Mock tool round complete".into()),
+                ])
+            } else {
+                MockProvider::text("Hello from rusty-pi! I'm a mock LLM provider.")
+            };
+            Ok((
+                Box::new(provider),
+                Model {
+                    id: "mock",
+                    api: "mock",
+                },
+            ))
+        }
         "deepseek" => {
             let provider = DeepSeekProvider::from_env().ok_or_else(|| {
                 let fmt = OutputFormatter::new();
@@ -326,11 +343,13 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let size = terminal.size()?;
+    let mut session = session;
     let mut app_state = rusty_pi::tui::app::AppState::new((size.width, size.height));
+    let model = session.agent().model();
+    app_state.set_provider_model(model.api, model.id);
 
     // Create agent and event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
-    let mut session = session;
     session.agent().set_event_sender(event_tx);
     let mut current_token = tokio_util::sync::CancellationToken::new();
     session.agent().set_abort_flag(current_token.clone());
@@ -356,9 +375,8 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
     }
 }
 
-/// TUI event loop.
-/// When a prompt is submitted, the agent runs inline (not in a separate task)
-/// so we avoid Send/Sync issues with the Agent's callback fields.
+/// TUI event loop.  An agent future is polled alongside terminal input so a
+/// running command can still be cancelled and the next draft can be edited.
 async fn run_tui_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     state: &mut rusty_pi::tui::app::AppState,
@@ -370,46 +388,40 @@ async fn run_tui_loop(
     use rusty_pi::tui::app::{Action, Effect};
 
     loop {
-        // Draw
         terminal.draw(|frame| {
             rusty_pi::tui::app::view(frame, state);
         })?;
 
-        // Handle events with a timeout so we can process agent events
         let poll_timeout = std::time::Duration::from_millis(50);
         if crossterm::event::poll(poll_timeout)? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                let effects = state.update(Action::KeyInput(key));
-                for effect in effects {
-                    match effect {
-                        Effect::RunAgent(prompt) => {
-                            match registry.dispatch(&prompt, session)? {
-                                rusty_pi::coding_agent::command::DispatchOutcome::Exit => {
-                                    let _ = state.update(Action::Quit);
-                                }
-                                rusty_pi::coding_agent::command::DispatchOutcome::Handled(result) => {
-                                    let command_effects = state.update(Action::CommandResult(result));
-                                    if command_effects.iter().any(|effect| matches!(effect, Effect::Quit)) {
-                                        return Ok(());
-                                    }
-                                }
-                                rusty_pi::coding_agent::command::DispatchOutcome::NotACommand => {
-                                    // Create fresh token for this run
-                                    let new_token = tokio_util::sync::CancellationToken::new();
-                                    session.agent().set_abort_flag(new_token.clone());
-                                    *current_token = new_token;
-                                    // Run agent inline — events flow through the channel
-                                    let _ = session.agent().run(&prompt).await;
-                                }
+            let event = crossterm::event::read()?;
+            let effects = match event {
+                crossterm::event::Event::Key(key) => state.update(Action::KeyInput(key)),
+                crossterm::event::Event::Paste(text) => state.update(Action::Paste(text)),
+                crossterm::event::Event::Resize(width, height) => state.update(Action::Resize(width, height)),
+                _ => Vec::new(),
+            };
+            for effect in effects {
+                match effect {
+                    Effect::RunAgent(prompt) => match registry.dispatch(&prompt, session)? {
+                        rusty_pi::coding_agent::command::DispatchOutcome::Exit => {
+                            let _ = state.update(Action::Quit);
+                        }
+                        rusty_pi::coding_agent::command::DispatchOutcome::Handled(result) => {
+                            let command_effects = state.update(Action::CommandResult(result));
+                            if command_effects.iter().any(|effect| matches!(effect, Effect::Quit)) {
+                                return Ok(());
                             }
                         }
-                        Effect::CancelAgent => {
-                            current_token.cancel();
+                        rusty_pi::coding_agent::command::DispatchOutcome::NotACommand => {
+                            let new_token = tokio_util::sync::CancellationToken::new();
+                            session.agent().set_abort_flag(new_token.clone());
+                            *current_token = new_token;
+                            run_agent_with_ui(terminal, state, session, current_token, event_rx, prompt).await?;
                         }
-                        Effect::Quit => {
-                            return Ok(());
-                        }
-                    }
+                    },
+                    Effect::CancelAgent => current_token.cancel(),
+                    Effect::Quit => return Ok(()),
                 }
             }
         }
@@ -422,6 +434,71 @@ async fn run_tui_loop(
         // Check if we should quit
         if state.quit {
             return Ok(());
+        }
+    }
+}
+
+/// Poll one agent turn while continuing to service keyboard and AgentEvent
+/// traffic.  The future still borrows the existing PromptSession, so session
+/// persistence and the established AgentEvent/CancellationToken boundaries
+/// remain unchanged.
+async fn run_agent_with_ui(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    state: &mut rusty_pi::tui::app::AppState,
+    session: &mut PromptSession,
+    current_token: &mut tokio_util::sync::CancellationToken,
+    event_rx: &mut tokio::sync::mpsc::Receiver<rusty_pi::agent::events::AgentEvent>,
+    prompt: String,
+) -> anyhow::Result<()> {
+    use rusty_pi::tui::app::{Action, Effect};
+
+    let run = session.agent().run(&prompt);
+    tokio::pin!(run);
+
+    loop {
+        terminal.draw(|frame| rusty_pi::tui::app::view(frame, state))?;
+
+        // A short synchronous poll is intentional: crossterm is the terminal
+        // boundary, while the agent future remains cancellable between polls.
+        if crossterm::event::poll(std::time::Duration::from_millis(10))? {
+            let event = crossterm::event::read()?;
+            let effects = match event {
+                crossterm::event::Event::Key(key) => state.update(Action::KeyInput(key)),
+                crossterm::event::Event::Paste(text) => state.update(Action::Paste(text)),
+                crossterm::event::Event::Resize(width, height) => state.update(Action::Resize(width, height)),
+                _ => Vec::new(),
+            };
+            for effect in effects {
+                match effect {
+                    Effect::CancelAgent => current_token.cancel(),
+                    Effect::Quit => return Ok(()),
+                    // Enter is deliberately unavailable while running, so a
+                    // second RunAgent effect cannot be produced here.
+                    Effect::RunAgent(_) => {}
+                }
+            }
+        }
+
+        while let Ok(event) = event_rx.try_recv() {
+            state.update(Action::AgentEvent(event));
+        }
+        if state.quit {
+            return Ok(());
+        }
+
+        tokio::select! {
+            result = &mut run => {
+                if let Err(error) = result {
+                    state.update(Action::CommandResult(
+                        rusty_pi::coding_agent::command::CommandResult::Error(error.to_string()),
+                    ));
+                }
+                while let Ok(event) = event_rx.try_recv() {
+                    state.update(Action::AgentEvent(event));
+                }
+                return Ok(());
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(40)) => {}
         }
     }
 }

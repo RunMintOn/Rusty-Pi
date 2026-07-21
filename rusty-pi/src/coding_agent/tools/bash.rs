@@ -1371,38 +1371,24 @@ mod tests {
         rest.chars().next()
     }
 
-    #[cfg(unix)]
-    fn zombie_pids() -> std::collections::HashSet<u32> {
-        let output = std::process::Command::new("ps")
-            .args(["-eo", "pid=,stat="])
-            .output()
-            .expect("ps must be available for zombie inspection");
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                let pid = fields.next()?.parse::<u32>().ok()?;
-                let stat = fields.next()?;
-                stat.starts_with('Z').then_some(pid)
-            })
-            .collect()
-    }
-
     /// Verify no zombie processes remain after concurrent execution.
     #[tokio::test]
     async fn no_zombies_after_concurrent() {
-        #[cfg(unix)]
-        let zombies_before = zombie_pids();
+        let pid_dir = tempfile::tempdir().unwrap();
         let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
         let t = Arc::new(BashTool::new(shared_cwd));
         let mut handles = Vec::new();
+        let mut pid_files = Vec::new();
 
         for i in 0..10 {
             let t = Arc::clone(&t);
             let (ctx, _rx) = make_context();
             let id = format!("zombie_{}", i);
+            let pid_file = pid_dir.path().join(format!("{i}.pid"));
+            pid_files.push(pid_file.clone());
             handles.push(tokio::spawn(async move {
-                t.execute(&id, serde_json::json!({"command": "echo clean"}), ctx).await
+                let command = format!("printf '%s\\n' $$ > {}; echo clean", pid_file.display());
+                t.execute(&id, serde_json::json!({"command": command}), ctx).await
             }));
         }
 
@@ -1411,18 +1397,19 @@ mod tests {
             assert!(!result.is_error);
         }
 
-        // Compare against the pre-test snapshot. Other processes in a shared
-        // CI/container environment may already be zombies; only a newly
-        // created zombie is evidence of a lifecycle regression here.
         #[cfg(unix)]
         {
-            let zombies_after = zombie_pids();
-            let new_zombies: Vec<u32> = zombies_after.difference(&zombies_before).copied().collect();
-            assert!(
-                new_zombies.is_empty(),
-                "bash test created zombie processes: {:?}",
-                new_zombies
-            );
+            // Identify only the shells created by this test. A global `ps`
+            // snapshot races with other concurrent Bash tests, which can
+            // transiently contain their still-being-reaped children.
+            for pid_file in pid_files {
+                let pid = std::fs::read_to_string(pid_file)
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap();
+                assert_eq!(process_state(pid), None, "bash shell {pid} must be reaped");
+            }
         }
     }
 }

@@ -1740,6 +1740,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "unicode-normalization",
+ "unicode-width 0.2.0",
  "url",
  "wiremock",
 ]

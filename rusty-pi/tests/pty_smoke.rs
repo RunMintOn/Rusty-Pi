@@ -27,6 +27,10 @@ struct PtyProcess {
 
 impl PtyProcess {
     fn spawn(agent_dir: &std::path::Path) -> Self {
+        Self::spawn_with_tool(agent_dir, None)
+    }
+
+    fn spawn_with_tool(agent_dir: &std::path::Path, mock_tool: Option<&str>) -> Self {
         let system = native_pty_system();
         let pair = system
             .openpty(PtySize {
@@ -42,6 +46,9 @@ impl PtyProcess {
         command.arg("-p");
         command.arg("mock");
         command.env("RUSTY_PI_AGENT_DIR", agent_dir);
+        if let Some(mock_tool) = mock_tool {
+            command.env("RUSTY_PI_MOCK_TOOL", mock_tool);
+        }
 
         let child = pair
             .slave
@@ -162,6 +169,9 @@ fn real_tui_pty() {
     // 0x03 is the terminal control character delivered by a real PTY in raw
     // mode, not an internal CancellationToken call.
     process.send_bytes(b"\x03");
+    // Ctrl+C in an idle, empty editor is intentionally non-exiting. Use the
+    // explicit command for process termination.
+    process.send_bytes(b"/quit\r");
     process.finish();
 }
 
@@ -170,6 +180,53 @@ fn real_tui_pty_quit_command() {
     let agent_dir = tempfile::tempdir().expect("temporary agent directory");
     let mut process = PtyProcess::spawn(agent_dir.path());
     process.wait_for("Transcript", Duration::from_secs(5));
+    process.send_bytes(b"/quit\r");
+    process.finish();
+}
+
+#[test]
+fn real_tui_pty_multiline_tool_output_scroll_and_end() {
+    let agent_dir = tempfile::tempdir().expect("temporary agent directory");
+    let mut process = PtyProcess::spawn_with_tool(
+        agent_dir.path(),
+        Some("for i in $(seq 1 40); do printf 'out-%s\\n' $i; printf 'err-%s\\n' $i >&2; done"),
+    );
+    process.wait_for("Transcript", Duration::from_secs(5));
+
+    // Ctrl+J is the portable multiline binding used by the reducer.
+    process.send_bytes(b"first line\x0asecond line\r");
+    process.wait_for("Mock tool round complete", Duration::from_secs(10));
+
+    // Tab focuses the transcript, Space expands the selected tool, and
+    // PageUp enters browsing mode. The next prompt must not pull the view
+    // back to the bottom; the title exposes the unread count.
+    process.send_bytes(b"\t ");
+    process.send_bytes(b"\x1b[5~");
+    process.wait_for("err-", Duration::from_secs(2));
+    // Home is the explicit beginning-of-transcript operation, where the
+    // stdout half of the expanded tool is visible.
+    process.send_bytes(b"\x1b[H");
+    process.wait_for("out-", Duration::from_secs(2));
+    process.send_bytes(b"i");
+    process.send_bytes(b"next prompt\r");
+    process.wait_for("new lines", Duration::from_secs(5));
+
+    // End returns to follow mode. Explicit /quit is used because Ctrl+C in an
+    // idle empty editor intentionally does not terminate the application.
+    process.send_bytes(b"\x1b[F");
+    process.send_bytes(b"/quit\r");
+    process.finish();
+}
+
+#[test]
+fn real_tui_pty_ctrl_c_aborts_running_tool() {
+    let agent_dir = tempfile::tempdir().expect("temporary agent directory");
+    let mut process = PtyProcess::spawn_with_tool(agent_dir.path(), Some("sleep 3; echo should-not-finish"));
+    process.wait_for("Transcript", Duration::from_secs(5));
+    process.send_bytes(b"run a slow tool\r");
+    process.wait_for("running", Duration::from_secs(5));
+    process.send_bytes(b"\x03");
+    process.wait_for("Aborted", Duration::from_secs(5));
     process.send_bytes(b"/quit\r");
     process.finish();
 }

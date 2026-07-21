@@ -1,13 +1,11 @@
-//! Ratatui TUI application state, actions, effects, update, and view.
+//! Ratatui TUI state, reducer, and rendering.
 //!
-//! This is the minimal vertical slice for the TUI:
-//! - Transcript area
-//! - Single-line input box
-//! - Status area
-//! - Tool running state
-//! - Error state
+//! The agent/session layers only emit domain events.  This module turns those
+//! events into a small, stable view model and routes keyboard input through a
+//! reducer.  Rendering is deliberately read-only: all lifecycle, selection,
+//! history, and scroll changes happen in [`AppState::update`].
 
-use crate::agent::events::{AgentEvent, RunId};
+use crate::agent::events::{AgentEvent, RunId, ToolOutputStream};
 use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
 use crate::coding_agent::command::{CommandHelpItem, CommandResult};
@@ -18,40 +16,21 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
-// ── AppState ────────────────────────────────────────────────────────────────
+/// Maximum retained output for either tool stream.
+///
+/// Output is bounded before it enters the transcript, rather than only while
+/// drawing, so a noisy command cannot make AppState grow without limit.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const OUTPUT_TRUNCATION_MARKER: &str = "… output truncated …";
+const MAX_TRANSCRIPT_BLOCKS: usize = 2_000;
 
-/// The complete state of the TUI application.
-#[derive(Debug, Clone)]
-pub struct AppState {
-    /// Transcript of messages (user prompts and agent responses).
-    pub transcript: Vec<TranscriptEntry>,
-    /// Current input buffer.
-    pub input: String,
-    /// Cursor position in the input buffer (byte offset).
-    pub cursor: usize,
-    /// Current activity state.
-    pub activity: ActivityState,
-    /// Outcome of the last completed run.
-    pub last_outcome: Option<RunOutcome>,
-    /// The RunId of the current run, if any.
-    pub current_run_id: Option<RunId>,
-    /// Status message.
-    pub status: String,
-    /// Last error message.
-    pub error: Option<String>,
-    /// Terminal size (width, height).
-    pub terminal_size: (u16, u16),
-    /// Whether to quit.
-    pub quit: bool,
-    /// Scroll offset for transcript.
-    pub scroll_offset: u16,
-    /// Maps tool call ID to transcript index for updating tool entries.
-    tool_index: HashMap<String, usize>,
-}
+// ── View model ──────────────────────────────────────────────────────────────
 
-/// State of a tool run in the transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The state of a tool invocation as shown in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRunState {
     Running,
     Succeeded,
@@ -60,41 +39,381 @@ pub enum ToolRunState {
     Aborted,
 }
 
-/// A single entry in the transcript.
-#[derive(Debug, Clone)]
-pub enum TranscriptEntry {
-    /// A user prompt.
-    User(String),
-    /// An agent text response (accumulated).
-    Assistant(String),
-    /// A tool call with full lifecycle information.
+impl ToolRunState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "success",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed out",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// Structured content rendered by the TUI.
+///
+/// This is a frontend view model.  It is intentionally not part of the agent
+/// or session model: tool output, provider errors, and command results never
+/// become assistant text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptBlock {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+        streaming: bool,
+    },
+    Thinking {
+        text: String,
+        expanded: bool,
+    },
     Tool {
-        id: String,
+        tool_call_id: String,
         name: String,
         arguments: serde_json::Value,
+        /// Formatted when ToolStarted is reduced, not in view().
+        arguments_display: String,
         stdout: String,
         stderr: String,
         state: ToolRunState,
-        result: Option<AgentToolResult>,
+        expanded: bool,
+        exit_code: Option<i32>,
+        duration: Option<Duration>,
     },
-    /// A provider error.
-    ProviderError(String),
-    /// A system message (abort, etc).
-    System(String),
+    Error {
+        message: String,
+    },
+    System {
+        message: String,
+    },
 }
 
-/// Current activity state.
+/// Compatibility name for callers that used the initial TUI prototype.
+pub type TranscriptEntry = TranscriptBlock;
+
+impl TranscriptBlock {
+    fn tool(tool_call_id: String, name: String, arguments: serde_json::Value) -> Self {
+        let arguments_display = sanitize_message(
+            &serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "<invalid arguments>".into()),
+        );
+        Self::Tool {
+            tool_call_id,
+            name,
+            arguments,
+            arguments_display,
+            stdout: String::new(),
+            stderr: String::new(),
+            state: ToolRunState::Running,
+            expanded: false,
+            exit_code: None,
+            duration: None,
+        }
+    }
+
+    fn is_expandable(&self) -> bool {
+        matches!(self, Self::Tool { .. } | Self::Thinking { .. })
+    }
+}
+
+/// Explicit conversion seam for a future session/domain transcript.
+///
+/// The current session transcript is reconstructed by AgentEvent updates, so
+/// the input and output are already frontend blocks.  Keeping this function
+/// public makes that boundary explicit and gives a future persisted transcript
+/// one place to map into Ratatui's model.
+pub fn transcript_to_blocks(entries: &[TranscriptEntry]) -> Vec<TranscriptBlock> {
+    entries.to_vec()
+}
+
+// ── Input model ─────────────────────────────────────────────────────────────
+
+/// UTF-8 safe multiline editor state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputState {
+    pub text: String,
+    pub cursor_byte: usize,
+    pub preferred_column: Option<usize>,
+    /// Vertical scroll in wrapped display lines.
+    pub viewport_line: usize,
+}
+
+impl InputState {
+    pub fn set_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor_byte = self.text.len();
+        self.preferred_column = None;
+        self.viewport_line = 0;
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor_byte = 0;
+        self.preferred_column = None;
+        self.viewport_line = 0;
+    }
+
+    fn insert_char(&mut self, c: char) {
+        debug_assert!(self.text.is_char_boundary(self.cursor_byte));
+        self.text.insert(self.cursor_byte, c);
+        self.cursor_byte += c.len_utf8();
+        self.preferred_column = None;
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        debug_assert!(self.text.is_char_boundary(self.cursor_byte));
+        self.text.insert_str(self.cursor_byte, text);
+        self.cursor_byte += text.len();
+        self.preferred_column = None;
+    }
+
+    fn previous_boundary(&self) -> Option<usize> {
+        self.text[..self.cursor_byte].char_indices().next_back().map(|(i, _)| i)
+    }
+
+    fn next_boundary(&self) -> Option<usize> {
+        self.text[self.cursor_byte..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| self.cursor_byte + i)
+    }
+
+    fn move_left(&mut self) {
+        if let Some(previous) = self.previous_boundary() {
+            self.cursor_byte = previous;
+        }
+        self.preferred_column = None;
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.next_boundary() {
+            self.cursor_byte = next;
+        }
+        self.preferred_column = None;
+    }
+
+    fn line_start(&self, byte: usize) -> usize {
+        self.text[..byte].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    fn line_end(&self, byte: usize) -> usize {
+        self.text[byte..].find('\n').map_or(self.text.len(), |i| byte + i)
+    }
+
+    fn current_column(&self) -> usize {
+        self.text[self.line_start(self.cursor_byte)..self.cursor_byte]
+            .chars()
+            .map(char_width)
+            .sum()
+    }
+
+    fn line_bounds(&self, line: usize) -> Option<(usize, usize)> {
+        let mut current = 0;
+        let mut start = 0;
+        for (index, character) in self.text.char_indices() {
+            if current == line {
+                if character == '\n' {
+                    return Some((start, index));
+                }
+            } else if character == '\n' {
+                current += 1;
+                start = index + 1;
+            }
+        }
+        (current == line).then_some((start, self.text.len()))
+    }
+
+    fn current_line(&self) -> usize {
+        self.text[..self.cursor_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+    }
+
+    fn move_home(&mut self) {
+        self.cursor_byte = self.line_start(self.cursor_byte);
+        self.preferred_column = None;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor_byte = self.line_end(self.cursor_byte);
+        self.preferred_column = None;
+    }
+
+    fn move_vertical(&mut self, direction: i32) {
+        let current_line = self.current_line();
+        let target_line = if direction < 0 {
+            current_line.saturating_sub(1)
+        } else {
+            current_line.saturating_add(1)
+        };
+        let Some((start, end)) = self.line_bounds(target_line) else {
+            return;
+        };
+        let desired = self.preferred_column.unwrap_or_else(|| self.current_column());
+        let mut column = 0;
+        let mut cursor = start;
+        for (offset, character) in self.text[start..end].char_indices() {
+            let width = char_width(character);
+            if column + width > desired {
+                break;
+            }
+            column += width;
+            cursor = start + offset + character.len_utf8();
+        }
+        self.cursor_byte = cursor;
+        self.preferred_column = Some(desired);
+    }
+
+    fn delete_to_line_start(&mut self) {
+        let start = self.line_start(self.cursor_byte);
+        self.text.drain(start..self.cursor_byte);
+        self.cursor_byte = start;
+        self.preferred_column = None;
+    }
+
+    fn delete_to_line_end(&mut self) {
+        let end = self.line_end(self.cursor_byte);
+        self.text.drain(self.cursor_byte..end);
+        self.preferred_column = None;
+    }
+
+    fn delete_previous_word(&mut self) {
+        let mut start = self.cursor_byte;
+        let mut saw_non_whitespace = false;
+        while let Some(previous) = self.text[..start].char_indices().next_back() {
+            let character = previous.1;
+            if character.is_whitespace() {
+                if saw_non_whitespace {
+                    break;
+                }
+            } else {
+                saw_non_whitespace = true;
+            }
+            start = previous.0;
+        }
+        self.text.drain(start..self.cursor_byte);
+        self.cursor_byte = start;
+        self.preferred_column = None;
+    }
+
+    fn backspace(&mut self) {
+        if let Some(previous) = self.previous_boundary() {
+            self.text.drain(previous..self.cursor_byte);
+            self.cursor_byte = previous;
+            self.preferred_column = None;
+        }
+    }
+
+    fn delete(&mut self) {
+        if let Some(next) = self.next_boundary() {
+            self.text.drain(self.cursor_byte..next);
+            self.preferred_column = None;
+        }
+    }
+
+    fn cursor_visual_position(&self, width: usize) -> (usize, usize) {
+        visual_position(&self.text, self.cursor_byte, width)
+    }
+}
+
+fn char_width(character: char) -> usize {
+    UnicodeWidthChar::width(character).unwrap_or(0).max(1)
+}
+
+/// Prompt history for the current process only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputHistory {
+    pub entries: Vec<String>,
+    pub cursor: Option<usize>,
+    pub draft: String,
+}
+
+impl InputHistory {
+    fn record(&mut self, prompt: &str) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+        if self.entries.last().is_none_or(|last| last != prompt) {
+            self.entries.push(prompt.to_owned());
+        }
+        self.cursor = None;
+        self.draft.clear();
+    }
+
+    fn previous(&mut self, input: &mut InputState) {
+        if self.entries.is_empty() {
+            return;
+        }
+        if self.cursor.is_none() {
+            self.draft = input.text.clone();
+            self.cursor = Some(self.entries.len() - 1);
+        } else if let Some(cursor) = self.cursor {
+            self.cursor = Some(cursor.saturating_sub(1));
+        }
+        if let Some(cursor) = self.cursor {
+            input.set_text(self.entries[cursor].clone());
+        }
+    }
+
+    fn next(&mut self, input: &mut InputState) {
+        let Some(cursor) = self.cursor else {
+            return;
+        };
+        if cursor + 1 < self.entries.len() {
+            self.cursor = Some(cursor + 1);
+            input.set_text(self.entries[cursor + 1].clone());
+        } else {
+            self.cursor = None;
+            input.set_text(self.draft.clone());
+            self.draft.clear();
+        }
+    }
+}
+
+// ── Focus and scroll state ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Input,
+    Transcript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptSelection {
+    pub selected_block: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollState {
+    pub offset_from_bottom: usize,
+    pub follow_output: bool,
+    pub unread_lines: usize,
+}
+
+impl Default for ScrollState {
+    fn default() -> Self {
+        Self {
+            offset_from_bottom: 0,
+            follow_output: true,
+            unread_lines: 0,
+        }
+    }
+}
+
+// ── App state and reducer ───────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityState {
-    /// Idle, waiting for input.
     Idle,
-    /// Running an agent turn.
     Running,
-    /// User requested cancel, waiting for agent to stop.
     Cancelling,
 }
 
-/// Outcome of the most recent completed run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
     Completed,
@@ -103,253 +422,322 @@ pub enum RunOutcome {
     ToolError(String),
 }
 
-// Note: RunState is replaced by ActivityState + RunOutcome.
-// ActivityState tracks the current activity, RunOutcome tracks the last result.
+/// Complete TUI state.  This is the only state changed by the reducer.
+#[derive(Debug, Clone)]
+pub struct AppState {
+    pub transcript: Vec<TranscriptBlock>,
+    pub input: InputState,
+    pub history: InputHistory,
+    pub focus: Focus,
+    pub selection: TranscriptSelection,
+    pub scroll: ScrollState,
+    pub activity: ActivityState,
+    pub last_outcome: Option<RunOutcome>,
+    pub current_run_id: Option<RunId>,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub terminal_size: (u16, u16),
+    pub quit: bool,
+    tool_index: HashMap<String, usize>,
+    tool_started_at: HashMap<String, Instant>,
+    run_tool_error: Option<String>,
+}
 
-// ── Action ──────────────────────────────────────────────────────────────────
-
-/// Actions that can update the application state.
 #[derive(Debug)]
 pub enum Action {
-    /// A key was pressed.
     KeyInput(KeyEvent),
-    /// Terminal was resized.
+    Paste(String),
     Resize(u16, u16),
-    /// Submit the current input.
     Submit,
-    /// Cancel the current run.
     Cancel,
-    /// An event from the agent.
     AgentEvent(AgentEvent),
-    /// A structured slash-command result.
     CommandResult(CommandResult),
-    /// Quit the application.
     Quit,
 }
 
-// ── Effect ──────────────────────────────────────────────────────────────────
-
-/// Side effects to be performed after a state update.
 #[derive(Debug)]
 pub enum Effect {
-    /// Start an agent run with the given prompt.
     RunAgent(String),
-    /// Cancel the current agent run.
     CancelAgent,
-    /// Quit the application.
     Quit,
 }
-
-// ── update ──────────────────────────────────────────────────────────────────
 
 impl AppState {
     pub fn new(terminal_size: (u16, u16)) -> Self {
         Self {
             transcript: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            input: InputState::default(),
+            history: InputHistory::default(),
+            focus: Focus::Input,
+            selection: TranscriptSelection { selected_block: None },
+            scroll: ScrollState::default(),
             activity: ActivityState::Idle,
             last_outcome: None,
             current_run_id: None,
-            status: String::from("Ready"),
+            provider: "mock".into(),
+            model: "mock".into(),
+            status: "Ready".into(),
             error: None,
             terminal_size,
             quit: false,
-            scroll_offset: 0,
             tool_index: HashMap::new(),
+            tool_started_at: HashMap::new(),
+            run_tool_error: None,
         }
     }
 
-    /// Process an action and return any side effects.
-    pub fn update(&mut self, action: Action) -> Vec<Effect> {
-        let mut effects = Vec::new();
+    pub fn set_provider_model(&mut self, provider: impl Into<String>, model: impl Into<String>) {
+        self.provider = provider.into();
+        self.model = model.into();
+    }
 
+    pub fn update(&mut self, action: Action) -> Vec<Effect> {
         match action {
-            Action::KeyInput(key) => {
-                self.error = None; // Clear error on any input
-                match key.code {
-                    KeyCode::Char(c) => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            match c {
-                                'c' => {
-                                    if self.activity == ActivityState::Running {
-                                        effects.push(Effect::CancelAgent);
-                                    } else {
-                                        effects.push(Effect::Quit);
-                                    }
-                                }
-                                'a' => {
-                                    self.cursor = 0;
-                                }
-                                'e' => {
-                                    self.cursor = self.input.len();
-                                }
-                                'u' => {
-                                    self.input.clear();
-                                    self.cursor = 0;
-                                }
-                                'w' => {
-                                    // Delete word backward
-                                    let before = &self.input[..self.cursor];
-                                    let new_pos = before.rfind(' ').map(|p| p + 1).unwrap_or(0);
-                                    self.input.drain(new_pos..self.cursor);
-                                    self.cursor = new_pos;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            self.input.insert(self.cursor, c);
-                            self.cursor += c.len_utf8();
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if self.activity == ActivityState::Idle {
-                            let prompt = self.input.trim().to_string();
-                            if !prompt.is_empty() {
-                                self.transcript.push(TranscriptEntry::User(prompt.clone()));
-                                self.activity = ActivityState::Running;
-                                self.status = "Running...".into();
-                                self.input.clear();
-                                self.cursor = 0;
-                                effects.push(Effect::RunAgent(prompt));
-                            }
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if self.cursor > 0 {
-                            // Find the previous character boundary
-                            let prev = self.input[..self.cursor]
-                                .char_indices()
-                                .next_back()
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            self.input.drain(prev..self.cursor);
-                            self.cursor = prev;
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if self.cursor < self.input.len() {
-                            let next = self.input[self.cursor..]
-                                .char_indices()
-                                .nth(1)
-                                .map(|(i, _)| self.cursor + i)
-                                .unwrap_or(self.input.len());
-                            self.input.drain(self.cursor..next);
-                        }
-                    }
-                    KeyCode::Left => {
-                        if self.cursor > 0 {
-                            let prev = self.input[..self.cursor]
-                                .char_indices()
-                                .next_back()
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            self.cursor = prev;
-                        }
-                    }
-                    KeyCode::Right => {
-                        if self.cursor < self.input.len() {
-                            let next = self.input[self.cursor..]
-                                .char_indices()
-                                .nth(1)
-                                .map(|(i, _)| self.cursor + i)
-                                .unwrap_or(self.input.len());
-                            self.cursor = next;
-                        }
-                    }
-                    KeyCode::Home => {
-                        self.cursor = 0;
-                    }
-                    KeyCode::End => {
-                        self.cursor = self.input.len();
-                    }
-                    KeyCode::Up => {
-                        self.scroll_offset = self.scroll_offset.saturating_add(1);
-                    }
-                    KeyCode::Down => {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                    }
-                    KeyCode::PageUp => {
-                        self.scroll_offset = self.scroll_offset.saturating_add(10);
-                    }
-                    KeyCode::PageDown => {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(10);
-                    }
-                    _ => {}
+            Action::KeyInput(key) => self.handle_key(key),
+            Action::Paste(text) => {
+                if self.focus == Focus::Input {
+                    self.input.insert_text(&text);
+                    self.sync_input_viewport();
                 }
+                Vec::new()
             }
-            Action::Resize(w, h) => {
-                self.terminal_size = (w, h);
+            Action::Resize(width, height) => {
+                self.terminal_size = (width, height);
+                self.clamp_scroll();
+                self.sync_input_viewport();
+                Vec::new()
             }
-            Action::Submit => {
-                // Same as Enter
-                if self.activity == ActivityState::Idle {
-                    let prompt = self.input.trim().to_string();
-                    if !prompt.is_empty() {
-                        self.transcript.push(TranscriptEntry::User(prompt.clone()));
-                        self.activity = ActivityState::Running;
-                        self.status = "Running...".into();
-                        self.input.clear();
-                        self.cursor = 0;
-                        effects.push(Effect::RunAgent(prompt));
-                    }
-                }
-            }
-            Action::Cancel => {
-                if self.activity == ActivityState::Running {
-                    self.activity = ActivityState::Cancelling;
-                    effects.push(Effect::CancelAgent);
-                }
-            }
+            Action::Submit => self.submit(),
+            Action::Cancel => self.cancel(),
             Action::AgentEvent(event) => {
                 self.handle_agent_event(event);
+                Vec::new()
             }
-            Action::CommandResult(result) => {
-                effects.extend(self.apply_command_result(result));
-            }
+            Action::CommandResult(result) => self.apply_command_result(result),
             Action::Quit => {
                 self.quit = true;
-                effects.push(Effect::Quit);
+                vec![Effect::Quit]
             }
         }
-
-        effects
     }
 
-    /// Apply a command result without letting the command write to a terminal.
-    ///
-    /// Command output is represented as transcript content so the same result
-    /// can be rendered by Ratatui or another frontend.
+    fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        self.error = None;
+
+        // These routes are global so input focus cannot accidentally consume
+        // transcript navigation keys.
+        match key.code {
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Focus::Input => {
+                        self.selection.selected_block = self.last_selectable();
+                        Focus::Transcript
+                    }
+                    Focus::Transcript => Focus::Input,
+                };
+                return Vec::new();
+            }
+            KeyCode::PageUp => {
+                self.scroll_by(10, true);
+                return Vec::new();
+            }
+            KeyCode::PageDown => {
+                self.scroll_by(10, false);
+                return Vec::new();
+            }
+            KeyCode::Esc => {
+                self.selection.selected_block = None;
+                self.focus = Focus::Input;
+                return Vec::new();
+            }
+            _ => {}
+        }
+
+        if self.focus == Focus::Transcript {
+            return self.handle_transcript_key(key);
+        }
+        self.handle_input_key(key)
+    }
+
+    fn handle_transcript_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Char('i') => {
+                self.focus = Focus::Input;
+            }
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Home => {
+                self.scroll_to_start();
+                self.selection.selected_block = self.first_selectable();
+            }
+            KeyCode::End => {
+                self.scroll_to_end();
+                self.selection.selected_block = self.last_selectable();
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected(),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.handle_ctrl_c();
+        }
+
+        if key.code == KeyCode::Enter
+            && (key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT))
+        {
+            self.input.insert_char('\n');
+            self.sync_input_viewport();
+            return Vec::new();
+        }
+
+        if let KeyCode::Char(character) = key.code {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match character {
+                    'a' => self.input.move_home(),
+                    'e' => self.input.move_end(),
+                    'j' => self.input.insert_char('\n'),
+                    'u' => self.input.delete_to_line_start(),
+                    'k' => self.input.delete_to_line_end(),
+                    'w' => self.input.delete_previous_word(),
+                    _ => return Vec::new(),
+                }
+                self.sync_input_viewport();
+                return Vec::new();
+            }
+            self.input.insert_char(character);
+            self.sync_input_viewport();
+            return Vec::new();
+        }
+
+        match key.code {
+            KeyCode::Enter => self.submit(),
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            KeyCode::Delete => {
+                self.input.delete();
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            KeyCode::Left => {
+                self.input.move_left();
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            KeyCode::Right => {
+                self.input.move_right();
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            KeyCode::Up => {
+                if self.input.text.is_empty() || can_browse_history(&self.input) {
+                    self.history.previous(&mut self.input);
+                } else {
+                    self.input.move_vertical(-1);
+                }
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            KeyCode::Down => {
+                if self.history.cursor.is_some() {
+                    self.history.next(&mut self.input);
+                } else {
+                    self.input.move_vertical(1);
+                }
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            KeyCode::Home => {
+                self.input.move_home();
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            KeyCode::End => {
+                // End edits the current line and also has the useful global
+                // meaning of returning the transcript to the latest output.
+                self.input.move_end();
+                self.scroll_to_end();
+                self.sync_input_viewport();
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_ctrl_c(&mut self) -> Vec<Effect> {
+        match self.activity {
+            ActivityState::Running => self.cancel(),
+            ActivityState::Cancelling => Vec::new(),
+            ActivityState::Idle if !self.input.text.is_empty() => {
+                self.input.clear();
+                self.history.cursor = None;
+                self.history.draft.clear();
+                self.status = "Input cleared".into();
+                Vec::new()
+            }
+            ActivityState::Idle => Vec::new(),
+        }
+    }
+
+    fn submit(&mut self) -> Vec<Effect> {
+        if self.activity != ActivityState::Idle {
+            self.status = "Running · Enter unavailable · Ctrl+C to cancel".into();
+            return Vec::new();
+        }
+        let prompt = self.input.text.clone();
+        if prompt.trim().is_empty() {
+            return Vec::new();
+        }
+        self.transcript.push(TranscriptBlock::User { text: prompt.clone() });
+        self.enforce_block_limit();
+        self.history.record(&prompt);
+        self.input.clear();
+        self.focus = Focus::Input;
+        self.activity = ActivityState::Running;
+        self.last_outcome = None;
+        self.run_tool_error = None;
+        self.status = "Running".into();
+        self.note_new_lines(2);
+        vec![Effect::RunAgent(prompt)]
+    }
+
+    fn cancel(&mut self) -> Vec<Effect> {
+        if self.activity == ActivityState::Running {
+            self.activity = ActivityState::Cancelling;
+            self.status = "Cancelling · waiting for agent".into();
+            vec![Effect::CancelAgent]
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn apply_command_result(&mut self, result: CommandResult) -> Vec<Effect> {
         self.activity = ActivityState::Idle;
         self.error = None;
-
-        match result {
-            CommandResult::Message(message) => {
-                self.transcript.push(TranscriptEntry::System(message));
-                self.status = "Ready".into();
-                Vec::new()
-            }
+        let block = match result {
+            CommandResult::Message(message) => TranscriptBlock::System { message },
             CommandResult::Error(message) => {
+                let message = sanitize_message(&message);
                 self.error = Some(message.clone());
-                self.transcript.push(TranscriptEntry::ProviderError(message));
-                self.status = "Error".into();
-                Vec::new()
+                self.status = "Command error".into();
+                TranscriptBlock::Error { message }
             }
-            CommandResult::Help(items) => {
-                self.transcript.push(TranscriptEntry::System(format_help(&items)));
-                self.status = "Ready".into();
-                Vec::new()
-            }
-            CommandResult::ModelChanged { model } => {
-                self.transcript
-                    .push(TranscriptEntry::System(format!("Switched to {model}")));
-                self.status = "Ready".into();
-                Vec::new()
-            }
-            CommandResult::Sessions(sessions) => {
-                let text = if sessions.is_empty() {
-                    "No sessions found.".to_string()
+            CommandResult::Help(items) => TranscriptBlock::System {
+                message: format_help(&items),
+            },
+            CommandResult::ModelChanged { model } => TranscriptBlock::System {
+                message: format!("Switched to {model}"),
+            },
+            CommandResult::Sessions(sessions) => TranscriptBlock::System {
+                message: if sessions.is_empty() {
+                    "No sessions found.".into()
                 } else {
                     let mut text = String::from("Available sessions:");
                     for session in sessions {
@@ -359,213 +747,493 @@ impl AppState {
                         ));
                     }
                     text
-                };
-                self.transcript.push(TranscriptEntry::System(text));
-                self.status = "Ready".into();
-                Vec::new()
-            }
+                },
+            },
             CommandResult::Quit => {
                 self.quit = true;
-                vec![Effect::Quit]
+                return vec![Effect::Quit];
             }
-            CommandResult::Noop => Vec::new(),
+            CommandResult::Noop => return Vec::new(),
+        };
+        let line_count = block_line_count(&block);
+        self.transcript.push(block);
+        self.enforce_block_limit();
+        self.note_new_lines(line_count);
+        if self.error.is_none() {
+            self.status = "Ready".into();
         }
+        Vec::new()
     }
 
-    /// Handle an agent event by updating the transcript.
-    /// Events from old runs are silently ignored.
-    fn handle_agent_event(&mut self, event: AgentEvent) {
+    /// Reduce one domain event into the frontend transcript.
+    /// Events from an older run are ignored by RunId, never appended to a new
+    /// run's blocks.
+    pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::RunStarted { run_id } => {
-                // Track the current run; clear old tool_index
                 self.current_run_id = Some(run_id);
+                self.activity = ActivityState::Running;
                 self.tool_index.clear();
+                self.tool_started_at.clear();
+                self.run_tool_error = None;
             }
-            AgentEvent::TextDelta { run_id, text } => {
-                // Ignore events from old runs
-                if self.current_run_id != Some(run_id) {
+            AgentEvent::TextDelta { run_id, text } if self.accepts(run_id) => {
+                if text.is_empty() {
                     return;
                 }
-                // Find or create the last assistant entry
                 match self.transcript.last_mut() {
-                    Some(TranscriptEntry::Assistant(s)) => {
-                        s.push_str(&text);
+                    Some(TranscriptBlock::Assistant {
+                        text: current,
+                        streaming,
+                    }) => {
+                        current.push_str(&text);
+                        *streaming = true;
                     }
-                    _ => {
-                        self.transcript.push(TranscriptEntry::Assistant(text));
-                    }
+                    _ => self.transcript.push(TranscriptBlock::Assistant {
+                        text: text.clone(),
+                        streaming: true,
+                    }),
                 }
+                self.note_new_lines(text_line_count(&text));
+                self.enforce_block_limit();
             }
-            AgentEvent::ThinkingDelta { run_id, text } => {
-                if self.current_run_id != Some(run_id) {
+            AgentEvent::ThinkingDelta { run_id, text } if self.accepts(run_id) => {
+                if text.is_empty() {
                     return;
                 }
-                // Show thinking in status
-                self.status = format!("Thinking: {}", text.chars().take(50).collect::<String>());
+                match self.transcript.last_mut() {
+                    Some(TranscriptBlock::Thinking { text: current, .. }) => current.push_str(&text),
+                    _ => self.transcript.push(TranscriptBlock::Thinking {
+                        text: text.clone(),
+                        expanded: false,
+                    }),
+                }
+                self.status = format!("Thinking · {} lines", text_line_count(&text));
+                self.note_new_lines(text_line_count(&text));
+                self.enforce_block_limit();
             }
             AgentEvent::ToolStarted {
                 run_id,
                 tool_call_id,
                 name,
                 arguments,
-            } => {
-                if self.current_run_id != Some(run_id) {
-                    return;
-                }
-                let idx = self.transcript.len();
-                self.tool_index.insert(tool_call_id.clone(), idx);
-                self.transcript.push(TranscriptEntry::Tool {
-                    id: tool_call_id,
-                    name: name.clone(),
-                    arguments,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    state: ToolRunState::Running,
-                    result: None,
-                });
-                self.status = format!("Running {}...", name);
+            } if self.accepts(run_id) => {
+                let index = self.transcript.len();
+                self.tool_index.insert(tool_call_id.clone(), index);
+                self.tool_started_at.insert(tool_call_id.clone(), Instant::now());
+                self.transcript
+                    .push(TranscriptBlock::tool(tool_call_id, name.clone(), arguments));
+                self.status = format!("Running {name}");
+                self.note_new_lines(1);
+                self.enforce_block_limit();
             }
             AgentEvent::ToolOutput {
                 run_id,
                 tool_call_id,
                 stream,
                 chunk,
-            } => {
-                if self.current_run_id != Some(run_id) {
-                    return;
-                }
-                if let Some(&idx) = self.tool_index.get(&tool_call_id) {
-                    if let Some(TranscriptEntry::Tool { stdout, stderr, .. }) = self.transcript.get_mut(idx) {
-                        match stream {
-                            crate::agent::events::ToolOutputStream::Stdout => {
-                                stdout.push_str(&chunk);
-                            }
-                            crate::agent::events::ToolOutputStream::Stderr => {
-                                stderr.push_str(&chunk);
-                            }
-                        }
-                    }
-                } else {
-                    // Unknown tool ID — create orphan entry so we don't lose output
-                    let idx = self.transcript.len();
-                    self.tool_index.insert(tool_call_id.clone(), idx);
-                    let mut stdout = String::new();
-                    let mut stderr = String::new();
-                    match stream {
-                        crate::agent::events::ToolOutputStream::Stdout => {
-                            stdout.push_str(&chunk);
-                        }
-                        crate::agent::events::ToolOutputStream::Stderr => {
-                            stderr.push_str(&chunk);
-                        }
-                    }
-                    self.transcript.push(TranscriptEntry::Tool {
-                        id: tool_call_id,
-                        name: "unknown".into(),
-                        arguments: serde_json::Value::Null,
-                        stdout,
-                        stderr,
-                        state: ToolRunState::Running,
-                        result: None,
-                    });
-                }
+            } if self.accepts(run_id) => {
+                self.reduce_tool_output(tool_call_id, stream, &chunk);
+                self.note_new_lines(text_line_count(&chunk));
             }
             AgentEvent::ToolFinished {
                 run_id,
                 tool_call_id,
                 name,
                 result,
-            } => {
-                if self.current_run_id != Some(run_id) {
-                    return;
-                }
-                let tool_state = if result.timed_out {
-                    ToolRunState::TimedOut
-                } else if result.aborted {
-                    ToolRunState::Aborted
-                } else if result.is_error {
-                    ToolRunState::Failed
-                } else {
-                    ToolRunState::Succeeded
-                };
-
-                if let Some(&idx) = self.tool_index.get(&tool_call_id) {
-                    if let Some(TranscriptEntry::Tool {
+            } if self.accepts(run_id) => {
+                let tool_state = tool_state_for(&result);
+                let duration = self.tool_started_at.remove(&tool_call_id).map(|start| start.elapsed());
+                let final_text = result
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        crate::ai::types::Content::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Some(&index) = self.tool_index.get(&tool_call_id) {
+                    if let Some(TranscriptBlock::Tool {
                         name: entry_name,
-                        state: entry_state,
-                        result: entry_result,
+                        state,
+                        exit_code,
+                        duration: entry_duration,
+                        stdout,
+                        stderr,
                         ..
-                    }) = self.transcript.get_mut(idx)
+                    }) = self.transcript.get_mut(index)
                     {
-                        // Update name if it was unknown (orphan from ToolOutput)
                         if entry_name == "unknown" {
-                            *entry_name = name;
+                            *entry_name = name.clone();
                         }
-                        *entry_state = tool_state;
-                        *entry_result = Some(result);
+                        *state = tool_state;
+                        *exit_code = result.exit_code;
+                        *entry_duration = duration;
+                        // Most tools stream their result.  For tools that do
+                        // not, retain the final text once rather than adding
+                        // a duplicate after ToolOutput chunks.
+                        if stdout.is_empty() && stderr.is_empty() && !final_text.is_empty() {
+                            append_limited(stdout, &final_text);
+                        }
                     }
                 } else {
-                    // ToolFinished for unknown ID — create entry
-                    let idx = self.transcript.len();
-                    self.tool_index.insert(tool_call_id.clone(), idx);
-                    self.transcript.push(TranscriptEntry::Tool {
-                        id: tool_call_id,
-                        name,
-                        arguments: serde_json::Value::Null,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        state: tool_state,
-                        result: Some(result),
-                    });
+                    let index = self.transcript.len();
+                    self.tool_index.insert(tool_call_id.clone(), index);
+                    let mut block = TranscriptBlock::tool(tool_call_id, name.clone(), serde_json::Value::Null);
+                    if let TranscriptBlock::Tool {
+                        state,
+                        exit_code,
+                        duration: entry_duration,
+                        stdout,
+                        stderr,
+                        ..
+                    } = &mut block
+                    {
+                        *state = tool_state;
+                        *exit_code = result.exit_code;
+                        *entry_duration = duration;
+                        if stdout.is_empty() && stderr.is_empty() && !final_text.is_empty() {
+                            append_limited(stdout, &final_text);
+                        }
+                    }
+                    self.transcript.push(block);
+                    self.note_new_lines(1);
                 }
-                self.status = "Running...".into();
+                if tool_state == ToolRunState::Failed {
+                    self.run_tool_error = Some(format!("{} failed", name));
+                    self.status = format!("Tool error · {name}");
+                } else {
+                    self.status = format!("{} · {}", name, tool_state.label());
+                }
             }
-            AgentEvent::ProviderError { run_id, error } => {
-                if self.current_run_id != Some(run_id) {
-                    return;
-                }
-                self.transcript
-                    .push(TranscriptEntry::ProviderError(error.message.clone()));
-                self.error = Some(error.message);
+            AgentEvent::ProviderError { run_id, error } if self.accepts(run_id) => {
+                let message = sanitize_message(&error.message);
+                self.error = Some(message.clone());
+                self.transcript.push(TranscriptBlock::Error { message });
+                self.note_new_lines(2);
+                self.enforce_block_limit();
             }
-            AgentEvent::RunAborted { run_id } => {
-                if self.current_run_id != Some(run_id) {
-                    return;
-                }
+            AgentEvent::RunAborted { run_id } if self.accepts(run_id) => {
+                self.finish_assistant_stream();
                 self.activity = ActivityState::Idle;
                 self.last_outcome = Some(RunOutcome::Aborted);
-                self.transcript.push(TranscriptEntry::System("Run aborted".into()));
+                self.transcript.push(TranscriptBlock::System {
+                    message: "Run aborted".into(),
+                });
                 self.status = "Aborted".into();
+                self.note_new_lines(2);
+                self.enforce_block_limit();
             }
-            AgentEvent::RunFinished { run_id, stop_reason } => {
-                if self.current_run_id != Some(run_id) {
-                    return;
-                }
-                self.activity = ActivityState::Idle;
+            AgentEvent::RunFinished { run_id, stop_reason } if self.accepts(run_id) => {
+                self.finish_assistant_stream();
                 match stop_reason {
+                    StopReason::ToolUse => {
+                        self.activity = ActivityState::Running;
+                        self.status = "Running".into();
+                    }
                     StopReason::Stop => {
-                        self.last_outcome = Some(RunOutcome::Completed);
+                        self.activity = ActivityState::Idle;
+                        self.last_outcome = self
+                            .run_tool_error
+                            .take()
+                            .map(RunOutcome::ToolError)
+                            .or(Some(RunOutcome::Completed));
                         self.status = "Ready".into();
                     }
-                    StopReason::Error => {
-                        self.last_outcome = Some(RunOutcome::ProviderError("Provider error".into()));
-                        self.status = "Error".into();
-                    }
                     StopReason::Length => {
+                        self.activity = ActivityState::Idle;
                         self.last_outcome = Some(RunOutcome::Completed);
-                        self.status = "Truncated".into();
+                        self.status = "Completed · response truncated".into();
+                    }
+                    StopReason::Error => {
+                        self.activity = ActivityState::Idle;
+                        self.last_outcome = Some(RunOutcome::ProviderError(
+                            self.error.clone().unwrap_or_else(|| "Provider error".into()),
+                        ));
+                        self.status = "Provider error".into();
                     }
                     StopReason::Aborted => {
+                        self.activity = ActivityState::Idle;
                         self.last_outcome = Some(RunOutcome::Aborted);
                         self.status = "Aborted".into();
                     }
-                    StopReason::ToolUse => {
-                        self.status = "Running...".into();
-                    }
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn accepts(&self, run_id: RunId) -> bool {
+        self.current_run_id == Some(run_id)
+    }
+
+    fn finish_assistant_stream(&mut self) {
+        if let Some(TranscriptBlock::Assistant { streaming, .. }) = self.transcript.last_mut() {
+            *streaming = false;
+        }
+    }
+
+    fn reduce_tool_output(&mut self, tool_call_id: String, stream: ToolOutputStream, chunk: &str) {
+        let index = if let Some(index) = self.tool_index.get(&tool_call_id).copied() {
+            index
+        } else {
+            let index = self.transcript.len();
+            self.tool_index.insert(tool_call_id.clone(), index);
+            self.transcript.push(TranscriptBlock::tool(
+                tool_call_id,
+                "unknown".into(),
+                serde_json::Value::Null,
+            ));
+            index
+        };
+        if let Some(TranscriptBlock::Tool { stdout, stderr, .. }) = self.transcript.get_mut(index) {
+            match stream {
+                ToolOutputStream::Stdout => append_limited(stdout, chunk),
+                ToolOutputStream::Stderr => append_limited(stderr, chunk),
+            }
+        }
+        self.enforce_block_limit();
+    }
+
+    fn enforce_block_limit(&mut self) {
+        if self.transcript.len() <= MAX_TRANSCRIPT_BLOCKS {
+            return;
+        }
+        let remove = self.transcript.len() - MAX_TRANSCRIPT_BLOCKS;
+        self.transcript.drain(0..remove);
+        for index in self.tool_index.values_mut() {
+            *index = index.saturating_sub(remove);
+        }
+        self.tool_index.retain(|_, index| *index < self.transcript.len());
+        self.selection.selected_block = self
+            .selection
+            .selected_block
+            .and_then(|index| (index >= remove).then_some(index - remove));
+    }
+
+    fn note_new_lines(&mut self, count: usize) {
+        if !self.scroll.follow_output {
+            self.scroll.unread_lines = self.scroll.unread_lines.saturating_add(count.max(1));
+        } else {
+            self.scroll.offset_from_bottom = 0;
+            self.scroll.unread_lines = 0;
+        }
+    }
+
+    pub fn scroll_by(&mut self, amount: usize, towards_start: bool) {
+        if towards_start {
+            self.scroll.offset_from_bottom = self.scroll.offset_from_bottom.saturating_add(amount);
+            self.scroll.follow_output = false;
+        } else {
+            self.scroll.offset_from_bottom = self.scroll.offset_from_bottom.saturating_sub(amount);
+            if self.scroll.offset_from_bottom == 0 {
+                self.scroll.follow_output = true;
+                self.scroll.unread_lines = 0;
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    pub fn scroll_to_start(&mut self) {
+        self.scroll.offset_from_bottom = self
+            .total_transcript_lines()
+            .saturating_sub(self.transcript_viewport_lines());
+        self.scroll.follow_output = false;
+    }
+
+    pub fn scroll_to_end(&mut self) {
+        self.scroll.offset_from_bottom = 0;
+        self.scroll.follow_output = true;
+        self.scroll.unread_lines = 0;
+    }
+
+    fn clamp_scroll(&mut self) {
+        let max = self
+            .total_transcript_lines()
+            .saturating_sub(self.transcript_viewport_lines());
+        self.scroll.offset_from_bottom = self.scroll.offset_from_bottom.min(max);
+        if self.scroll.offset_from_bottom == 0 && self.scroll.follow_output {
+            self.scroll.unread_lines = 0;
+        }
+    }
+
+    fn transcript_viewport_lines(&self) -> usize {
+        let input = input_height(self.terminal_size.0, self.terminal_size.1, &self.input);
+        self.terminal_size.1.saturating_sub(input).saturating_sub(3).max(1) as usize
+    }
+
+    fn total_transcript_lines(&self) -> usize {
+        render_lines(self)
+            .iter()
+            .map(|line| wrapped_line_count(&line.text, self.transcript_width()))
+            .sum()
+    }
+
+    fn transcript_width(&self) -> usize {
+        self.terminal_size.0.saturating_sub(2).max(1) as usize
+    }
+
+    fn sync_input_viewport(&mut self) {
+        let width = self.terminal_size.0.saturating_sub(2).max(1) as usize;
+        let (line, _) = self.input.cursor_visual_position(width);
+        let visible = input_height(self.terminal_size.0, self.terminal_size.1, &self.input).saturating_sub(2) as usize;
+        let visible = visible.max(1);
+        if line < self.input.viewport_line {
+            self.input.viewport_line = line;
+        } else if line >= self.input.viewport_line + visible {
+            self.input.viewport_line = line + 1 - visible;
+        }
+    }
+
+    fn first_selectable(&self) -> Option<usize> {
+        self.transcript.iter().position(TranscriptBlock::is_expandable)
+    }
+
+    fn last_selectable(&self) -> Option<usize> {
+        self.transcript.iter().rposition(TranscriptBlock::is_expandable)
+    }
+
+    fn move_selection(&mut self, direction: i32) {
+        let candidates: Vec<usize> = self
+            .transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| block.is_expandable().then_some(index))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let current = self
+            .selection
+            .selected_block
+            .and_then(|selected| candidates.iter().position(|index| *index == selected));
+        let next = match (current, direction) {
+            (None, -1) => candidates.len() - 1,
+            (None, _) => 0,
+            (Some(position), -1) => position.saturating_sub(1),
+            (Some(position), _) => (position + 1).min(candidates.len() - 1),
+        };
+        self.selection.selected_block = Some(candidates[next]);
+    }
+
+    fn toggle_selected(&mut self) {
+        let Some(index) = self.selection.selected_block else {
+            return;
+        };
+        match self.transcript.get_mut(index) {
+            Some(TranscriptBlock::Tool { expanded, .. }) | Some(TranscriptBlock::Thinking { expanded, .. }) => {
+                *expanded = !*expanded;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn tool_state_for(result: &AgentToolResult) -> ToolRunState {
+    if result.timed_out {
+        ToolRunState::TimedOut
+    } else if result.aborted {
+        ToolRunState::Aborted
+    } else if result.is_error {
+        ToolRunState::Failed
+    } else {
+        ToolRunState::Succeeded
+    }
+}
+
+fn text_line_count(text: &str) -> usize {
+    text.split('\n').count().max(1)
+}
+
+fn can_browse_history(input: &InputState) -> bool {
+    !input.text.contains('\n') && input.current_line() == 0
+}
+
+fn block_line_count(block: &TranscriptBlock) -> usize {
+    match block {
+        TranscriptBlock::User { text }
+        | TranscriptBlock::Assistant { text, .. }
+        | TranscriptBlock::Error { message: text }
+        | TranscriptBlock::System { message: text } => text_line_count(text) + 1,
+        TranscriptBlock::Thinking { text, expanded } => {
+            if *expanded {
+                text_line_count(text) + 1
+            } else {
+                1
+            }
+        }
+        TranscriptBlock::Tool {
+            expanded,
+            stdout,
+            stderr,
+            ..
+        } => {
+            if *expanded {
+                5 + text_line_count(stdout) + text_line_count(stderr)
+            } else {
+                1
             }
         }
     }
+}
+
+fn append_limited(output: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    let without_marker = output.replace(OUTPUT_TRUNCATION_MARKER, "");
+    let combined = format!("{without_marker}{chunk}");
+    if combined.len() <= MAX_TOOL_OUTPUT_BYTES {
+        *output = combined;
+        return;
+    }
+    let available = MAX_TOOL_OUTPUT_BYTES.saturating_sub(OUTPUT_TRUNCATION_MARKER.len());
+    let head_budget = available / 2;
+    let tail_budget = available.saturating_sub(head_budget);
+    let head = safe_prefix(&combined, head_budget);
+    let tail = safe_suffix(&combined, tail_budget);
+    *output = format!("{head}{OUTPUT_TRUNCATION_MARKER}{tail}");
+}
+
+fn safe_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn safe_suffix(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+fn sanitize_message(message: &str) -> String {
+    let sensitive = [
+        "authorization",
+        "api_key",
+        "apikey",
+        "access_token",
+        "bearer ",
+        "token=",
+    ];
+    message
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if sensitive.iter().any(|needle| lower.contains(needle)) {
+                let end = line.find(['=', ':']).map(|index| index + 1).unwrap_or(0);
+                format!("{} [redacted]", line[..end].trim_end())
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_help(items: &[CommandHelpItem]) -> String {
@@ -573,180 +1241,386 @@ fn format_help(items: &[CommandHelpItem]) -> String {
     for item in items {
         output.push_str(&format!("\n  /{:<12} {}", item.name, item.description));
     }
+    output.push_str(
+        "\n\nKeys: Enter submit · Ctrl+J newline · Tab focus · PageUp/Down scroll · End latest · Space expand · Ctrl+C cancel",
+    );
     output
 }
 
-// ── view ────────────────────────────────────────────────────────────────────
+// ── Rendering ───────────────────────────────────────────────────────────────
 
-/// Render the application state to a terminal frame.
+#[derive(Debug, Clone)]
+struct RenderLine {
+    text: String,
+    style: Style,
+}
+
 pub fn view(frame: &mut Frame, state: &AppState) {
+    let input_lines = input_height(state.terminal_size.0, state.terminal_size.1, &state.input);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),    // Transcript
-            Constraint::Length(3), // Input
-            Constraint::Length(1), // Status
+            Constraint::Min(1),
+            Constraint::Length(input_lines),
+            Constraint::Length(1),
         ])
         .split(frame.area());
-
-    // Transcript
     render_transcript(frame, state, chunks[0]);
-
-    // Input
     render_input(frame, state, chunks[1]);
-
-    // Status
     render_status(frame, state, chunks[2]);
 }
 
-/// Render the transcript area.
-fn render_transcript(frame: &mut Frame, state: &AppState, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+fn input_height(width: u16, height: u16, input: &InputState) -> u16 {
+    if height <= 4 {
+        return height.saturating_sub(1).max(1);
+    }
+    let max_height = (height.saturating_mul(3) / 10).clamp(3, 8);
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let content_lines = input
+        .text
+        .split('\n')
+        .map(|line| wrapped_line_count(line, inner_width))
+        .sum::<usize>()
+        .max(1);
+    let cursor_line = input.cursor_visual_position(inner_width).0 + 1;
+    let lines = content_lines.max(cursor_line) as u16;
+    (lines + 2).clamp(3, max_height)
+}
 
-    for entry in &state.transcript {
-        match entry {
-            TranscriptEntry::User(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled("You: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw(text.clone()),
-                ]));
-                lines.push(Line::from(""));
+fn render_transcript(frame: &mut Frame, state: &AppState, area: Rect) {
+    let lines = render_lines(state);
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let total = lines
+        .iter()
+        .map(|line| wrapped_line_count(&line.text, width))
+        .sum::<usize>();
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let max_top = total.saturating_sub(visible);
+    let top = if state.scroll.follow_output {
+        max_top
+    } else {
+        max_top.saturating_sub(state.scroll.offset_from_bottom)
+    } as u16;
+
+    let title = if state.scroll.follow_output {
+        "Transcript".to_string()
+    } else if state.scroll.unread_lines > 0 {
+        format!("Transcript · {} new lines · End to follow", state.scroll.unread_lines)
+    } else {
+        "Transcript · browsing history".into()
+    };
+    let paragraph = Paragraph::new(
+        lines
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line.text, line.style)))
+            .collect::<Vec<_>>(),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    )
+    .scroll((top, 0))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_lines(state: &AppState) -> Vec<RenderLine> {
+    let mut lines = Vec::new();
+    for (index, block) in state.transcript.iter().enumerate() {
+        let selected = state.selection.selected_block == Some(index);
+        let selection_style = |style: Style| {
+            if selected {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
             }
-            TranscriptEntry::Assistant(text) => {
-                for line in text.lines() {
-                    lines.push(Line::from(vec![Span::raw(line.to_string())]));
+        };
+        match block {
+            TranscriptBlock::User { text } => {
+                lines.push(RenderLine {
+                    text: "You".into(),
+                    style: selection_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                });
+                push_body_lines(&mut lines, text, Color::Cyan, selected);
+            }
+            TranscriptBlock::Assistant { text, streaming } => {
+                lines.push(RenderLine {
+                    text: if *streaming {
+                        "Assistant · streaming"
+                    } else {
+                        "Assistant"
+                    }
+                    .into(),
+                    style: selection_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                });
+                push_body_lines(&mut lines, text, Color::White, selected);
+            }
+            TranscriptBlock::Thinking { text, expanded } => {
+                let line_count = text_line_count(text);
+                lines.push(RenderLine {
+                    text: if *expanded {
+                        "▼ Thinking".into()
+                    } else {
+                        format!("▶ Thinking… {line_count} lines")
+                    },
+                    style: selection_style(Style::default().fg(Color::Magenta)),
+                });
+                if *expanded {
+                    push_body_lines(&mut lines, text, Color::Magenta, selected);
                 }
-                lines.push(Line::from(""));
             }
-            TranscriptEntry::Tool {
+            TranscriptBlock::Tool {
                 name,
+                arguments_display,
                 stdout,
                 stderr,
                 state: tool_state,
+                expanded,
+                exit_code,
                 ..
             } => {
-                let (icon, style) = match tool_state {
-                    ToolRunState::Running => ("⚙", Style::default().fg(Color::Yellow)),
-                    ToolRunState::Succeeded => ("✅", Style::default().fg(Color::Green)),
-                    ToolRunState::Failed => ("❌", Style::default().fg(Color::Red)),
-                    ToolRunState::TimedOut => ("⏰", Style::default().fg(Color::Red)),
-                    ToolRunState::Aborted => ("⏹", Style::default().fg(Color::Yellow)),
-                };
-                let status_label = match tool_state {
-                    ToolRunState::Running => " running...".to_string(),
-                    ToolRunState::Succeeded => String::new(),
-                    ToolRunState::Failed => " [failed]".to_string(),
-                    ToolRunState::TimedOut => " [timed out]".to_string(),
-                    ToolRunState::Aborted => " [aborted]".to_string(),
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{} {}{}", icon, name, status_label),
-                    style,
-                )]));
-                // Show stdout
-                for line in stdout.lines().take(3) {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {}", line),
-                        Style::default().fg(Color::DarkGray),
-                    )]));
+                let exit = exit_code.map(|code| format!(" · exit {code}")).unwrap_or_default();
+                lines.push(RenderLine {
+                    text: if *expanded {
+                        format!("▼ {name}  {}{exit}", tool_state.label())
+                    } else {
+                        format!("▶ {name}  {}{exit}", tool_state.label())
+                    },
+                    style: selection_style(tool_style(*tool_state)),
+                });
+                if *expanded {
+                    lines.push(RenderLine {
+                        text: "Arguments:".into(),
+                        style: selection_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    });
+                    push_indented_raw_lines(&mut lines, arguments_display, Color::Yellow, selected);
+                    lines.push(RenderLine {
+                        text: "stdout:".into(),
+                        style: selection_style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                    });
+                    push_indented_raw_lines(
+                        &mut lines,
+                        if stdout.is_empty() { "(empty)" } else { stdout },
+                        Color::DarkGray,
+                        selected,
+                    );
+                    lines.push(RenderLine {
+                        text: "stderr:".into(),
+                        style: selection_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    });
+                    push_indented_raw_lines(
+                        &mut lines,
+                        if stderr.is_empty() { "(empty)" } else { stderr },
+                        Color::Red,
+                        selected,
+                    );
                 }
-                if stdout.lines().count() > 3 {
-                    lines.push(Line::from(vec![Span::styled(
-                        "  ...",
-                        Style::default().fg(Color::DarkGray),
-                    )]));
-                }
-                // Show stderr if non-empty
-                if !stderr.trim().is_empty() {
-                    lines.push(Line::from(vec![Span::styled(
-                        "  [stderr]",
-                        Style::default().fg(Color::Red),
-                    )]));
-                    for line in stderr.lines().take(2) {
-                        lines.push(Line::from(vec![Span::styled(
-                            format!("    {}", line),
-                            Style::default().fg(Color::Red),
-                        )]));
-                    }
-                }
-                lines.push(Line::from(""));
             }
-            TranscriptEntry::ProviderError(msg) => {
-                lines.push(Line::from(vec![
-                    Span::styled("❌ Error: ", Style::default().fg(Color::Red)),
-                    Span::raw(msg.clone()),
-                ]));
-                lines.push(Line::from(""));
+            TranscriptBlock::Error { message } => {
+                lines.push(RenderLine {
+                    text: "Error".into(),
+                    style: selection_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                });
+                push_body_lines(&mut lines, message, Color::Red, selected);
             }
-            TranscriptEntry::System(msg) => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("ℹ {}", msg),
-                    Style::default().fg(Color::Blue),
-                )]));
-                lines.push(Line::from(""));
+            TranscriptBlock::System { message } => {
+                lines.push(RenderLine {
+                    text: "System".into(),
+                    style: selection_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                });
+                push_body_lines(&mut lines, message, Color::Blue, selected);
             }
         }
+        lines.push(RenderLine {
+            text: String::new(),
+            style: Style::default(),
+        });
     }
-
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Transcript")
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(paragraph, area);
+    lines
 }
 
-/// Render the input area.
+fn tool_style(state: ToolRunState) -> Style {
+    match state {
+        ToolRunState::Running => Style::default().fg(Color::Yellow),
+        ToolRunState::Succeeded => Style::default().fg(Color::Green),
+        ToolRunState::Failed | ToolRunState::TimedOut => Style::default().fg(Color::Red),
+        ToolRunState::Aborted => Style::default().fg(Color::Yellow),
+    }
+}
+
+fn push_body_lines(lines: &mut Vec<RenderLine>, text: &str, color: Color, selected: bool) {
+    for line in text.split('\n') {
+        lines.push(RenderLine {
+            text: format!("  {line}"),
+            style: if selected {
+                Style::default().fg(color).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(color)
+            },
+        });
+    }
+}
+
+fn push_indented_raw_lines(lines: &mut Vec<RenderLine>, text: &str, color: Color, selected: bool) {
+    for line in text.split('\n') {
+        lines.push(RenderLine {
+            text: format!("  {line}"),
+            style: if selected {
+                Style::default().fg(color).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(color)
+            },
+        });
+    }
+}
+
 fn render_input(frame: &mut Frame, state: &AppState, area: Rect) {
-    // Create display text with cursor indicator
-    let is_active = matches!(state.activity, ActivityState::Running | ActivityState::Cancelling);
-    let display_text = if is_active {
-        format!("{} ⏳", state.input)
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let (cursor_line, cursor_column) = state.input.cursor_visual_position(width);
+    let viewport = state
+        .input
+        .viewport_line
+        .min(cursor_line)
+        .max(cursor_line.saturating_sub(visible.saturating_sub(1)));
+    let active = state.focus == Focus::Input;
+    let title = if state.activity == ActivityState::Running {
+        "Input · draft (Enter unavailable)"
     } else {
-        state.input.clone()
+        "Input · Enter submit · Ctrl+J newline"
     };
-
-    let paragraph = Paragraph::new(display_text)
+    let paragraph = Paragraph::new(state.input.text.clone())
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Input")
-                .border_style(Style::default().fg(if is_active { Color::Yellow } else { Color::Cyan })),
+                .title(title)
+                .border_style(Style::default().fg(if active { Color::Cyan } else { Color::DarkGray })),
         )
-        .scroll((0, 0));
-
+        .scroll((viewport as u16, 0))
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-
-    // Set cursor position
-    let cursor_x = area.x + 1 + state.cursor as u16;
-    let cursor_y = area.y + 1;
-    frame.set_cursor_position((cursor_x, cursor_y));
+    if active && area.width > 2 && area.height > 2 {
+        let x = area.x + 1 + cursor_column.min(width.saturating_sub(1)) as u16;
+        let y = area.y + 1 + cursor_line.saturating_sub(viewport) as u16;
+        if y < area.bottom().saturating_sub(1) {
+            frame.set_cursor_position((x.min(area.right().saturating_sub(1)), y));
+        }
+    }
 }
 
-/// Render the status bar.
 fn render_status(frame: &mut Frame, state: &AppState, area: Rect) {
-    let status_style = if state.error.is_some() {
+    let activity = match state.activity {
+        ActivityState::Idle => "Ready",
+        ActivityState::Running => "Running",
+        ActivityState::Cancelling => "Cancelling",
+    };
+    let outcome: Option<String> = state.last_outcome.as_ref().map(|outcome| match outcome {
+        RunOutcome::Completed => "Completed".into(),
+        RunOutcome::Aborted => "Aborted".into(),
+        RunOutcome::ProviderError(_) => "Provider error".into(),
+        RunOutcome::ToolError(_) => "Tool error".into(),
+    });
+    let text = if area.width < 40 {
+        if state.activity == ActivityState::Running || state.activity == ActivityState::Cancelling {
+            format!("{activity} · Ctrl+C cancel")
+        } else {
+            format!("{activity} · Tab focus · Enter submit")
+        }
+    } else {
+        let mut parts = vec![format!("{}/{}", state.provider, state.model), activity.into()];
+        if let Some(outcome) = outcome {
+            parts.push(format!("last: {outcome}"));
+        }
+        if let Some(tool) = state.transcript.iter().rev().find_map(|block| match block {
+            TranscriptBlock::Tool {
+                name,
+                state: ToolRunState::Running,
+                ..
+            } => Some(name.as_str()),
+            _ => None,
+        }) {
+            parts.push(format!("tool: {tool}"));
+        }
+        if !state.scroll.follow_output {
+            parts.push(if state.scroll.unread_lines > 0 {
+                format!("{} new lines · End latest", state.scroll.unread_lines)
+            } else {
+                "browsing history · End latest".into()
+            });
+        }
+        parts.push(if state.focus == Focus::Input {
+            "Input · Tab transcript · PageUp/Down scroll · Ctrl+C cancel".into()
+        } else {
+            "Transcript · Space expand · i input · End latest".into()
+        });
+        if !state.status.is_empty() && state.status != "Ready" && state.status != "Running" {
+            parts.push(state.status.clone());
+        }
+        if let Some(error) = &state.error {
+            parts.push(format!("Error: {error}"));
+        }
+        parts.join(" | ")
+    };
+    let style = if state.error.is_some() {
         Style::default().fg(Color::Red)
-    } else if matches!(state.activity, ActivityState::Running | ActivityState::Cancelling) {
+    } else if state.activity != ActivityState::Idle {
         Style::default().fg(Color::Yellow)
-    } else if state.last_outcome == Some(RunOutcome::Aborted) {
-        Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::Green)
     };
+    frame.render_widget(Paragraph::new(text).style(style), area);
+}
 
-    let status_text = if let Some(ref err) = state.error {
-        format!("❌ {} | {}", err, state.status)
-    } else {
-        state.status.clone()
-    };
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    text.split('\n')
+        .map(|line| {
+            if line.is_empty() {
+                return 1;
+            }
+            let mut lines = 1;
+            let mut column = 0;
+            for character in line.chars() {
+                let character_width = char_width(character);
+                if column > 0 && column + character_width > width {
+                    lines += 1;
+                    column = 0;
+                }
+                column += character_width;
+            }
+            lines.max(1)
+        })
+        .sum::<usize>()
+        .max(1)
+}
 
-    let paragraph = Paragraph::new(status_text).style(status_style);
-    frame.render_widget(paragraph, area);
+fn visual_position(text: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    let mut line = 0;
+    let mut column = 0;
+    for (index, character) in text.char_indices() {
+        if index >= cursor {
+            break;
+        }
+        if character == '\n' {
+            line += 1;
+            column = 0;
+            continue;
+        }
+        let character_width = char_width(character);
+        if column > 0 && column + character_width > width {
+            line += 1;
+            column = 0;
+        }
+        column += character_width;
+        if column >= width {
+            line += 1;
+            column = 0;
+        }
+    }
+    (line, column)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -754,1251 +1628,476 @@ fn render_status(frame: &mut Frame, state: &AppState, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::mock::MockProvider;
-    use crate::ai::providers::Model;
-    use crate::coding_agent::command::{CommandRegistry, DispatchOutcome, ExitCommand, HelpCommand, QuitCommand};
-    use crate::coding_agent::prompt_session::PromptSession;
+    use crate::agent::events::ProviderError;
+    use crate::ai::types::Content;
     use crossterm::event::{KeyCode, KeyModifiers};
-    use std::path::PathBuf;
-
-    fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, modifiers)
-    }
-
-    fn command_session() -> PromptSession {
-        PromptSession::new(
-            Box::new(MockProvider::text("mock")),
-            Model {
-                id: "mock",
-                api: "mock",
-            },
-            vec![],
-            PathBuf::from("/tmp"),
-            PathBuf::from("/tmp/.pi/agent"),
-            vec![],
-            vec![],
-            false,
-            None,
-            vec![],
-        )
-    }
-
-    #[test]
-    fn app_state_initial() {
-        let state = AppState::new((80, 24));
-        assert_eq!(state.activity, ActivityState::Idle);
-        assert!(state.input.is_empty());
-        assert!(state.transcript.is_empty());
-        assert!(!state.quit);
-    }
-
-    #[test]
-    fn help_command_is_rendered_into_ratatui_transcript() {
-        let mut registry = CommandRegistry::new();
-        registry.register(Box::new(HelpCommand));
-        registry.register(Box::new(ExitCommand));
-        let mut session = command_session();
-        let outcome = registry.dispatch("/help", &mut session).unwrap();
-        let mut state = AppState::new((80, 24));
-        if let DispatchOutcome::Handled(result) = outcome {
-            state.update(Action::CommandResult(result));
-        } else {
-            panic!("/help should be handled");
-        }
-        let output = render_state(&state);
-        assert!(output.contains("Commands:"));
-        assert!(output.contains("/help"));
-        assert_eq!(state.activity, ActivityState::Idle);
-    }
-
-    #[test]
-    fn quit_command_produces_ratatui_quit_effect() {
-        let mut registry = CommandRegistry::new();
-        registry.register(Box::new(QuitCommand));
-        let mut session = command_session();
-        let outcome = registry.dispatch("/quit", &mut session).unwrap();
-        let mut state = AppState::new((80, 24));
-        let effects = match outcome {
-            DispatchOutcome::Exit => state.update(Action::Quit),
-            other => panic!("expected exit, got {other:?}"),
-        };
-        assert!(state.quit);
-        assert!(effects.iter().any(|effect| matches!(effect, Effect::Quit)));
-    }
-
-    #[test]
-    fn unknown_command_is_rendered_as_structured_ratatui_error() {
-        let registry = CommandRegistry::new();
-        let mut session = command_session();
-        let outcome = registry.dispatch("/unknown", &mut session).unwrap();
-        let mut state = AppState::new((80, 24));
-        if let DispatchOutcome::Handled(result) = outcome {
-            state.update(Action::CommandResult(result));
-        } else {
-            panic!("unknown command should be handled as an error");
-        }
-        let output = render_state(&state);
-        assert!(output.contains("Unknown command"));
-        assert!(state.error.is_some());
-    }
-
-    #[test]
-    fn app_state_input_char() {
-        let mut state = AppState::new((80, 24));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('a'), KeyModifiers::NONE)));
-        assert_eq!(state.input, "a");
-        assert_eq!(state.cursor, 1);
-    }
-
-    #[test]
-    fn app_state_backspace() {
-        let mut state = AppState::new((80, 24));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('h'), KeyModifiers::NONE)));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('i'), KeyModifiers::NONE)));
-        assert_eq!(state.input, "hi");
-        state.update(Action::KeyInput(key_event(KeyCode::Backspace, KeyModifiers::NONE)));
-        assert_eq!(state.input, "h");
-        assert_eq!(state.cursor, 1);
-    }
-
-    #[test]
-    fn app_state_delete() {
-        let mut state = AppState::new((80, 24));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('a'), KeyModifiers::NONE)));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('b'), KeyModifiers::NONE)));
-        state.update(Action::KeyInput(key_event(KeyCode::Left, KeyModifiers::NONE)));
-        state.update(Action::KeyInput(key_event(KeyCode::Delete, KeyModifiers::NONE)));
-        assert_eq!(state.input, "a");
-    }
-
-    #[test]
-    fn app_state_cursor_movement() {
-        let mut state = AppState::new((80, 24));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('a'), KeyModifiers::NONE)));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('b'), KeyModifiers::NONE)));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('c'), KeyModifiers::NONE)));
-        assert_eq!(state.cursor, 3);
-
-        state.update(Action::KeyInput(key_event(KeyCode::Left, KeyModifiers::NONE)));
-        assert_eq!(state.cursor, 2);
-
-        state.update(Action::KeyInput(key_event(KeyCode::Left, KeyModifiers::NONE)));
-        assert_eq!(state.cursor, 1);
-
-        state.update(Action::KeyInput(key_event(KeyCode::Right, KeyModifiers::NONE)));
-        assert_eq!(state.cursor, 2);
-
-        state.update(Action::KeyInput(key_event(KeyCode::Home, KeyModifiers::NONE)));
-        assert_eq!(state.cursor, 0);
-
-        state.update(Action::KeyInput(key_event(KeyCode::End, KeyModifiers::NONE)));
-        assert_eq!(state.cursor, 3);
-    }
-
-    #[test]
-    fn app_state_submit_empty_does_nothing() {
-        let mut state = AppState::new((80, 24));
-        let effects = state.update(Action::KeyInput(key_event(KeyCode::Enter, KeyModifiers::NONE)));
-        assert!(effects.is_empty());
-        assert_eq!(state.activity, ActivityState::Idle);
-    }
-
-    #[test]
-    fn app_state_submit_creates_run() {
-        let mut state = AppState::new((80, 24));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('h'), KeyModifiers::NONE)));
-        state.update(Action::KeyInput(key_event(KeyCode::Char('i'), KeyModifiers::NONE)));
-        let effects = state.update(Action::KeyInput(key_event(KeyCode::Enter, KeyModifiers::NONE)));
-        assert_eq!(state.activity, ActivityState::Running);
-        assert_eq!(state.transcript.len(), 1);
-        assert!(matches!(&state.transcript[0], TranscriptEntry::User(s) if s == "hi"));
-        assert!(!effects.is_empty());
-    }
-
-    #[test]
-    fn app_state_cancel_while_running() {
-        let mut state = AppState::new((80, 24));
-        state.activity = ActivityState::Running;
-        let effects = state.update(Action::Cancel);
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(&effects[0], Effect::CancelAgent));
-        assert_eq!(state.activity, ActivityState::Cancelling);
-    }
-
-    #[test]
-    fn app_state_cancel_sets_cancelling() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.activity = ActivityState::Running;
-        let _effects = state.update(Action::Cancel);
-        assert_eq!(state.activity, ActivityState::Cancelling);
-        // RunAborted event transitions to Idle with Aborted outcome
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
-        assert_eq!(state.activity, ActivityState::Idle);
-        assert_eq!(state.last_outcome, Some(RunOutcome::Aborted));
-    }
-
-    #[test]
-    fn app_state_resize() {
-        let mut state = AppState::new((80, 24));
-        state.update(Action::Resize(120, 40));
-        assert_eq!(state.terminal_size, (120, 40));
-    }
-
-    #[test]
-    fn app_state_text_delta_appends() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId::new(1),
-            text: "hello".into(),
-        });
-        state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId::new(1),
-            text: " world".into(),
-        });
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Assistant(s) => assert_eq!(s, "hello world"),
-            _ => panic!("Expected Assistant entry"),
-        }
-    }
-
-    #[test]
-    fn app_state_tool_started_creates_entry() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({"command": "ls"}),
-        });
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Tool {
-                id,
-                name,
-                state: tool_state,
-                ..
-            } => {
-                assert_eq!(id, "tc_1");
-                assert_eq!(name, "bash");
-                assert_eq!(*tool_state, ToolRunState::Running);
-            }
-            other => panic!("Expected Tool entry, got: {:?}", other),
-        }
-        assert!(state.status.contains("bash"));
-    }
-
-    #[test]
-    fn app_state_tool_finished_updates_entry() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult {
-                content: vec![crate::ai::types::Content::Text { text: "output".into() }],
-                ..Default::default()
-            },
-        });
-        // Should still be exactly 1 entry (no duplicate)
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Tool {
-                state: tool_state,
-                result,
-                ..
-            } => {
-                assert_eq!(*tool_state, ToolRunState::Succeeded);
-                assert!(result.is_some());
-            }
-            other => panic!("Expected Tool entry, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn app_state_run_finished_sets_idle() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: RunId::new(1),
-            stop_reason: StopReason::Stop,
-        });
-        assert_eq!(state.activity, ActivityState::Idle);
-    }
-
-    #[test]
-    fn app_state_quit() {
-        let mut state = AppState::new((80, 24));
-        let effects = state.update(Action::Quit);
-        assert!(state.quit);
-        assert!(matches!(&effects[0], Effect::Quit));
-    }
-
-    // ── TestBackend rendering tests ───────────────────────────────────────
-
+    use insta::assert_snapshot;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    fn run_started(state: &mut AppState) {
+        state.update(Action::AgentEvent(AgentEvent::RunStarted { run_id: RunId::new(1) }));
+    }
+
+    fn tool_started(state: &mut AppState, id: &str) {
+        state.update(Action::AgentEvent(AgentEvent::ToolStarted {
+            run_id: RunId::new(1),
+            tool_call_id: id.into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command":"ls"}),
+        }));
+    }
 
     fn render_state(state: &AppState) -> String {
         let backend = TestBackend::new(state.terminal_size.0, state.terminal_size.1);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                super::view(frame, state);
+        terminal.draw(|frame| view(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
             })
-            .unwrap();
-        // Capture the buffer as a string using ratatui's built-in rendering
-        let buf = terminal.backend().buffer().clone();
-        let mut lines = Vec::new();
-        for y in 0..buf.area.height {
-            let mut line = String::new();
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                let symbol = cell.symbol();
-                line.push_str(symbol);
-            }
-            lines.push(line);
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn initial_state_uses_input_focus_and_follow_mode() {
+        let state = AppState::new((80, 24));
+        assert_eq!(state.focus, Focus::Input);
+        assert!(state.scroll.follow_output);
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn multiline_unicode_editor_preserves_boundaries() {
+        let mut state = AppState::new((80, 24));
+        for character in "你好\nworld".chars() {
+            state.update(Action::KeyInput(key(KeyCode::Char(character))));
         }
-        lines.join("\n")
+        state.update(Action::KeyInput(key(KeyCode::Up)));
+        state.update(Action::KeyInput(key(KeyCode::Home)));
+        state.update(Action::KeyInput(key(KeyCode::Delete)));
+        assert_eq!(state.input.text, "好\nworld");
+        assert!(state.input.text.is_char_boundary(state.input.cursor_byte));
     }
 
     #[test]
-    fn render_80x24_idle() {
-        let state = AppState::new((80, 24));
-        let output = render_state(&state);
-        assert!(output.contains("Transcript"), "Should show Transcript title");
-        assert!(output.contains("Input"), "Should show Input title");
-        assert!(output.contains("Ready"), "Should show Ready status");
-    }
-
-    #[test]
-    fn render_120x40() {
-        let state = AppState::new((120, 40));
-        let output = render_state(&state);
-        assert!(output.contains("Transcript"));
-        assert!(output.contains("Input"));
-    }
-
-    #[test]
-    fn render_narrow_terminal_40x12() {
-        let state = AppState::new((40, 12));
-        let output = render_state(&state);
-        // Should not panic on small terminal
-        assert!(output.contains("Transcript"));
-    }
-
-    #[test]
-    fn render_empty_transcript() {
-        let state = AppState::new((80, 24));
-        let output = render_state(&state);
-        assert!(output.contains("Transcript"));
-        // No user/assistant messages
-        assert!(!output.contains("You:"));
-    }
-
-    #[test]
-    fn render_user_message() {
+    fn editor_supports_control_editing_and_paste() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::User("hello world".into()));
-        let output = render_state(&state);
-        assert!(output.contains("You:"));
-        assert!(output.contains("hello world"));
+        state.update(Action::Paste("one two\n三".into()));
+        state.update(Action::KeyInput(key(KeyCode::Up)));
+        state.update(Action::KeyInput(ctrl('a')));
+        state.update(Action::KeyInput(ctrl('k')));
+        assert_eq!(state.input.text, "\n三");
+        state.update(Action::KeyInput(ctrl('u')));
+        assert_eq!(state.input.text, "\n三");
+        state.update(Action::KeyInput(ctrl('w')));
+        assert_eq!(state.input.text, "\n三");
     }
 
     #[test]
-    fn render_assistant_streaming_text() {
+    fn enter_submits_original_multiline_prompt_and_history() {
         let mut state = AppState::new((80, 24));
-        state
-            .transcript
-            .push(TranscriptEntry::Assistant("Hello! I am here to help.".into()));
-        let output = render_state(&state);
-        assert!(output.contains("Hello! I am here to help."));
+        state.update(Action::Paste("first\nsecond".into()));
+        let effects = state.update(Action::KeyInput(key(KeyCode::Enter)));
+        assert!(matches!(effects.as_slice(), [Effect::RunAgent(prompt)] if prompt == "first\nsecond"));
+        assert!(matches!(&state.transcript[0], TranscriptBlock::User { text } if text == "first\nsecond"));
+        assert_eq!(state.history.entries, vec!["first\nsecond"]);
     }
 
     #[test]
-    fn render_tool_running_entry() {
+    fn empty_prompt_is_not_transcript_or_history() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::Tool {
-            id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({"command": "ls"}),
-            stdout: String::new(),
-            stderr: String::new(),
-            state: ToolRunState::Running,
-            result: None,
-        });
-        let output = render_state(&state);
-        assert!(output.contains("bash"));
+        state.update(Action::Paste(" \n ".into()));
+        assert!(state.update(Action::Submit).is_empty());
+        assert!(state.transcript.is_empty());
+        assert!(state.history.entries.is_empty());
     }
 
     #[test]
-    fn render_tool_stdout_stderr_in_transcript() {
+    fn history_deduplicates_and_restores_draft() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::Tool {
-            id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-            stdout: "file1.txt\nfile2.txt".into(),
-            stderr: String::new(),
-            state: ToolRunState::Succeeded,
-            result: None,
-        });
-        let output = render_state(&state);
-        assert!(output.contains("file1.txt"));
-        assert!(output.contains("file2.txt"));
+        for prompt in ["one", "one", "two"] {
+            state.input.set_text(prompt.into());
+            state.update(Action::Submit);
+            state.activity = ActivityState::Idle;
+        }
+        assert_eq!(state.history.entries, vec!["one", "two"]);
+        state.input.set_text("draft 中文".into());
+        state.update(Action::KeyInput(key(KeyCode::Up)));
+        assert_eq!(state.input.text, "two");
+        state.update(Action::KeyInput(key(KeyCode::Up)));
+        assert_eq!(state.input.text, "one");
+        state.update(Action::KeyInput(key(KeyCode::Down)));
+        assert_eq!(state.input.text, "two");
+        state.update(Action::KeyInput(key(KeyCode::Down)));
+        assert_eq!(state.input.text, "draft 中文");
+        assert_eq!(state.history.entries, vec!["one", "two"]);
     }
 
     #[test]
-    fn render_tool_success_entry() {
+    fn running_enter_is_rejected_but_draft_is_kept() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::Tool {
-            id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-            stdout: "success".into(),
-            stderr: String::new(),
-            state: ToolRunState::Succeeded,
-            result: None,
-        });
-        let output = render_state(&state);
-        assert!(output.contains("bash"));
-        assert!(output.contains("success"));
+        state.input.set_text("first".into());
+        assert_eq!(state.update(Action::Submit).len(), 1);
+        state.input.set_text("next".into());
+        assert!(state.update(Action::KeyInput(key(KeyCode::Enter))).is_empty());
+        assert_eq!(state.input.text, "next");
+        assert!(state.status.contains("Enter unavailable"));
     }
 
     #[test]
-    fn render_tool_error_entry() {
+    fn ctrl_c_clears_idle_draft_and_cancels_running() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::Tool {
-            id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-            stdout: String::new(),
-            stderr: "command failed".into(),
-            state: ToolRunState::Failed,
-            result: None,
-        });
-        let output = render_state(&state);
-        assert!(output.contains("bash"));
-        assert!(output.contains("command failed"));
-    }
-
-    #[test]
-    fn render_provider_error() {
-        let mut state = AppState::new((80, 24));
-        state
-            .transcript
-            .push(TranscriptEntry::ProviderError("API limit".into()));
-        let output = render_state(&state);
-        assert!(output.contains("Error"));
-        assert!(output.contains("API limit"));
-    }
-
-    #[test]
-    fn render_aborted() {
-        let mut state = AppState::new((80, 24));
-        // Set up run_id so events are accepted
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
+        state.input.set_text("draft".into());
+        assert!(state.update(Action::KeyInput(ctrl('c'))).is_empty());
+        assert!(state.input.text.is_empty());
         state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
-        let output = render_state(&state);
-        assert!(output.contains("Aborted") || output.contains("abort"));
+        assert!(matches!(
+            state.update(Action::KeyInput(ctrl('c'))).as_slice(),
+            [Effect::CancelAgent]
+        ));
+        assert_eq!(state.activity, ActivityState::Cancelling);
     }
 
     #[test]
-    fn render_long_text_wrapping() {
+    fn focus_routes_selection_without_toggling_non_expandable_blocks() {
         let mut state = AppState::new((80, 24));
-        let long_text = "a".repeat(200);
-        state.transcript.push(TranscriptEntry::Assistant(long_text.clone()));
-        let output = render_state(&state);
-        // Long text should be present (wrapping is handled by ratatui)
-        assert!(output.contains("aaaaaaaaaa"));
-    }
-
-    #[test]
-    fn render_unicode_and_chinese() {
-        let mut state = AppState::new((80, 24));
+        state.transcript.push(TranscriptBlock::User { text: "you".into() });
+        state.transcript.push(TranscriptBlock::Thinking {
+            text: "hmm".into(),
+            expanded: false,
+        });
         state
             .transcript
-            .push(TranscriptEntry::Assistant("你好世界 🌍 café".into()));
-        // TestBackend has limitations with wide characters, so we verify
-        // the state is correct and rendering doesn't panic
-        let output = render_state(&state);
-        assert!(!output.is_empty());
-        // Verify the transcript entry exists
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Assistant(s) => {
-                assert!(s.contains("你好世界"));
-                assert!(s.contains("café"));
-            }
-            _ => panic!("Expected Assistant entry"),
-        }
+            .push(TranscriptBlock::tool("t".into(), "bash".into(), serde_json::json!({})));
+        state.update(Action::KeyInput(key(KeyCode::Tab)));
+        assert_eq!(state.focus, Focus::Transcript);
+        state.selection.selected_block = Some(0);
+        state.update(Action::KeyInput(key(KeyCode::Enter)));
+        assert!(matches!(state.transcript[0], TranscriptBlock::User { .. }));
+        state.selection.selected_block = Some(1);
+        state.update(Action::KeyInput(key(KeyCode::Char(' '))));
+        assert!(matches!(
+            state.transcript[1],
+            TranscriptBlock::Thinking { expanded: true, .. }
+        ));
     }
 
     #[test]
-    fn render_resize() {
+    fn tool_expansion_is_independent_and_survives_output_and_finish() {
         let mut state = AppState::new((80, 24));
-        state.update(Action::Resize(120, 40));
-        let output = render_state(&state);
-        assert!(output.contains("Transcript"));
-    }
-
-    #[test]
-    fn render_input_cursor_position() {
-        let mut state = AppState::new((80, 24));
-        state.input = "hello".into();
-        state.cursor = 3;
-        let output = render_state(&state);
-        assert!(output.contains("hello"));
-    }
-
-    #[test]
-    fn render_narrow_no_panic() {
-        // Very small terminal should not panic
-        let state = AppState::new((10, 5));
-        let output = render_state(&state);
-        assert!(!output.is_empty());
-    }
-
-    // ── Transcript tool entry tests ──────────────────────────────────────
-
-    #[test]
-    fn transcript_tool_started_creates_tool_entry() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
+        run_started(&mut state);
+        tool_started(&mut state, "a");
+        tool_started(&mut state, "b");
+        state.selection.selected_block = Some(0);
+        state.focus = Focus::Transcript;
+        state.update(Action::KeyInput(key(KeyCode::Char(' '))));
+        state.update(Action::AgentEvent(AgentEvent::ToolOutput {
             run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
+            tool_call_id: "a".into(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "out".into(),
+        }));
+        state.update(Action::AgentEvent(AgentEvent::ToolFinished {
+            run_id: RunId::new(1),
+            tool_call_id: "a".into(),
             name: "bash".into(),
-            arguments: serde_json::json!({"command": "ls"}),
-        });
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Tool {
-                id,
-                name,
-                arguments,
-                state: ts,
+            result: AgentToolResult {
+                exit_code: Some(0),
+                content: vec![Content::Text { text: "out".into() }],
+                ..Default::default()
+            },
+        }));
+        assert!(matches!(
+            state.transcript[0],
+            TranscriptBlock::Tool {
+                expanded: true,
+                state: ToolRunState::Succeeded,
                 ..
-            } => {
-                assert_eq!(id, "tc_a");
-                assert_eq!(name, "bash");
-                assert_eq!(arguments["command"], "ls");
-                assert_eq!(*ts, ToolRunState::Running);
             }
-            other => panic!("Expected Tool entry, got: {:?}", other),
-        }
+        ));
+        assert!(matches!(
+            state.transcript[1],
+            TranscriptBlock::Tool { expanded: false, .. }
+        ));
     }
 
     #[test]
-    fn transcript_stdout_only_goes_to_stdout() {
+    fn thinking_is_collapsed_with_summary_and_expands() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
+        run_started(&mut state);
+        state.update(Action::AgentEvent(AgentEvent::ThinkingDelta {
             run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "hello\n".into(),
-        });
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { stdout, stderr, .. } => {
-                assert_eq!(stdout, "hello\n");
-                assert!(stderr.is_empty());
-            }
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
+            text: "a\nb".into(),
+        }));
+        let collapsed = render_state(&state);
+        assert!(collapsed.contains("Thinking… 2 lines"));
+        assert!(!collapsed.contains("  a"));
+        state.focus = Focus::Transcript;
+        state.selection.selected_block = Some(0);
+        state.update(Action::KeyInput(key(KeyCode::Char(' '))));
+        assert!(render_state(&state).contains("  a"));
     }
 
     #[test]
-    fn transcript_stderr_only_goes_to_stderr() {
+    fn assistant_deltas_merge_and_finish_without_empty_block() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
+        run_started(&mut state);
+        state.update(Action::AgentEvent(AgentEvent::TextDelta {
             run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolOutput {
+            text: "a".into(),
+        }));
+        state.update(Action::AgentEvent(AgentEvent::TextDelta {
             run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            stream: crate::agent::events::ToolOutputStream::Stderr,
-            chunk: "err msg\n".into(),
-        });
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { stdout, stderr, .. } => {
-                assert!(stdout.is_empty());
-                assert_eq!(stderr, "err msg\n");
-            }
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_assistant_text_does_not_mix_with_tool() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId::new(1),
-            text: "some text".into(),
-        });
-        assert_eq!(state.transcript.len(), 2);
-        // Tool entry should not have assistant text
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { stdout, .. } => assert!(stdout.is_empty()),
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-        // Assistant entry should have the text
-        match &state.transcript[1] {
-            TranscriptEntry::Assistant(text) => assert_eq!(text, "some text"),
-            other => panic!("Expected Assistant, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_tool_output_does_not_create_assistant_entry() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        // ToolOutput for an unknown ID should create a Tool entry, not Assistant
-        state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId::new(1),
-            tool_call_id: "orphan".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "data".into(),
-        });
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { .. } => (),
-            other => panic!("Expected Tool (orphan), got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_tool_finished_updates_original_no_duplicate() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_1".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult {
-                content: vec![],
-                ..Default::default()
-            },
-        });
-        assert_eq!(state.transcript.len(), 1, "Should not create duplicate entry");
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { state: ts, .. } => {
-                assert_eq!(*ts, ToolRunState::Succeeded);
-            }
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_two_tools_outputs_do_not_cross() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_b".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "alpha".into(),
-        });
-        state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_b".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "beta".into(),
-        });
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { stdout, .. } => assert_eq!(stdout, "alpha"),
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-        match &state.transcript[1] {
-            TranscriptEntry::Tool { stdout, .. } => assert_eq!(stdout, "beta"),
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_unknown_tool_id_does_not_panic() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        // Output for an ID that was never started
-        state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId::new(1),
-            tool_call_id: "ghost".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "data".into(),
-        });
-        // Finish for an ID that was never started
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId::new(1),
-            tool_call_id: "ghost2".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult::default(),
-        });
-        assert_eq!(state.transcript.len(), 2);
-    }
-
-    #[test]
-    fn transcript_timeout_maps_to_timed_out() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_to".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_to".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult {
-                timed_out: true,
-                is_error: true,
-                ..Default::default()
-            },
-        });
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::TimedOut),
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_abort_maps_to_aborted() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_ab".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_ab".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult {
-                aborted: true,
-                is_error: true,
-                ..Default::default()
-            },
-        });
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Aborted),
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_nonzero_exit_maps_to_failed() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_err".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_err".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult {
-                is_error: true,
-                exit_code: Some(1),
-                ..Default::default()
-            },
-        });
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Failed),
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn transcript_success_maps_to_succeeded() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_ok".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_ok".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult {
-                is_error: false,
-                ..Default::default()
-            },
-        });
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Succeeded),
-            other => panic!("Expected Tool, got: {:?}", other),
-        }
-    }
-
-    // ── Run state model tests ──────────────────────────────────────────────
-
-    #[test]
-    fn run_started_sets_running() {
-        let mut state = AppState::new((80, 24));
-        state.activity = ActivityState::Idle;
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        // RunStarted sets current_run_id and clears the tool index
-        assert_eq!(state.current_run_id, Some(RunId::new(1)));
-        assert!(state.tool_index.is_empty());
-    }
-
-    #[test]
-    fn run_aborted_preserves_outcome() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
-        assert_eq!(state.activity, ActivityState::Idle);
-        assert_eq!(state.last_outcome, Some(RunOutcome::Aborted));
-        assert_eq!(state.status, "Aborted");
-    }
-
-    #[test]
-    fn run_finished_stop_sets_completed() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunFinished {
+            text: "b".into(),
+        }));
+        state.update(Action::AgentEvent(AgentEvent::RunFinished {
             run_id: RunId::new(1),
             stop_reason: StopReason::Stop,
-        });
-        assert_eq!(state.activity, ActivityState::Idle);
-        assert_eq!(state.last_outcome, Some(RunOutcome::Completed));
-        assert_eq!(state.status, "Ready");
+        }));
+        assert!(matches!(&state.transcript[0], TranscriptBlock::Assistant { text, streaming: false } if text == "ab"));
+        assert_eq!(state.transcript.len(), 1);
     }
 
     #[test]
-    fn provider_error_not_overwritten_by_stop() {
+    fn one_thousand_deltas_stay_in_one_assistant_block() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ProviderError {
-            run_id: RunId::new(1),
-            error: crate::agent::events::ProviderError {
-                reason: StopReason::Error,
-                message: "limit exceeded".into(),
-            },
-        });
-        assert_eq!(state.last_outcome, None); // ProviderError doesn't set last_outcome
-        state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: RunId::new(1),
-            stop_reason: StopReason::Error,
-        });
-        assert_eq!(
-            state.last_outcome,
-            Some(RunOutcome::ProviderError("Provider error".into()))
+        run_started(&mut state);
+        for _ in 0..1_000 {
+            state.update(Action::AgentEvent(AgentEvent::TextDelta {
+                run_id: RunId::new(1),
+                text: "x".into(),
+            }));
+        }
+        assert!(
+            matches!(&state.transcript[..], [TranscriptBlock::Assistant { text, streaming: true }] if text.len() == 1_000)
         );
     }
 
     #[test]
-    fn new_run_clears_tool_index() {
+    fn tool_streams_are_separate_and_unknown_id_is_safe() {
         let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
+        run_started(&mut state);
+        state.update(Action::AgentEvent(AgentEvent::ToolOutput {
             run_id: RunId::new(1),
-            tool_call_id: "old_tc".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        assert!(!state.tool_index.is_empty());
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-        assert!(state.tool_index.is_empty());
-    }
-
-    // ── Run ID isolation tests ───────────────────────────────────────────
-
-    #[test]
-    fn late_text_delta_from_old_run_ignored() {
-        let mut state = AppState::new((80, 24));
-        // Run A starts and produces text
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::TextDelta {
+            tool_call_id: "orphan".into(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "out".into(),
+        }));
+        state.update(Action::AgentEvent(AgentEvent::ToolOutput {
             run_id: RunId::new(1),
-            text: "from A".into(),
-        });
-        // Run B starts (simulating a new run after Run A was cancelled externally)
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-        // Late TextDelta from Run A arrives after Run B started
-        state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: RunId::new(1),
-            text: "STALE".into(),
-        });
-        // Transcript should only contain Run A's initial text, not the stale delta
-        assert_eq!(state.transcript.len(), 1);
-        match &state.transcript[0] {
-            TranscriptEntry::Assistant(s) => assert_eq!(s, "from A", "Stale delta should not be appended"),
-            _ => panic!("Expected Assistant entry"),
-        }
-        // current_run_id should still be Run B
-        assert_eq!(state.current_run_id, Some(RunId::new(2)));
+            tool_call_id: "orphan".into(),
+            stream: ToolOutputStream::Stderr,
+            chunk: "err".into(),
+        }));
+        assert!(
+            matches!(&state.transcript[0], TranscriptBlock::Tool { stdout, stderr, name, .. } if stdout == "out" && stderr == "err" && name == "unknown")
+        );
     }
 
     #[test]
-    fn late_tool_output_from_old_run_does_not_pollute() {
+    fn expanded_tool_render_has_arguments_and_separate_stream_labels() {
         let mut state = AppState::new((80, 24));
-        // Run A starts tool_a and gets some output
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
+        run_started(&mut state);
+        tool_started(&mut state, "render");
+        state.update(Action::AgentEvent(AgentEvent::ToolOutput {
             run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolOutput {
+            tool_call_id: "render".into(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "out".into(),
+        }));
+        state.update(Action::AgentEvent(AgentEvent::ToolOutput {
             run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "legit data".into(),
-        });
-        // Run B starts (simulating new run) — tool_index is cleared
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(2),
-            tool_call_id: "tc_b".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({}),
-        });
-        // Late ToolOutput from Run A arrives — should be ignored because run_id != current_run_id
-        state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "STALE DATA".into(),
-        });
-        // Transcript has 2 entries: tool_a from Run A (with legit data) + tool_b from Run B (empty)
-        assert_eq!(state.transcript.len(), 2, "Should have tool_a and tool_b entries");
-        // tool_b (index 1) should have empty stdout — not polluted by stale event
-        match &state.transcript[1] {
-            TranscriptEntry::Tool { stdout, id, .. } => {
-                assert_eq!(id, "tc_b");
-                assert!(stdout.is_empty(), "tool_b stdout should be empty, not polluted");
-            }
-            _ => panic!("Expected tool_b entry at index 1"),
-        }
-        // tool_a (index 0) should have only the legit data, not the stale chunk
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { stdout, id, .. } => {
-                assert_eq!(id, "tc_a");
-                assert_eq!(stdout, "legit data", "tool_a should only have legit data");
-            }
-            _ => panic!("Expected tool_a entry at index 0"),
+            tool_call_id: "render".into(),
+            stream: ToolOutputStream::Stderr,
+            chunk: "err".into(),
+        }));
+        state.focus = Focus::Transcript;
+        state.selection.selected_block = Some(0);
+        state.update(Action::KeyInput(key(KeyCode::Char(' '))));
+        let rendered = render_state(&state);
+        assert!(rendered.contains("Arguments:"));
+        assert!(rendered.contains("stdout:"));
+        assert!(rendered.contains("stderr:"));
+        assert!(rendered.contains("out"));
+        assert!(rendered.contains("err"));
+    }
+
+    #[test]
+    fn tool_states_include_exit_code_timeout_and_abort() {
+        let mut state = AppState::new((80, 24));
+        run_started(&mut state);
+        for (id, result, expected) in [
+            (
+                "failed",
+                AgentToolResult {
+                    is_error: true,
+                    exit_code: Some(42),
+                    ..Default::default()
+                },
+                ToolRunState::Failed,
+            ),
+            (
+                "timeout",
+                AgentToolResult {
+                    is_error: true,
+                    timed_out: true,
+                    ..Default::default()
+                },
+                ToolRunState::TimedOut,
+            ),
+            (
+                "abort",
+                AgentToolResult {
+                    is_error: true,
+                    aborted: true,
+                    ..Default::default()
+                },
+                ToolRunState::Aborted,
+            ),
+        ] {
+            tool_started(&mut state, id);
+            state.update(Action::AgentEvent(AgentEvent::ToolFinished {
+                run_id: RunId::new(1),
+                tool_call_id: id.into(),
+                name: "bash".into(),
+                result,
+            }));
+            assert!(matches!(state.transcript.last(), Some(TranscriptBlock::Tool { state, .. }) if *state == expected));
         }
     }
 
     #[test]
-    fn late_tool_finished_from_old_run_ignored() {
+    fn follow_mode_and_unread_counter() {
         let mut state = AppState::new((80, 24));
-        // Run A starts tool_a
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
+        for i in 0..30 {
+            state.transcript.push(TranscriptBlock::System {
+                message: format!("line {i}"),
+            });
+        }
+        state.update(Action::KeyInput(key(KeyCode::PageUp)));
+        assert!(!state.scroll.follow_output);
+        state.update(Action::AgentEvent(AgentEvent::RunStarted { run_id: RunId::new(1) }));
+        state.update(Action::AgentEvent(AgentEvent::TextDelta {
             run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        // Run B starts (simulating new run)
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: RunId::new(2),
-            tool_call_id: "tc_b".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({}),
-        });
-        // Late ToolFinished from Run A
-        state.handle_agent_event(AgentEvent::ToolFinished {
+            text: "new output".into(),
+        }));
+        assert!(state.scroll.unread_lines > 0);
+        state.update(Action::KeyInput(key(KeyCode::End)));
+        assert!(state.scroll.follow_output);
+        assert_eq!(state.scroll.unread_lines, 0);
+    }
+
+    #[test]
+    fn scroll_clamps_on_resize_and_empty_transcript() {
+        let mut state = AppState::new((80, 24));
+        state.scroll_to_start();
+        state.update(Action::Resize(20, 8));
+        assert!(state.scroll.offset_from_bottom <= state.total_transcript_lines());
+        state.update(Action::Resize(20, 3));
+        state.update(Action::KeyInput(key(KeyCode::PageDown)));
+        assert!(state.scroll.offset_from_bottom <= state.total_transcript_lines());
+        let _ = render_state(&state);
+    }
+
+    #[test]
+    fn output_is_utf8_safe_and_has_one_truncation_marker() {
+        let mut state = AppState::new((80, 24));
+        run_started(&mut state);
+        tool_started(&mut state, "large");
+        // This is deliberately larger than the UI limit: it exercises the
+        // same reducer path with a 1 MiB burst without retaining that burst.
+        let chunk = "界".repeat(1024 * 1024);
+        for _ in 0..1 {
+            state.update(Action::AgentEvent(AgentEvent::ToolOutput {
+                run_id: RunId::new(1),
+                tool_call_id: "large".into(),
+                stream: ToolOutputStream::Stdout,
+                chunk: chunk.clone(),
+            }));
+        }
+        let TranscriptBlock::Tool { stdout, .. } = &state.transcript[0] else {
+            panic!("tool")
+        };
+        assert!(stdout.is_char_boundary(stdout.len()));
+        assert_eq!(stdout.matches(OUTPUT_TRUNCATION_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn provider_error_is_separate_and_sanitized() {
+        let mut state = AppState::new((80, 24));
+        run_started(&mut state);
+        state.update(Action::AgentEvent(AgentEvent::ProviderError {
             run_id: RunId::new(1),
-            tool_call_id: "tc_a".into(),
+            error: ProviderError {
+                reason: StopReason::Error,
+                message: "Authorization: Bearer secret".into(),
+            },
+        }));
+        assert!(matches!(&state.transcript[0], TranscriptBlock::Error { message } if !message.contains("secret")));
+        assert!(!render_state(&state).contains("secret"));
+    }
+
+    #[test]
+    fn test_backend_renders_all_requested_sizes_and_unicode() {
+        for size in [(120, 40), (80, 24), (60, 18), (40, 12), (20, 8)] {
+            let mut state = AppState::new(size);
+            state.input.set_text("你好\nworld".into());
+            state.transcript.push(TranscriptBlock::User {
+                text: "多行 prompt\n第二行".into(),
+            });
+            state.transcript.push(TranscriptBlock::Assistant {
+                text: "response".into(),
+                streaming: true,
+            });
+            assert!(!render_state(&state).is_empty());
+        }
+    }
+
+    #[test]
+    fn snapshots_cover_stable_idle_and_tool_views() {
+        let state = AppState::new((80, 24));
+        assert_snapshot!("idle_v2", render_state(&state));
+        let mut tool = AppState::new((80, 24));
+        run_started(&mut tool);
+        tool_started(&mut tool, "normalized");
+        assert_snapshot!("tool_collapsed_v2", render_state(&tool));
+        tool.update(Action::AgentEvent(AgentEvent::ToolOutput {
+            run_id: RunId::new(1),
+            tool_call_id: "normalized".into(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "listed file".into(),
+        }));
+        tool.update(Action::AgentEvent(AgentEvent::ToolOutput {
+            run_id: RunId::new(1),
+            tool_call_id: "normalized".into(),
+            stream: ToolOutputStream::Stderr,
+            chunk: "warning".into(),
+        }));
+        tool.update(Action::AgentEvent(AgentEvent::ToolFinished {
+            run_id: RunId::new(1),
+            tool_call_id: "normalized".into(),
             name: "bash".into(),
-            result: crate::agent::types::AgentToolResult {
-                content: vec![],
+            result: AgentToolResult {
+                exit_code: Some(0),
                 ..Default::default()
             },
-        });
-        // Run B tool state should be unchanged (tc_b still Running)
-        match &state.transcript[0] {
-            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Running),
-            _ => panic!("Expected tool_b entry"),
-        }
-        // current_run_id should still be Run B
-        assert_eq!(state.current_run_id, Some(RunId::new(2)));
-    }
-
-    #[test]
-    fn late_run_finished_from_old_run_does_not_affect_current() {
-        let mut state = AppState::new((80, 24));
-        // Run A starts
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        // Run B starts (simulating new run)
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-        // Late RunFinished from Run A with Stop reason
-        state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: RunId::new(1),
-            stop_reason: StopReason::Stop,
-        });
-        // current_run_id should still be Run B
-        assert_eq!(state.current_run_id, Some(RunId::new(2)));
-        // Transcript should be empty (Run A's finish didn't add anything)
-        assert!(state.transcript.is_empty());
-    }
-
-    #[test]
-    fn unknown_run_id_events_ignored() {
-        let mut state = AppState::new((80, 24));
-        // No run started yet — send events with unknown run_id
-        let unknown = RunId::new(999);
-        let orig_activity = state.activity.clone();
-        let orig_outcome = state.last_outcome.clone();
-        let orig_transcript_len = state.transcript.len();
-        let orig_status = state.status.clone();
-        let orig_quit = state.quit;
-
-        state.handle_agent_event(AgentEvent::TextDelta {
-            run_id: unknown,
-            text: "ghost".into(),
-        });
-        state.handle_agent_event(AgentEvent::ToolStarted {
-            run_id: unknown,
-            tool_call_id: "tc_ghost".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-        });
-        state.handle_agent_event(AgentEvent::ToolOutput {
-            run_id: unknown,
-            tool_call_id: "tc_ghost".into(),
-            stream: crate::agent::events::ToolOutputStream::Stdout,
-            chunk: "data".into(),
-        });
-        state.handle_agent_event(AgentEvent::ToolFinished {
-            run_id: unknown,
-            tool_call_id: "tc_ghost".into(),
-            name: "bash".into(),
-            result: crate::agent::types::AgentToolResult::default(),
-        });
-        state.handle_agent_event(AgentEvent::ProviderError {
-            run_id: unknown,
-            error: crate::agent::events::ProviderError {
-                reason: StopReason::Error,
-                message: "error".into(),
-            },
-        });
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: unknown });
-        state.handle_agent_event(AgentEvent::RunFinished {
-            run_id: unknown,
-            stop_reason: StopReason::Stop,
-        });
-
-        // AppState should be completely unchanged
-        assert_eq!(state.activity, orig_activity);
-        assert_eq!(state.last_outcome, orig_outcome);
-        assert_eq!(state.transcript.len(), orig_transcript_len);
-        assert_eq!(state.status, orig_status);
-        assert_eq!(state.quit, orig_quit);
-        assert_eq!(state.current_run_id, None);
-    }
-
-    #[test]
-    fn late_provider_error_from_old_run_ignored() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-
-        state.handle_agent_event(AgentEvent::ProviderError {
-            run_id: RunId::new(1),
-            error: crate::agent::events::ProviderError {
-                reason: StopReason::Error,
-                message: "stale error".into(),
-            },
-        });
-        assert!(state.error.is_none(), "Stale provider error should be ignored");
-        assert!(state.transcript.is_empty());
-    }
-
-    #[test]
-    fn late_run_aborted_from_old_run_ignored() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
-        // Run B's current_run_id should still be RunId::new(2)
-        assert_eq!(state.current_run_id, Some(RunId::new(2)));
-        // Transcript should be empty (Run A's abort didn't add anything)
-        assert!(state.transcript.is_empty());
-    }
-
-    #[test]
-    fn late_thinking_delta_from_old_run_ignored() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(2) });
-        let orig_status = state.status.clone();
-
-        state.handle_agent_event(AgentEvent::ThinkingDelta {
-            run_id: RunId::new(1),
-            text: "thinking...".into(),
-        });
-        assert_eq!(state.status, orig_status, "Stale thinking should not change status");
-    }
-
-    // ── Snapshot tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn snapshot_idle() {
-        let state = AppState::new((80, 24));
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_streaming() {
-        let mut state = AppState::new((80, 24));
-        state.activity = ActivityState::Running;
-        state.transcript.push(TranscriptEntry::User("hi".into()));
-        state.transcript.push(TranscriptEntry::Assistant(
-            "Hello! I can help you with coding tasks.".into(),
-        ));
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_tool_running() {
-        let mut state = AppState::new((80, 24));
-        state.activity = ActivityState::Running;
-        state.transcript.push(TranscriptEntry::Tool {
-            id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({"command": "ls"}),
-            stdout: String::new(),
-            stderr: String::new(),
-            state: ToolRunState::Running,
-            result: None,
-        });
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_tool_success() {
-        let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::Tool {
-            id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-            stdout: "file1.txt\nfile2.txt".into(),
-            stderr: String::new(),
-            state: ToolRunState::Succeeded,
-            result: None,
-        });
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_tool_error() {
-        let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::Tool {
-            id: "tc_1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
-            stdout: String::new(),
-            stderr: "command not found".into(),
-            state: ToolRunState::Failed,
-            result: None,
-        });
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_provider_error() {
-        let mut state = AppState::new((80, 24));
-        state
-            .transcript
-            .push(TranscriptEntry::ProviderError("Rate limit exceeded".into()));
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_aborted() {
-        let mut state = AppState::new((80, 24));
-        state.handle_agent_event(AgentEvent::RunStarted { run_id: RunId::new(1) });
-        state.activity = ActivityState::Running;
-        state.handle_agent_event(AgentEvent::RunAborted { run_id: RunId::new(1) });
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_narrow_terminal() {
-        let state = AppState::new((40, 12));
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
-    }
-
-    #[test]
-    fn snapshot_unicode() {
-        let mut state = AppState::new((80, 24));
-        state
-            .transcript
-            .push(TranscriptEntry::Assistant("你好世界 🌍 café résumé".into()));
-        let output = render_state(&state);
-        insta::assert_snapshot!(output);
+        }));
+        tool.focus = Focus::Transcript;
+        tool.selection.selected_block = Some(0);
+        tool.update(Action::KeyInput(key(KeyCode::Char(' '))));
+        assert_snapshot!("tool_expanded_v2", render_state(&tool));
     }
 }
