@@ -6,6 +6,7 @@
 
 use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
+use serde::{Deserialize, Serialize};
 
 /// Opaque identifier for a single agent run.
 ///
@@ -90,6 +91,51 @@ pub enum AgentEvent {
 
     /// The run finished normally.
     RunFinished { run_id: RunId, stop_reason: StopReason },
+
+    /// The run failed due to an internal agent error.
+    RunFailed { run_id: RunId, error: AgentRunError },
+}
+
+/// Phase where an agent run failure occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentRunPhase {
+    /// Failed to create or start the provider stream.
+    ProviderStart,
+    /// Failed while receiving from the provider stream.
+    ProviderStream,
+    /// Failed to append a message to the session.
+    Session,
+    /// Failed during tool execution.
+    ToolExecution,
+    /// General agent loop invariant failure.
+    AgentLoop,
+}
+
+impl std::fmt::Display for AgentRunPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderStart => write!(f, "provider start"),
+            Self::ProviderStream => write!(f, "provider stream"),
+            Self::Session => write!(f, "session"),
+            Self::ToolExecution => write!(f, "tool execution"),
+            Self::AgentLoop => write!(f, "agent loop"),
+        }
+    }
+}
+
+/// Structured error for agent run failures.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AgentRunError {
+    /// The phase where the failure occurred.
+    pub phase: AgentRunPhase,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+impl std::fmt::Display for AgentRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.phase, self.message)
+    }
 }
 
 /// Which stream a tool output chunk came from.

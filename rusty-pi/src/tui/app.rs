@@ -925,6 +925,17 @@ impl AppState {
                 self.note_new_lines(2);
                 self.enforce_block_limit();
             }
+            AgentEvent::RunFailed { run_id, error } if self.accepts(run_id) => {
+                self.finish_assistant_stream();
+                self.activity = ActivityState::Idle;
+                self.last_outcome = Some(RunOutcome::ToolError(format!("{}: {}", error.phase, error.message)));
+                self.transcript.push(TranscriptBlock::Error {
+                    message: format!("Run failed [{}]: {}", error.phase, error.message),
+                });
+                self.status = format!("Failed · {}", error.phase);
+                self.note_new_lines(2);
+                self.enforce_block_limit();
+            }
             AgentEvent::RunFinished { run_id, stop_reason } if self.accepts(run_id) => {
                 self.finish_assistant_stream();
                 match stop_reason {

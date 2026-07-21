@@ -30,15 +30,6 @@ impl Default for AgentConfig {
     }
 }
 
-/// Callback for streaming text deltas.
-pub type TextCallback = Box<dyn FnMut(&str) + Send>;
-
-/// Callback when a tool starts executing. Arguments: (tool_name, args_json).
-pub type ToolStartCallback = Box<dyn Fn(&str, &str) + Send>;
-
-/// Callback when a tool finishes executing. Arguments: (tool_name, duration_ms).
-pub type ToolEndCallback = Box<dyn Fn(&str, u64) + Send>;
-
 /// Shared cancellation token for signalling Ctrl+C / cancellation.
 /// Each agent run creates a child token; cancelling the parent cancels all runs.
 pub type AbortFlag = CancellationToken;
@@ -58,12 +49,6 @@ pub struct Agent {
     provider: Box<dyn ProviderApi>,
     model: Model,
     config: AgentConfig,
-    /// Optional callback for streaming text deltas.
-    on_text: Option<TextCallback>,
-    /// Optional callback when a tool starts.
-    on_tool_start: Option<ToolStartCallback>,
-    /// Optional callback when a tool finishes.
-    on_tool_end: Option<ToolEndCallback>,
     /// Shared cancellation token: cancelling this aborts the current run.
     abort: AbortFlag,
     /// Optional event sender for unified event stream.
@@ -83,9 +68,6 @@ impl Agent {
             provider,
             model,
             config: AgentConfig::default(),
-            on_text: None,
-            on_tool_start: None,
-            on_tool_end: None,
             abort: CancellationToken::new(),
             event_tx: None,
             run_counter: 0,
@@ -95,32 +77,6 @@ impl Agent {
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         self.config = config;
         self
-    }
-
-    /// Register a callback for streaming text deltas.
-    pub fn on_text<F>(&mut self, callback: F)
-    where
-        F: FnMut(&str) + Send + 'static,
-    {
-        self.on_text = Some(Box::new(callback));
-    }
-
-    /// Register a callback for tool start events.
-    /// Arguments: `(tool_name, args_json)`.
-    pub fn on_tool_start<F>(&mut self, callback: F)
-    where
-        F: Fn(&str, &str) + Send + 'static,
-    {
-        self.on_tool_start = Some(Box::new(callback));
-    }
-
-    /// Register a callback for tool end events.
-    /// Arguments: `(tool_name, duration_ms)`.
-    pub fn on_tool_end<F>(&mut self, callback: F)
-    where
-        F: Fn(&str, u64) + Send + 'static,
-    {
-        self.on_tool_end = Some(Box::new(callback));
     }
 
     /// Signal the agent to abort the current round.
@@ -217,7 +173,7 @@ impl Agent {
             .as_millis() as i64
     }
 
-    async fn finish_aborted(&mut self, run_id: RunId) -> Result<()> {
+    async fn finish_aborted(&mut self, run_id: RunId) {
         let msg = crate::ai::types::AssistantMessage {
             content: vec![],
             api: self.model.api.to_string(),
@@ -228,18 +184,19 @@ impl Agent {
             error_message: Some("Aborted by user".into()),
             timestamp: Self::now_ms(),
         };
-        self.session
-            .append_message(AgentMessage::Assistant(msg))
-            .await
-            .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
+        let _ = self.session.append_message(AgentMessage::Assistant(msg)).await;
         self.emit(AgentEvent::RunAborted { run_id }).await;
-        Ok(())
     }
 
     fn tool_refs(&self) -> Vec<&dyn Tool> {
         self.tools.iter().map(|t| t.as_ref() as &dyn Tool).collect()
     }
 
+    /// Run the agent with a prompt. All events are emitted through the event channel.
+    ///
+    /// Every `RunStarted` is guaranteed to produce exactly one terminal event
+    /// (`RunFinished`, `RunAborted`, or `RunFailed`). The implementation uses
+    /// a centralized exit path via `finish_run` to enforce this invariant.
     pub async fn run(&mut self, prompt: &str) -> Result<()> {
         let now = Self::now_ms();
 
@@ -251,10 +208,19 @@ impl Agent {
             content: MessageContent::Text(prompt.to_string()),
             timestamp: now,
         });
-        self.session
-            .append_message(user_msg)
-            .await
-            .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
+        if let Err(e) = self.session.append_message(user_msg).await {
+            let err = format!("Session error: {}", e);
+            self.emit(AgentEvent::RunStarted { run_id }).await;
+            self.emit(AgentEvent::RunFailed {
+                run_id,
+                error: crate::agent::events::AgentRunError {
+                    phase: crate::agent::events::AgentRunPhase::Session,
+                    message: err.clone(),
+                },
+            })
+            .await;
+            return Err(anyhow::anyhow!(err));
+        }
 
         // Create a child token for this run. If the parent is already cancelled,
         // this child will be immediately cancelled too.
@@ -263,6 +229,33 @@ impl Agent {
         // Emit RunStarted
         self.emit(AgentEvent::RunStarted { run_id }).await;
 
+        // Run the inner loop, capturing the result
+        let result = self.run_inner(run_id, run_token).await;
+
+        // Centralized terminal event emission
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                // Don't emit RunFailed if the run was already aborted
+                if !self.abort.is_cancelled() {
+                    self.emit(AgentEvent::RunFailed {
+                        run_id,
+                        error: crate::agent::events::AgentRunError {
+                            phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                            message: err_msg.clone(),
+                        },
+                    })
+                    .await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner run loop — returns Ok(()) on any terminal event, Err on internal failure.
+    /// Terminal events (RunFinished, RunAborted, RunFailed) are emitted here.
+    async fn run_inner(&mut self, run_id: RunId, run_token: CancellationToken) -> Result<()> {
         for round in 0..=self.config.max_tool_rounds {
             let tool_refs = self.tool_refs();
             let current_messages = self.session.messages().await;
@@ -287,10 +280,23 @@ impl Agent {
                 ) => Some(result),
             };
             let Some(provider_result) = provider_result else {
-                self.finish_aborted(run_id).await?;
+                self.finish_aborted(run_id).await;
                 return Ok(());
             };
-            let mut stream = provider_result.with_context(|| format!("LLM call failed at round {}", round))?;
+            let mut stream = match provider_result {
+                Ok(s) => s,
+                Err(e) => {
+                    self.emit(AgentEvent::RunFailed {
+                        run_id,
+                        error: crate::agent::events::AgentRunError {
+                            phase: crate::agent::events::AgentRunPhase::ProviderStart,
+                            message: format!("LLM call failed at round {}: {}", round, e),
+                        },
+                    })
+                    .await;
+                    return Err(anyhow::anyhow!("LLM call failed at round {}: {}", round, e));
+                }
+            };
 
             // Accumulate stream events into an AssistantMessage
             let mut acc = MessageAccumulator::new(self.model.api, self.model.id, self.model.id);
@@ -298,7 +304,7 @@ impl Agent {
             // Check for abort BEFORE starting the stream loop
             if run_token.is_cancelled() {
                 stream.cancel_and_shutdown().await;
-                self.finish_aborted(run_id).await?;
+                self.finish_aborted(run_id).await;
                 return Ok(());
             }
 
@@ -306,30 +312,24 @@ impl Agent {
                 biased;
                 _ = run_token.cancelled() => {
                     stream.cancel_and_shutdown().await;
-                    self.finish_aborted(run_id).await?;
+                    self.finish_aborted(run_id).await;
                     return Ok(());
                 }
                 event = stream.recv() => event,
             } {
                 if run_token.is_cancelled() {
                     stream.cancel_and_shutdown().await;
-                    self.finish_aborted(run_id).await?;
+                    self.finish_aborted(run_id).await;
                     return Ok(());
                 }
 
-                // Fire streaming callback for text deltas
+                // Emit through event channel for text deltas
                 if let StreamEvent::TextDelta { ref delta } = event {
-                    // Emit through event channel
                     self.emit(AgentEvent::TextDelta {
                         run_id,
                         text: delta.clone(),
                     })
                     .await;
-
-                    // Also fire legacy callback
-                    if let Some(ref mut cb) = self.on_text {
-                        cb(delta);
-                    }
                 }
 
                 let is_terminal = matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
@@ -346,7 +346,7 @@ impl Agent {
 
             // Check for abort AFTER the stream loop (user hit Ctrl+C during streaming)
             if run_token.is_cancelled() {
-                self.finish_aborted(run_id).await?;
+                self.finish_aborted(run_id).await;
                 return Ok(());
             }
 
@@ -394,10 +394,21 @@ impl Agent {
                 ..response
             };
 
-            self.session
+            if let Err(e) = self
+                .session
                 .append_message(AgentMessage::Assistant(response.clone()))
                 .await
-                .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
+            {
+                self.emit(AgentEvent::RunFailed {
+                    run_id,
+                    error: crate::agent::events::AgentRunError {
+                        phase: crate::agent::events::AgentRunPhase::Session,
+                        message: format!("Session append failed: {}", e),
+                    },
+                })
+                .await;
+                return Err(anyhow::anyhow!("Session append failed: {}", e));
+            }
 
             match response.stop_reason {
                 StopReason::Stop | StopReason::Length | StopReason::Error | StopReason::Aborted => {
@@ -410,6 +421,14 @@ impl Agent {
                 }
                 StopReason::ToolUse => {
                     if round >= self.config.max_tool_rounds {
+                        self.emit(AgentEvent::RunFailed {
+                            run_id,
+                            error: crate::agent::events::AgentRunError {
+                                phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                                message: format!("Exceeded maximum tool call rounds ({})", self.config.max_tool_rounds),
+                            },
+                        })
+                        .await;
                         anyhow::bail!("Exceeded maximum tool call rounds ({})", self.config.max_tool_rounds);
                     }
 
@@ -429,10 +448,23 @@ impl Agent {
                         })
                         .await;
 
-                        let outcome = self
+                        let outcome = match self
                             .execute_tool(run_id, &call.id, &call.name, call.arguments.clone(), &run_token)
                             .await
-                            .with_context(|| format!("Tool '{}' execution failed", call.name))?;
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                self.emit(AgentEvent::RunFailed {
+                                    run_id,
+                                    error: crate::agent::events::AgentRunError {
+                                        phase: crate::agent::events::AgentRunPhase::ToolExecution,
+                                        message: format!("Tool '{}' failed: {}", call.name, e),
+                                    },
+                                })
+                                .await;
+                                return Err(anyhow::anyhow!("Tool '{}' execution failed: {}", call.name, e));
+                            }
+                        };
 
                         // Emit ToolFinished
                         self.emit(AgentEvent::ToolFinished {
@@ -443,16 +475,23 @@ impl Agent {
                         })
                         .await;
 
-                        self.session
-                            .append_message(outcome.session_message)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("Session error: {}", e))?;
+                        if let Err(e) = self.session.append_message(outcome.session_message).await {
+                            self.emit(AgentEvent::RunFailed {
+                                run_id,
+                                error: crate::agent::events::AgentRunError {
+                                    phase: crate::agent::events::AgentRunPhase::Session,
+                                    message: format!("Session append failed: {}", e),
+                                },
+                            })
+                            .await;
+                            return Err(anyhow::anyhow!("Session append failed: {}", e));
+                        }
                         if outcome.result.terminate {
                             any_terminate = true;
                         }
                     }
                     if run_token.is_cancelled() {
-                        self.finish_aborted(run_id).await?;
+                        self.finish_aborted(run_id).await;
                         return Ok(());
                     }
                     if any_terminate {
@@ -467,6 +506,14 @@ impl Agent {
             }
         }
 
+        self.emit(AgentEvent::RunFailed {
+            run_id,
+            error: crate::agent::events::AgentRunError {
+                phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                message: "Agent loop exited without producing a final response".into(),
+            },
+        })
+        .await;
         anyhow::bail!("Agent loop exited without producing a final response")
     }
 
@@ -492,13 +539,7 @@ impl Agent {
             .find(|t| t.name() == tool_name)
             .with_context(|| format!("Tool '{}' not found", tool_name))?;
 
-        // Fire on_tool_start callback
-        let args_str = args.to_string();
-        if let Some(ref cb) = self.on_tool_start {
-            cb(tool_name, &args_str);
-        }
-
-        let start_ms = Self::now_ms();
+        let _start_ms = Self::now_ms();
 
         // Create a per-execution context with its own cancellation token and output channel.
         let tool_token = run_token.child_token();
@@ -534,14 +575,6 @@ impl Agent {
 
         // Wait for the forwarder to finish draining output events.
         let _ = forwarder.await;
-
-        let end_ms = Self::now_ms();
-        let duration_ms = (end_ms - start_ms) as u64;
-
-        // Fire on_tool_end callback
-        if let Some(ref cb) = self.on_tool_end {
-            cb(tool_name, duration_ms);
-        }
 
         let now = Self::now_ms();
 
@@ -853,20 +886,6 @@ mod tests {
                 .count(),
             2
         );
-    }
-
-    #[tokio::test]
-    async fn agent_streaming_callback() {
-        let mock = MockProvider::new(vec![MockStep::Text("hello world".into())]);
-        let mut agent = Agent::new(Box::new(mock), make_model());
-        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let cb = received.clone();
-        agent.on_text(move |delta| {
-            cb.lock().unwrap().push_str(delta);
-        });
-        agent.run("Hi").await.unwrap();
-        let val = received.lock().unwrap().clone();
-        assert!(val.contains("hello"), "Expected 'hello' in stream: {}", val);
     }
 
     #[tokio::test]

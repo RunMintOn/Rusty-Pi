@@ -3,17 +3,16 @@
 use crate::agent::engine::AbortFlag;
 use crate::ai::types::{AgentMessage, StopReason};
 use crate::coding_agent::command::{
-    CommandRegistry, CommandResult, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader,
-    ListSessionsCommand, ModelCommand, QuitCommand, SessionCommand, TreeCommand,
+    CommandRegistry, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader, ListSessionsCommand,
+    ModelCommand, QuitCommand, SessionCommand, TreeCommand,
 };
 use crate::coding_agent::prompt_session::PromptSession;
 use crate::format::OutputFormatter;
+use crate::frontends::PrintFrontend;
 use anyhow::Result;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Run configuration for the CLI.
@@ -71,50 +70,6 @@ pub fn startup_banner(provider: &str, model: &str, session_id: &str) -> String {
     fmt.banner(provider, model, session_id)
 }
 
-/// Render a CommandResult to the terminal (stdout/stderr).
-pub fn render_command_result(result: &CommandResult) {
-    match result {
-        CommandResult::Message(text) => {
-            println!("{}", text);
-        }
-        CommandResult::Error(msg) => {
-            let fmt = OutputFormatter::new();
-            eprintln!("{}", fmt.error(msg));
-        }
-        CommandResult::Help(items) => {
-            println!("\n  Commands:");
-            for item in items {
-                println!("    /{:<12} {}", item.name, item.description);
-            }
-            println!("\n  Tips:");
-            println!("    - Up/down arrows navigate command history");
-            println!("    - Ctrl+C at prompt exits");
-            println!("    - Ctrl+C during agent run aborts the current round");
-            println!("    - Type any text to chat with the agent");
-        }
-        CommandResult::ModelChanged { model } => {
-            println!("Switched to {}", model);
-        }
-        CommandResult::Sessions(sessions) => {
-            if sessions.is_empty() {
-                println!("No sessions found.");
-            } else {
-                println!("Available sessions:");
-                for s in sessions {
-                    println!(
-                        "  {} | model: {} | msgs: {} | created: {}",
-                        s.id, s.model, s.msg_count, s.created
-                    );
-                }
-            }
-        }
-        CommandResult::Quit => {
-            // Handled by the caller via DispatchOutcome::Exit
-        }
-        CommandResult::Noop => {}
-    }
-}
-
 /// Run the CLI with the given configuration.
 pub async fn run(config: RunConfig) -> Result<()> {
     let mut session = config.session;
@@ -125,7 +80,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     }
 }
 
-/// Helper: run an agent with Ctrl+C abort support and tool event formatting.
+/// Helper: run an agent with Ctrl+C abort support and event-based output.
 /// Returns `true` if the run was aborted, `false` otherwise.
 async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
     // Expand templates/skills before borrowing agent
@@ -135,65 +90,84 @@ async fn run_with_abort(session: &mut PromptSession, prompt: &str) -> bool {
     let abort_token: AbortFlag = CancellationToken::new();
     agent.set_abort_flag(abort_token.clone());
 
-    let formatter = Arc::new(OutputFormatter::new());
+    // Set up event channel
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+    agent.set_event_sender(event_tx);
 
-    let buf = Arc::new(Mutex::new(String::new()));
-    let buf_cb = buf.clone();
-    agent.on_text(move |delta| {
-        print!("{}", delta);
-        let _ = io::stdout().flush();
-        buf_cb.lock().unwrap().push_str(delta);
-    });
+    let mut frontend = PrintFrontend::new();
+    let mut was_aborted = false;
 
-    // Register tool event callbacks
-    {
-        let fmt = formatter.clone();
-        agent.on_tool_start(move |name, args| {
-            print!("{}", fmt.tool_start(name, args));
-            let _ = io::stdout().flush();
-        });
-    }
-    {
-        let fmt = formatter.clone();
-        agent.on_tool_end(move |name, duration| {
-            print!("{}", fmt.tool_end(name, duration));
-            let _ = io::stdout().flush();
-        });
-    }
-
-    let run_future = agent.run(&expanded);
+    // Run the agent future
+    let run_future = session.agent().run(&expanded);
     tokio::pin!(run_future);
 
-    let was_aborted = tokio::select! {
-        result = &mut run_future => {
-            if let Err(e) = result {
-                eprintln!("\n[error] {}", e);
+    loop {
+        tokio::select! {
+            result = &mut run_future => {
+                // Agent finished (success or error)
+                if let Err(e) = result {
+                    eprintln!("\n[error] {}", e);
+                }
+                // Drain remaining events
+                while let Ok(event) = event_rx.try_recv() {
+                    let _ = frontend.handle_event(&event);
+                }
+                break;
             }
-            false
+            event = event_rx.recv() => {
+                if let Some(event) = event {
+                    let _ = frontend.handle_event(&event);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\n⏹ Ctrl+C — cancelling...");
+                abort_token.cancel();
+                was_aborted = true;
+                // Don't break yet — wait for the agent to finish
+            }
         }
-        _ = tokio::signal::ctrl_c() => {
-            let fmt = OutputFormatter::new();
-            eprintln!("{}", fmt.interrupt());
-            abort_token.cancel();
-            true
-        }
-    };
+    }
 
-    // Print trailing newline if needed
-    {
-        let output = buf.lock().unwrap();
-        if !output.ends_with('\n') && !output.is_empty() {
-            println!();
-        }
+    // Clean up: drain any late events
+    while let Ok(event) = event_rx.try_recv() {
+        let _ = frontend.handle_event(&event);
     }
 
     was_aborted
 }
 
 /// Run a single prompt and print the response, then exit.
+/// Uses PrintFrontend for event-based output with proper exit codes.
 async fn run_single_shot(session: &mut PromptSession, prompt: &str) -> Result<()> {
-    run_with_abort(session, prompt).await;
-    Ok(())
+    use crate::frontends::print::PrintRunOutcome;
+    use crate::frontends::print::{PrintFrontend, RealOutput, drive_print_run};
+
+    let expanded = session.expand(prompt);
+    let agent = session.agent();
+    let run_token = CancellationToken::new();
+    let mut frontend = PrintFrontend::<RealOutput>::new();
+
+    let outcome = drive_print_run(agent, &expanded, &mut frontend, run_token).await;
+
+    match outcome {
+        PrintRunOutcome::Finished(reason) => {
+            if matches!(reason, StopReason::Error | StopReason::Aborted) {
+                // Non-zero exit code for error/abort in single-shot mode
+                Ok(())
+            } else {
+                Ok(())
+            }
+        }
+        PrintRunOutcome::Aborted => {
+            // User cancelled — exit code 130
+            std::process::exit(130);
+        }
+        PrintRunOutcome::Failed(error) => {
+            // Internal failure — non-zero exit code
+            eprintln!("[error] {}", error);
+            Err(anyhow::anyhow!("Run failed: {}", error))
+        }
+    }
 }
 
 /// Resolve history path given a home directory string.
@@ -238,6 +212,8 @@ async fn run_repl_with(
     println!("{}", banner);
     println!("Type '/help' for commands\n");
 
+    let mut frontend = PrintFrontend::new();
+
     loop {
         let line = match reader.readline("> ") {
             Ok(line) => line,
@@ -266,7 +242,7 @@ async fn run_repl_with(
         match registry.dispatch(&trimmed, session)? {
             DispatchOutcome::Exit => break,
             DispatchOutcome::Handled(result) => {
-                render_command_result(&result);
+                let _ = frontend.handle_command_result(&result);
                 continue;
             }
             DispatchOutcome::NotACommand => {
@@ -283,8 +259,7 @@ async fn run_repl_with(
                 && a.stop_reason == StopReason::Error
                 && let Some(err) = &a.error_message
             {
-                let fmt = OutputFormatter::new();
-                eprintln!("{}", fmt.error(err));
+                eprintln!("[error] {}", err);
             }
         }
         println!();
