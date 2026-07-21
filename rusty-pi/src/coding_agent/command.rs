@@ -2,11 +2,48 @@
 //!
 //! Provides [`Command`] trait, [`CommandRegistry`], and built-in commands
 //! (`/help`, `/exit`, `/quit`).
+//!
+//! Commands return [`CommandResult`] — a structured enum that the frontend
+//! (PrintFrontend or Ratatui) renders appropriately. Commands never write
+//! directly to stdout/stderr.
 
 use crate::coding_agent::prompt_session::PromptSession;
 use crate::format::OutputFormatter;
 use anyhow::Result;
 use std::sync::OnceLock;
+
+// ── CommandResult ──────────────────────────────────────────────────────────
+
+/// Structured result returned by every slash command.
+///
+/// The frontend is responsible for rendering this into user-visible output.
+/// Commands must never write to stdout/stderr directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandResult {
+    /// A plain text message to display.
+    Message(String),
+    /// An error message.
+    Error(String),
+    /// Help text listing available commands.
+    Help(Vec<CommandHelpItem>),
+    /// The model was changed.
+    ModelChanged { model: String },
+    /// List of sessions.
+    Sessions(Vec<SessionSummary>),
+    /// Request to quit the REPL.
+    Quit,
+    /// No output needed.
+    Noop,
+}
+
+/// A single item in the help listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandHelpItem {
+    /// Command name (without `/`).
+    pub name: String,
+    /// One-line description.
+    pub description: String,
+}
 
 /// Run an async future to completion in a dedicated blocking runtime.
 ///
@@ -39,12 +76,12 @@ where
 }
 
 /// Outcome of dispatching a command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchOutcome {
     /// Input does not start with `/` — not a command.
     NotACommand,
-    /// A command was found and executed; continue the REPL loop.
-    Handled,
+    /// A command was found and executed; result is the structured output.
+    Handled(CommandResult),
     /// The command requested REPL exit.
     Exit,
 }
@@ -58,7 +95,7 @@ pub trait Command: Send + Sync {
     fn description(&self) -> &str;
 
     /// Execute the command with optional arguments and mutable access to the session.
-    fn execute(&self, args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome>;
+    fn execute(&self, args: &[&str], session: &mut PromptSession) -> Result<CommandResult>;
 }
 
 /// Registry of available slash commands.
@@ -103,7 +140,7 @@ impl CommandRegistry {
     ///
     /// Returns:
     /// - `Ok(NotACommand)` — input does not start with `/`.
-    /// - `Ok(Handled)` — command was found and executed.
+    /// - `Ok(Handled(result))` — command was found and executed.
     /// - `Ok(Exit)` — exit command was executed.
     /// - `Err(e)` — command execution failed.
     pub fn dispatch(&self, input: &str, session: &mut PromptSession) -> Result<DispatchOutcome> {
@@ -118,36 +155,48 @@ impl CommandRegistry {
 
         // Handle /help directly so it works even when HelpCommand is a stub
         if cmd_name == "help" {
-            print!("{}", self.help_text());
-            return Ok(DispatchOutcome::Handled);
+            let items = self.help_items();
+            return Ok(DispatchOutcome::Handled(CommandResult::Help(items)));
         }
 
         // Look for exact match
         for cmd in &self.commands {
             if cmd.name() == cmd_name {
-                return cmd.execute(&args, session);
+                let result = cmd.execute(&args, session)?;
+                // Convert CommandResult::Quit to DispatchOutcome::Exit
+                if matches!(result, CommandResult::Quit) {
+                    return Ok(DispatchOutcome::Exit);
+                }
+                return Ok(DispatchOutcome::Handled(result));
             }
         }
 
-        // Unknown command — still mark as handled so we don't send it to the agent
-        let fmt = OutputFormatter::new();
-        eprintln!(
-            "{}",
-            fmt.error(&format!(
-                "Unknown command '/{}'. Type '/help' for available commands.",
-                cmd_name
-            ))
-        );
-        Ok(DispatchOutcome::Handled)
+        // Unknown command
+        Ok(DispatchOutcome::Handled(CommandResult::Error(format!(
+            "Unknown command '/{}'. Type '/help' for available commands.",
+            cmd_name
+        ))))
+    }
+
+    /// Generate help items listing all registered commands.
+    pub fn help_items(&self) -> Vec<CommandHelpItem> {
+        self.commands
+            .iter()
+            .map(|cmd| CommandHelpItem {
+                name: cmd.name().to_string(),
+                description: cmd.description().to_string(),
+            })
+            .collect()
     }
 
     /// Generate help text listing all registered commands.
     pub fn help_text(&self) -> String {
+        let items = self.help_items();
         let mut out = String::new();
         out.push_str("\n  Commands:\n");
-        for cmd in &self.commands {
+        for item in &items {
             use std::fmt::Write;
-            let _ = write!(out, "    /{:<12} {}\n", cmd.name(), cmd.description());
+            let _ = write!(out, "    /{:<12} {}\n", item.name, item.description);
         }
         out.push_str("\n  Tips:\n");
         out.push_str("    - Up/down arrows navigate command history\n");
@@ -167,10 +216,6 @@ impl Default for CommandRegistry {
 // ── Built-in commands ────────────────────────────────────────────────────
 
 /// `/help` — list available commands.
-///
-/// This command is registered so it appears in `/help` listing.
-/// The actual help output is produced by [`CommandRegistry::dispatch`]
-/// when it matches `cmd_name == "help"`.
 pub struct HelpCommand;
 
 impl Command for HelpCommand {
@@ -182,10 +227,9 @@ impl Command for HelpCommand {
         "Show this help message"
     }
 
-    fn execute(&self, _args: &[&str], _session: &mut PromptSession) -> Result<DispatchOutcome> {
-        // dispatch() handles /help before reaching this stub.
-        // This execute() exists only to make the command appear in the registry listing.
-        Ok(DispatchOutcome::Handled)
+    fn execute(&self, _args: &[&str], _session: &mut PromptSession) -> Result<CommandResult> {
+        // The registry handles /help dispatch; this stub exists for listing.
+        Ok(CommandResult::Noop)
     }
 }
 
@@ -201,8 +245,8 @@ impl Command for ExitCommand {
         "Exit the REPL"
     }
 
-    fn execute(&self, _args: &[&str], _session: &mut PromptSession) -> Result<DispatchOutcome> {
-        Ok(DispatchOutcome::Exit)
+    fn execute(&self, _args: &[&str], _session: &mut PromptSession) -> Result<CommandResult> {
+        Ok(CommandResult::Quit)
     }
 }
 
@@ -218,8 +262,8 @@ impl Command for QuitCommand {
         "Exit the REPL"
     }
 
-    fn execute(&self, _args: &[&str], _session: &mut PromptSession) -> Result<DispatchOutcome> {
-        Ok(DispatchOutcome::Exit)
+    fn execute(&self, _args: &[&str], _session: &mut PromptSession) -> Result<CommandResult> {
+        Ok(CommandResult::Quit)
     }
 }
 
@@ -247,7 +291,7 @@ impl Command for ModelCommand {
         "Switch model (interactive selector)"
     }
 
-    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
+    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<CommandResult> {
         // Gather model IDs from the provider
         let models = {
             let agent = session.agent();
@@ -259,16 +303,14 @@ impl Command for ModelCommand {
         };
 
         if models.is_empty() {
-            // Provider doesn't support model listing
             let current = {
                 let agent = session.agent();
                 agent.model().id.to_string()
             };
-            println!(
+            return Ok(CommandResult::Message(format!(
                 "Current model: {}. This provider doesn't support runtime model switching.",
                 current
-            );
-            return Ok(DispatchOutcome::Handled);
+            )));
         }
 
         let selected = self.picker.select("Select model:", models)?;
@@ -278,21 +320,19 @@ impl Command for ModelCommand {
         };
 
         if selected == current_id {
-            println!("Already using {}", selected);
+            Ok(CommandResult::Message(format!("Already using {}", selected)))
         } else {
-            // Find the Model struct matching the selected ID
             let model = {
                 let agent = session.agent();
                 agent.list_models().into_iter().find(|m| m.id == selected).cloned()
             };
             if let Some(m) = model {
                 session.switch_model(m);
-                println!("✓ Switched to {}", selected);
+                Ok(CommandResult::ModelChanged { model: selected })
             } else {
-                println!("Model '{}' not found", selected);
+                Ok(CommandResult::Error(format!("Model '{}' not found", selected)))
             }
         }
-        Ok(DispatchOutcome::Handled)
     }
 }
 
@@ -316,7 +356,7 @@ impl Command for ContextCommand {
         "Inject a file into the system prompt"
     }
 
-    fn execute(&self, args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
+    fn execute(&self, args: &[&str], session: &mut PromptSession) -> Result<CommandResult> {
         let path_str = if args.is_empty() {
             self.picker.text("File path:", None, Some("Path to file to inject"))?
         } else {
@@ -327,8 +367,10 @@ impl Command for ContextCommand {
         let content = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("Cannot read {}: {}", path_str, e))?;
         let size_kb = content.len() / 1024;
         session.add_context_file(path, content);
-        println!("✓ Added {} ({}KB) to system prompt", path_str, size_kb);
-        Ok(DispatchOutcome::Handled)
+        Ok(CommandResult::Message(format!(
+            "Added {} ({}KB) to system prompt",
+            path_str, size_kb
+        )))
     }
 }
 
@@ -368,7 +410,8 @@ mod ticket21_tests {
         // Provider has no models (MockProvider returns empty list)
         let result = cmd.execute(&[], &mut session);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), DispatchOutcome::Handled);
+        let r = result.unwrap();
+        assert!(matches!(r, CommandResult::Message(_)));
     }
 
     #[test]
@@ -398,7 +441,7 @@ mod ticket21_tests {
         registry.register(Box::new(ModelCommand::new(picker)));
         let mut session = mock_session();
         let outcome = registry.dispatch("/model", &mut session).unwrap();
-        assert_eq!(outcome, DispatchOutcome::Handled);
+        assert!(matches!(outcome, DispatchOutcome::Handled(_)));
     }
 }
 
@@ -420,22 +463,20 @@ impl Command for SessionCommand {
         "Show current session information"
     }
 
-    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
+    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<CommandResult> {
         let s = session.session();
         let meta = block_on(s.get_metadata());
         let (total, _user, _assistant, _tool) = block_on(s.count_messages());
         let model = block_on(s.derive_model()).unwrap_or_default();
 
+        let fmt = OutputFormatter::new();
         let info = SessionInfo {
             id: meta.id,
             model,
             msg_count: total,
             cwd: meta.cwd,
         };
-
-        let fmt = OutputFormatter::new();
-        println!("{}", fmt.session_info(&info));
-        Ok(DispatchOutcome::Handled)
+        Ok(CommandResult::Message(fmt.session_info(&info)))
     }
 }
 
@@ -451,13 +492,12 @@ impl Command for TreeCommand {
         "Show session tree structure"
     }
 
-    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
+    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<CommandResult> {
         let s = session.session();
         let entries = block_on(s.get_entries());
 
         if entries.is_empty() {
-            println!("(empty session)");
-            return Ok(DispatchOutcome::Handled);
+            return Ok(CommandResult::Message("(empty session)".into()));
         }
 
         // Build parent → children map
@@ -547,8 +587,7 @@ impl Command for TreeCommand {
             output.push_str(&format!("{}{}\n", connector, label_for_entry(root)));
             render_children(&mut output, root.id(), &children, prefix);
         }
-        print!("{}", output);
-        Ok(DispatchOutcome::Handled)
+        Ok(CommandResult::Message(output))
     }
 }
 
@@ -564,7 +603,7 @@ impl Command for ListSessionsCommand {
         "List all saved sessions"
     }
 
-    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<DispatchOutcome> {
+    fn execute(&self, _args: &[&str], session: &mut PromptSession) -> Result<CommandResult> {
         use crate::agent::session::jsonl::JsonlSessionStorage;
         use crate::agent::session::storage::SessionStorage;
         use crate::ai::types::AgentMessage;
@@ -572,17 +611,17 @@ impl Command for ListSessionsCommand {
         let sessions_dir = session.agent_dir().join("sessions");
 
         if !sessions_dir.exists() {
-            println!("No sessions directory found at: {}", sessions_dir.display());
-            return Ok(DispatchOutcome::Handled);
+            return Ok(CommandResult::Message(format!(
+                "No sessions directory found at: {}",
+                sessions_dir.display()
+            )));
         }
 
-        let mut summaries: Vec<SessionSummary> = Vec::new();
+        let mut summaries: Vec<crate::format::SessionSummary> = Vec::new();
         let dir_entries = match std::fs::read_dir(&sessions_dir) {
             Ok(d) => d,
             Err(e) => {
-                let fmt = OutputFormatter::new();
-                eprintln!("{}", fmt.error(&format!("Cannot read sessions directory: {}", e)));
-                return Ok(DispatchOutcome::Handled);
+                return Ok(CommandResult::Error(format!("Cannot read sessions directory: {}", e)));
             }
         };
 
@@ -594,7 +633,6 @@ impl Command for ListSessionsCommand {
             let path_str = path.to_string_lossy().to_string();
             if let Ok(storage) = block_on(JsonlSessionStorage::open(path_str)) {
                 let meta = block_on(storage.get_metadata());
-                // Derive model and count from session entries
                 let entries = block_on(storage.get_entries());
                 let mut msg_count = 0;
                 let mut model = String::new();
@@ -608,7 +646,7 @@ impl Command for ListSessionsCommand {
                         }
                     }
                 }
-                summaries.push(SessionSummary {
+                summaries.push(crate::format::SessionSummary {
                     id: meta.id,
                     model,
                     msg_count,
@@ -617,12 +655,10 @@ impl Command for ListSessionsCommand {
             }
         }
 
-        // Sort by created_at descending
         summaries.sort_by(|a, b| b.created.cmp(&a.created));
 
         let fmt = OutputFormatter::new();
-        println!("{}", fmt.session_list(&summaries));
-        Ok(DispatchOutcome::Handled)
+        Ok(CommandResult::Message(fmt.session_list(&summaries)))
     }
 }
 
@@ -669,7 +705,7 @@ mod ticket22_tests {
             let mut session = mock_session();
             let result = cmd.execute(&[], &mut session);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), DispatchOutcome::Handled);
+            assert!(matches!(result.unwrap(), CommandResult::Message(_)));
         });
     }
 
@@ -680,7 +716,7 @@ mod ticket22_tests {
             let mut session = mock_session();
             let result = cmd.execute(&[], &mut session);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), DispatchOutcome::Handled);
+            assert!(matches!(result.unwrap(), CommandResult::Message(_)));
         });
     }
 
@@ -691,7 +727,7 @@ mod ticket22_tests {
             let mut session = mock_session();
             let result = cmd.execute(&[], &mut session);
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), DispatchOutcome::Handled);
+            assert!(matches!(result.unwrap(), CommandResult::Message(_)));
         });
     }
 
@@ -702,7 +738,7 @@ mod ticket22_tests {
             registry.register(Box::new(SessionCommand));
             let mut session = mock_session();
             let outcome = registry.dispatch("/session", &mut session).unwrap();
-            assert_eq!(outcome, DispatchOutcome::Handled);
+            assert!(matches!(outcome, DispatchOutcome::Handled(CommandResult::Message(_))));
         });
     }
 
@@ -713,7 +749,7 @@ mod ticket22_tests {
             registry.register(Box::new(ListSessionsCommand));
             let mut session = mock_session();
             let outcome = registry.dispatch("/list-sessions", &mut session).unwrap();
-            assert_eq!(outcome, DispatchOutcome::Handled);
+            assert!(matches!(outcome, DispatchOutcome::Handled(CommandResult::Message(_))));
         });
     }
 }
@@ -807,7 +843,7 @@ mod tests {
         let registry = CommandRegistry::new();
         let mut session = mock_session();
         let outcome = registry.dispatch("/unknown", &mut session).unwrap();
-        assert_eq!(outcome, DispatchOutcome::Handled);
+        assert!(matches!(outcome, DispatchOutcome::Handled(CommandResult::Error(_))));
     }
 
     #[test]
@@ -861,7 +897,7 @@ mod tests {
         registry.register(Box::new(HelpCommand));
         let mut session = mock_session();
         let outcome = registry.dispatch("/help", &mut session).unwrap();
-        assert_eq!(outcome, DispatchOutcome::Handled);
+        assert!(matches!(outcome, DispatchOutcome::Handled(CommandResult::Help(_))));
     }
 
     #[test]
@@ -917,5 +953,100 @@ mod tests {
         let text = registry.help_text();
         assert!(text.contains("Ctrl+C"));
         assert!(text.contains("Up/down arrows"));
+    }
+
+    // ── CommandResult structure tests ─────────────────────────────────
+
+    #[test]
+    fn help_returns_structured_help_items() {
+        let mut registry = CommandRegistry::new();
+        registry.register(Box::new(HelpCommand));
+        registry.register(Box::new(ExitCommand));
+        let mut session = mock_session();
+        let outcome = registry.dispatch("/help", &mut session).unwrap();
+        match outcome {
+            DispatchOutcome::Handled(CommandResult::Help(items)) => {
+                assert!(!items.is_empty());
+                assert!(items.iter().any(|i| i.name == "exit"));
+                assert!(items.iter().any(|i| i.name == "help"));
+            }
+            other => panic!("Expected Help, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn quit_returns_dispatch_exit() {
+        let mut registry = CommandRegistry::new();
+        registry.register(Box::new(QuitCommand));
+        let mut session = mock_session();
+        let outcome = registry.dispatch("/quit", &mut session).unwrap();
+        assert_eq!(outcome, DispatchOutcome::Exit);
+    }
+
+    #[test]
+    fn unknown_command_returns_error() {
+        let registry = CommandRegistry::new();
+        let mut session = mock_session();
+        let outcome = registry.dispatch("/nonexistent", &mut session).unwrap();
+        match outcome {
+            DispatchOutcome::Handled(CommandResult::Error(msg)) => {
+                assert!(msg.contains("Unknown command"));
+                assert!(msg.contains("/nonexistent"));
+            }
+            other => panic!("Expected Error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_command_returns_not_a_command() {
+        let registry = CommandRegistry::new();
+        let mut session = mock_session();
+        let outcome = registry.dispatch("hello world", &mut session).unwrap();
+        assert_eq!(outcome, DispatchOutcome::NotACommand);
+    }
+
+    #[test]
+    fn command_result_message_equality() {
+        let a = CommandResult::Message("hello".into());
+        let b = CommandResult::Message("hello".into());
+        let c = CommandResult::Message("world".into());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn command_result_variants_are_distinct() {
+        let msg = CommandResult::Message("m".into());
+        let err = CommandResult::Error("e".into());
+        let quit = CommandResult::Quit;
+        let noop = CommandResult::Noop;
+        let model = CommandResult::ModelChanged { model: "x".into() };
+        assert_ne!(msg, err);
+        assert_ne!(msg, quit);
+        assert_ne!(msg, noop);
+        assert_ne!(msg, model);
+        assert_ne!(err, quit);
+        assert_ne!(quit, noop);
+    }
+
+    #[test]
+    fn command_result_debug_stable() {
+        let r = CommandResult::Error("test error".into());
+        let debug = format!("{:?}", r);
+        assert!(debug.contains("Error"));
+        assert!(debug.contains("test error"));
+    }
+
+    #[test]
+    fn command_help_item_equality() {
+        let a = CommandHelpItem {
+            name: "help".into(),
+            description: "Show help".into(),
+        };
+        let b = CommandHelpItem {
+            name: "help".into(),
+            description: "Show help".into(),
+        };
+        assert_eq!(a, b);
     }
 }

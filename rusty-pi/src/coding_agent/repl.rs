@@ -3,8 +3,8 @@
 use crate::agent::engine::AbortFlag;
 use crate::ai::types::{AgentMessage, StopReason};
 use crate::coding_agent::command::{
-    CommandRegistry, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader, ListSessionsCommand,
-    ModelCommand, QuitCommand, SessionCommand, TreeCommand,
+    CommandRegistry, CommandResult, ContextCommand, DispatchOutcome, ExitCommand, HelpCommand, LineReader,
+    ListSessionsCommand, ModelCommand, QuitCommand, SessionCommand, TreeCommand,
 };
 use crate::coding_agent::prompt_session::PromptSession;
 use crate::format::OutputFormatter;
@@ -69,6 +69,50 @@ pub fn default_registry() -> CommandRegistry {
 pub fn startup_banner(provider: &str, model: &str, session_id: &str) -> String {
     let fmt = OutputFormatter::new();
     fmt.banner(provider, model, session_id)
+}
+
+/// Render a CommandResult to the terminal (stdout/stderr).
+pub fn render_command_result(result: &CommandResult) {
+    match result {
+        CommandResult::Message(text) => {
+            println!("{}", text);
+        }
+        CommandResult::Error(msg) => {
+            let fmt = OutputFormatter::new();
+            eprintln!("{}", fmt.error(msg));
+        }
+        CommandResult::Help(items) => {
+            println!("\n  Commands:");
+            for item in items {
+                println!("    /{:<12} {}", item.name, item.description);
+            }
+            println!("\n  Tips:");
+            println!("    - Up/down arrows navigate command history");
+            println!("    - Ctrl+C at prompt exits");
+            println!("    - Ctrl+C during agent run aborts the current round");
+            println!("    - Type any text to chat with the agent");
+        }
+        CommandResult::ModelChanged { model } => {
+            println!("Switched to {}", model);
+        }
+        CommandResult::Sessions(sessions) => {
+            if sessions.is_empty() {
+                println!("No sessions found.");
+            } else {
+                println!("Available sessions:");
+                for s in sessions {
+                    println!(
+                        "  {} | model: {} | msgs: {} | created: {}",
+                        s.id, s.model, s.msg_count, s.created
+                    );
+                }
+            }
+        }
+        CommandResult::Quit => {
+            // Handled by the caller via DispatchOutcome::Exit
+        }
+        CommandResult::Noop => {}
+    }
 }
 
 /// Run the CLI with the given configuration.
@@ -221,7 +265,10 @@ async fn run_repl_with(
         // Try command dispatch (dispatch handles /help internally)
         match registry.dispatch(&trimmed, session)? {
             DispatchOutcome::Exit => break,
-            DispatchOutcome::Handled => continue,
+            DispatchOutcome::Handled(result) => {
+                render_command_result(&result);
+                continue;
+            }
             DispatchOutcome::NotACommand => {
                 // Treat as a prompt for the agent
             }

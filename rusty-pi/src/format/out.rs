@@ -17,6 +17,7 @@ pub struct SessionInfo {
 }
 
 /// Summary of a stored session for listing purposes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub id: String,
     pub model: String,
