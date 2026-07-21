@@ -48,6 +48,7 @@ pub enum MockStep {
 /// Thread-safe via internal mutability (`Mutex`).
 pub struct MockProvider {
     steps: Mutex<Vec<MockStep>>,
+    models: Vec<Model>,
     /// Captured messages from each `stream()` call.
     captured_requests: Arc<Mutex<Vec<Vec<AgentMessage>>>>,
 }
@@ -57,6 +58,16 @@ impl MockProvider {
     pub fn new(steps: Vec<MockStep>) -> Self {
         Self {
             steps: Mutex::new(steps),
+            models: Vec::new(),
+            captured_requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Create a deterministic provider with an explicit runtime model list.
+    pub fn with_models(steps: Vec<MockStep>, models: Vec<Model>) -> Self {
+        Self {
+            steps: Mutex::new(steps),
+            models,
             captured_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -187,6 +198,10 @@ impl ProviderApi for MultiToolCallProvider {
 
 #[async_trait]
 impl ProviderApi for MockProvider {
+    fn list_models(&self) -> Vec<&Model> {
+        self.models.iter().collect()
+    }
+
     async fn stream(
         &self,
         _model: &Model,

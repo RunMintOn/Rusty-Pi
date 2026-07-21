@@ -675,8 +675,15 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
 /// Expand a skill command (/skill:name args) to its full content.
 /// Returns the expanded text, or the original text if not a skill command.
 pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
+    try_expand_skill_command(text, skills).unwrap_or_else(|| text.to_string())
+}
+
+/// Expand a skill command and report an exact match independently of its
+/// expanded contents. This avoids treating an expansion equal to the input as
+/// an unknown command.
+pub fn try_expand_skill_command(text: &str, skills: &[Skill]) -> Option<String> {
     if !text.starts_with("/skill:") {
-        return text.to_string();
+        return None;
     }
 
     let rest = &text[7..]; // skip "/skill:"
@@ -693,7 +700,7 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
         Some(skill) => {
             let content = match fs::read_to_string(&skill.file_path) {
                 Ok(c) => c,
-                Err(_) => return text.to_string(),
+                Err(_) => return None,
             };
             let (_frontmatter, body) = parse_frontmatter(&content);
             let body = body.trim();
@@ -710,12 +717,12 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
             );
 
             if !args.is_empty() {
-                format!("{}\n\n{}", skill_block, args)
+                Some(format!("{}\n\n{}", skill_block, args))
             } else {
-                skill_block
+                Some(skill_block)
             }
         }
-        None => text.to_string(),
+        None => None,
     }
 }
 

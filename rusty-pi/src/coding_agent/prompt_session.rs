@@ -44,6 +44,13 @@ pub struct PromptSession {
     prompt_state: PromptState,
 }
 
+/// Result of exact skill/template command matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptExpansion {
+    NotMatched,
+    Expanded(String),
+}
+
 impl PromptSession {
     /// Create a new PromptSession with the given provider, model, and tools.
     ///
@@ -194,20 +201,23 @@ impl PromptSession {
         self.agent.run(&expanded).await
     }
 
+    /// Try to expand a known skill or prompt template without conflating a
+    /// successful identity expansion with an unknown command.
+    pub fn try_expand_prompt_command(&self, text: &str) -> PromptExpansion {
+        if let Some(expanded) = skills::try_expand_skill_command(text, &self.prompt_state.skills) {
+            return PromptExpansion::Expanded(expanded);
+        }
+        if let Some(expanded) = prompt_templates::try_expand_prompt_template(text, &self.templates) {
+            return PromptExpansion::Expanded(expanded);
+        }
+        PromptExpansion::NotMatched
+    }
+
     /// Expand a prompt text: skill commands and template commands.
     pub fn expand(&self, text: &str) -> String {
-        // First, try skill expansion (/skill:name)
-        let after_skills = skills::expand_skill_command(text, &self.prompt_state.skills);
-
-        // Then, try template expansion (/templateName)
-        // But only if the text wasn't changed by skill expansion (to avoid double-expansion)
-
-        if after_skills == text {
-            prompt_templates::expand_prompt_template(text, &self.templates)
-        } else {
-            // For skill commands, also expand templates in the user args part
-            // The skill block itself should not be re-expanded
-            after_skills
+        match self.try_expand_prompt_command(text) {
+            PromptExpansion::Expanded(expanded) => expanded,
+            PromptExpansion::NotMatched => text.to_string(),
         }
     }
 

@@ -417,8 +417,16 @@ pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptT
 /// Expand a prompt template if the text matches a template name.
 /// Returns the expanded content or the original text if not a template.
 pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> String {
+    try_expand_prompt_template(text, templates).unwrap_or_else(|| text.to_string())
+}
+
+/// Expand a template while retaining whether the input matched a template.
+///
+/// The `Option` is intentionally separate from the expanded string: a valid
+/// template whose body expands to the original input is still a match.
+pub fn try_expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Option<String> {
     if !text.starts_with('/') {
-        return text.to_string();
+        return None;
     }
 
     // Matches /templateName or /templateName args
@@ -436,15 +444,15 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
 
     // Check if it's a skill command (starts with /skill:) — pass through, handled by skills module
     if template_name.starts_with("skill:") {
-        return text.to_string();
+        return None;
     }
 
     if let Some(template) = templates.iter().find(|t| t.name == template_name) {
         let args = parse_command_args(args_string);
-        return substitute_args(&template.content, &args);
+        return Some(substitute_args(&template.content, &args));
     }
 
-    text.to_string()
+    None
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

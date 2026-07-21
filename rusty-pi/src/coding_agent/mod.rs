@@ -2,7 +2,6 @@
 //!
 //! Mirrors the structure of `@earendil-works/pi-coding-agent`.
 pub mod command;
-pub mod picker;
 pub mod prompt_session;
 pub mod prompt_templates;
 pub mod repl;
