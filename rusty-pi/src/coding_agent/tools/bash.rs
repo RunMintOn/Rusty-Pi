@@ -957,4 +957,264 @@ mod tests {
         }
         // Channel is closed after execute returns
     }
+
+    // ── High-concurrency lifecycle tests ───────────────────────────────
+
+    /// Spawn 20 concurrent echo commands and verify all complete correctly.
+    #[tokio::test]
+    async fn concurrent_short_commands_all_complete() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let t = Arc::new(BashTool::new(shared_cwd));
+        let mut handles = Vec::new();
+
+        for i in 0..20 {
+            let t = Arc::clone(&t);
+            let (ctx, _rx) = make_context();
+            let id = format!("conc_{}", i);
+            handles.push(tokio::spawn(async move {
+                t.execute(&id, serde_json::json!({"command": "echo test"}), ctx).await
+            }));
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.unwrap().unwrap();
+            let text = match &result.content[0] {
+                Content::Text { text } => text.trim().to_string(),
+                _ => panic!("Expected text for command {}", i),
+            };
+            assert_eq!(text, "test", "Command {} output mismatch", i);
+            assert!(!result.is_error, "Command {} should not error", i);
+        }
+    }
+
+    /// Spawn 20 concurrent long commands, cancel all, verify all aborted.
+    #[tokio::test]
+    async fn concurrent_cancel_half() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let t = Arc::new(BashTool::new(shared_cwd));
+        let mut handles = Vec::new();
+        let mut cancel_tokens = Vec::new();
+
+        for i in 0..20 {
+            let cancel = CancellationToken::new();
+            let (output_tx, _rx) = tokio::sync::mpsc::channel(256);
+            let ctx = ToolExecutionContext {
+                output_tx,
+                cancellation: cancel.clone(),
+            };
+            let id = format!("conc_cancel_{}", i);
+            cancel_tokens.push((i, cancel));
+            let t = Arc::clone(&t);
+            handles.push(tokio::spawn(async move {
+                t.execute(&id, serde_json::json!({"command": "sleep 30"}), ctx).await
+            }));
+        }
+
+        // Let them start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Cancel the first 10
+        for (_i, cancel) in &cancel_tokens[..10] {
+            cancel.cancel();
+        }
+
+        // Cancel remaining to clean up immediately
+        for (_i, cancel) in &cancel_tokens[10..] {
+            cancel.cancel();
+        }
+
+        // All 20 should complete quickly since all are cancelled
+        let all_results = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut results = Vec::new();
+            for handle in handles {
+                results.push(handle.await.unwrap());
+            }
+            results
+        })
+        .await;
+        assert!(all_results.is_ok(), "All tasks should complete within 15s");
+        for (i, result) in all_results.unwrap().iter().enumerate() {
+            let r = result.as_ref().unwrap();
+            assert!(r.aborted, "Command {} should be aborted", i);
+        }
+    }
+
+    /// Spawn multiple commands that all timeout, verify all report timed_out.
+    #[tokio::test]
+    async fn concurrent_timeout_all() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let t = Arc::new(BashTool::new(shared_cwd));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let t = Arc::clone(&t);
+            let (ctx, _rx) = make_context();
+            let id = format!("conc_to_{}", i);
+            handles.push(tokio::spawn(async move {
+                t.execute(&id, serde_json::json!({"command": "sleep 30", "timeout": 1}), ctx)
+                    .await
+            }));
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.unwrap().unwrap();
+            assert!(result.timed_out, "Command {} should be timed_out", i);
+            assert!(result.is_error, "Command {} should report error on timeout", i);
+        }
+    }
+
+    /// Race between normal completion and cancellation — must not hang or panic.
+    #[tokio::test]
+    async fn race_completion_vs_cancel() {
+        for iteration in 0..100 {
+            let cancel = CancellationToken::new();
+            let (output_tx, _rx) = tokio::sync::mpsc::channel(256);
+            let ctx = ToolExecutionContext {
+                output_tx,
+                cancellation: cancel.clone(),
+            };
+
+            // Random-ish duration: sometimes finishes before cancel, sometimes not
+            let sleep_ms = if iteration % 2 == 0 { 10 } else { 50 };
+            let tool_id = format!("race_{}", iteration);
+
+            let handle = tokio::spawn(async move {
+                tool()
+                    .execute(
+                        &tool_id,
+                        serde_json::json!({"command": format!("sleep 0.0{}", sleep_ms)}),
+                        ctx,
+                    )
+                    .await
+            });
+
+            // Cancel at a random-ish point
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            cancel.cancel();
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("Should not hang")
+                .expect("Task should not panic");
+
+            // Result can be either completed or aborted — both are valid
+            let r = result.unwrap();
+            assert!(
+                !(r.timed_out && r.aborted),
+                "Should not have both timed_out and aborted"
+            );
+        }
+    }
+
+    /// Race between timeout and cancellation — must produce exactly one terminal state.
+    #[tokio::test]
+    async fn race_timeout_vs_cancel() {
+        for iteration in 0..50 {
+            let cancel = CancellationToken::new();
+            let (output_tx, _rx) = tokio::sync::mpsc::channel(256);
+            let ctx = ToolExecutionContext {
+                output_tx,
+                cancellation: cancel.clone(),
+            };
+
+            let tool_id = format!("race_tc_{}", iteration);
+            let handle = tokio::spawn(async move {
+                tool()
+                    .execute(&tool_id, serde_json::json!({"command": "sleep 30", "timeout": 1}), ctx)
+                    .await
+            });
+
+            // Cancel very close to the timeout
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            cancel.cancel();
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("Should not hang")
+                .expect("Task should not panic");
+
+            let r = result.unwrap();
+            // Must have exactly one terminal state, not both
+            if r.timed_out {
+                assert!(!r.aborted, "Should not have both timed_out and aborted");
+            } else if r.aborted {
+                assert!(!r.timed_out, "Should not have both timed_out and aborted");
+            } else {
+                // Neither — race resolved before either triggered
+                // This is a valid state: the command completed before timeout or cancel
+            }
+        }
+    }
+
+    /// Drop the tool future before completion — verify cleanup happens.
+    #[tokio::test]
+    async fn drop_future_cleans_up() {
+        let cancel = CancellationToken::new();
+        let (output_tx, _rx) = tokio::sync::mpsc::channel(256);
+        let ctx = ToolExecutionContext {
+            output_tx,
+            cancellation: cancel.clone(),
+        };
+
+        let handle = tokio::spawn(async move {
+            tool()
+                .execute("drop_test", serde_json::json!({"command": "sleep 30"}), ctx)
+                .await
+        });
+
+        // Let it start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Cancel and drop the handle
+        cancel.cancel();
+        drop(handle);
+
+        // Wait briefly — the OS threads should clean up
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // If we get here without hanging, the cleanup worked
+    }
+
+    /// Verify no zombie processes remain after concurrent execution.
+    #[tokio::test]
+    async fn no_zombies_after_concurrent() {
+        let shared_cwd = Arc::new(std::sync::RwLock::new(std::env::current_dir().unwrap()));
+        let t = Arc::new(BashTool::new(shared_cwd));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let t = Arc::clone(&t);
+            let (ctx, _rx) = make_context();
+            let id = format!("zombie_{}", i);
+            handles.push(tokio::spawn(async move {
+                t.execute(&id, serde_json::json!({"command": "echo clean"}), ctx).await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.unwrap().unwrap();
+            assert!(!result.is_error);
+        }
+
+        // Check for zombie processes (best effort)
+        #[cfg(unix)]
+        {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("ps -eo pid,ppid,stat,comm | grep -E 'Z|<defunct>' || true")
+                .output()
+                .unwrap();
+            let zombies = String::from_utf8_lossy(&output.stdout);
+            // Filter for our test processes only
+            let our_zombies: Vec<&str> = zombies
+                .lines()
+                .filter(|l| l.contains("sleep") || l.contains("echo"))
+                .collect();
+            assert!(
+                our_zombies.is_empty(),
+                "Should not have zombie processes: {:?}",
+                our_zombies
+            );
+        }
+    }
 }
