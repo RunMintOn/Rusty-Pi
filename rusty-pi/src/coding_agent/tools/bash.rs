@@ -10,10 +10,11 @@ use crate::coding_agent::tools::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader as StdBufReader};
 use std::path::PathBuf;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::io::AsyncBufReadExt;
-use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::Duration;
 
 /// Callback for streaming bash output chunks as they arrive.
@@ -190,41 +191,59 @@ impl AgentTool for BashTool {
         // Build command with CWD detection appended
         let detect_cmd = format!("{}; echo {}:$(pwd)", bash_params.command, CWD_MARKER,);
 
-        // Build and spawn the command
+        // Build and spawn with std::process::Command (not tokio).
+        // tokio::process::Child::drop never calls waitpid, leaving zombies
+        // when the runtime is dropped. Using std::process::Command with
+        // manual waitpid in an OS thread gives us full control.
         let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
+            let mut c = StdCommand::new("cmd");
             c.arg("/C").arg(&detect_cmd);
             c
         } else {
-            let mut c = Command::new("sh");
+            let mut c = StdCommand::new("sh");
             c.arg("-c").arg(&detect_cmd);
             c
         };
 
         cmd.current_dir(&current_cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        // On Unix, create a new process group so we can kill the entire group
-        // (shell + children) when aborting or timing out.
         #[cfg(unix)]
         {
+            use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
 
         let mut child = cmd.spawn()?;
         let pid = child.id();
 
+        // Take stdout/stderr for thread-based async reading
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+
+        // Channel for streaming output chunks
+        let (output_tx, mut output_rx) = mpsc::channel::<(ToolOutputStream, String)>(256);
+        // Channel for the exit code (reap result)
+        let (reap_tx, mut reap_rx) = mpsc::channel::<Option<i32>>(1);
+
         // Take the event_tx for emitting ToolOutput events
         let event_tx = self.event_tx.lock().unwrap().take();
 
-        // Check if already aborted before taking pipes
+        // Check if already aborted before spawning reader threads
         if let Some(rx) = &signal
             && *rx.borrow()
         {
-            kill_process_group(pid);
-            // Use timeout to avoid hanging on child.wait() due to SIGCHLD races
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            kill_process_group(Some(pid));
+            // Reap in a blocking thread
+            let _ = std::thread::spawn(move || {
+                let mut status: i32 = 0;
+                #[cfg(unix)]
+                unsafe {
+                    libc::waitpid(pid as i32, &mut status, 0);
+                }
+            })
+            .join();
             return Ok(AgentToolResult {
                 content: vec![Content::Text {
                     text: "Command aborted".into(),
@@ -236,91 +255,105 @@ impl AgentTool for BashTool {
             });
         }
 
-        // Take stdout/stderr pipes for streaming reads
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
+        // ── Spawn reader threads for stdout/stderr ───────────────────────
+        // These OS threads read blocking I/O and send chunks through channels.
+        // They survive tokio runtime shutdown.
+        if let Some(stdout) = child_stdout {
+            let tx = output_tx.clone();
+            std::thread::spawn(move || {
+                let reader = StdBufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) => {
+                            let _ = tx.blocking_send((ToolOutputStream::Stdout, format!("{}\n", l)));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        if let Some(stderr) = child_stderr {
+            let tx = output_tx.clone();
+            std::thread::spawn(move || {
+                let reader = StdBufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) => {
+                            let _ = tx.blocking_send((ToolOutputStream::Stderr, format!("{}\n", l)));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        // Drop the extra sender so the channel closes when all readers finish
+        drop(output_tx);
 
-        let mut stdout_reader = tokio::io::BufReader::new(stdout);
-        let mut stderr_reader = tokio::io::BufReader::new(stderr);
+        // ── Spawn reap thread ────────────────────────────────────────────
+        // Blocking waitpid in an OS thread. This thread survives runtime
+        // shutdown and ensures the child is always reaped.
+        std::thread::spawn(move || {
+            let mut status: i32 = 0;
+            #[cfg(unix)]
+            {
+                let ret = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+                let code = if ret > 0 && libc::WIFEXITED(status) {
+                    Some(libc::WEXITSTATUS(status))
+                } else {
+                    None
+                };
+                let _ = reap_tx.blocking_send(code);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.wait();
+                let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+                let _ = reap_tx.blocking_send(code);
+            }
+        });
+
+        // ── Main read loop ────────────────────────────────────────────────
         let mut full_output = String::new();
-
-        let mut stdout_line = String::new();
-        let mut stderr_line = String::new();
-        let mut stdout_done = false;
-        let mut stderr_done = false;
         let mut timed_out = false;
         let mut aborted_early = false;
+        let mut stdout_done = false;
+        let mut stderr_done = false;
 
         let timeout_dur = bash_params.timeout.filter(|&t| t > 0).map(Duration::from_secs);
 
-        // ── Main read loop ────────────────────────────────────────────────
-        // Design: child.wait() is called EXACTLY ONCE, after this loop exits.
-        // All branches that previously called child.wait() + return now just
-        // set a flag and break. This avoids the Linux SIGCHLD race condition
-        // where multiple wait() calls on a process_group(0) child can hang.
         while !stdout_done || !stderr_done {
             // Check abort signal at top of loop
             if let Some(ref rx) = signal
                 && *rx.borrow()
             {
                 aborted_early = true;
-                kill_process_group(pid);
+                kill_process_group(Some(pid));
                 break;
             }
 
             tokio::select! {
-                result = async {
-                    if stdout_done { return Ok(0usize); }
-                    stdout_reader.read_line(&mut stdout_line).await
-                } => {
-                    let n = result?;
-                    if n == 0 {
-                        stdout_done = true;
-                    } else {
-                        // Emit ToolOutput event for stdout
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.try_send(AgentEvent::ToolOutput {
-                                id: tool_call_id.clone(),
-                                stream: ToolOutputStream::Stdout,
-                                chunk: stdout_line.clone(),
-                            });
+                msg = output_rx.recv() => {
+                    match msg {
+                        Some((stream, chunk)) => {
+                            // Emit ToolOutput event
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.try_send(AgentEvent::ToolOutput {
+                                    id: tool_call_id.clone(),
+                                    stream,
+                                    chunk: chunk.clone(),
+                                });
+                            }
+                            // Also fire legacy callback
+                            if let Some(ref mut cb) = *self.output_cb.lock().unwrap() {
+                                cb(&chunk);
+                            }
+                            full_output.push_str(&chunk);
                         }
-                        // Also fire legacy callback
-                        if let Some(ref mut cb) = *self.output_cb.lock().unwrap() {
-                            cb(&stdout_line);
+                        None => {
+                            // Channel closed — both reader threads finished
+                            stdout_done = true;
+                            stderr_done = true;
                         }
-                        full_output.push_str(&stdout_line);
-                        stdout_line.clear();
-                    }
-                }
-                result = async {
-                    if stderr_done { return Ok(0usize); }
-                    stderr_reader.read_line(&mut stderr_line).await
-                } => {
-                    let n = result?;
-                    if n == 0 {
-                        stderr_done = true;
-                    } else {
-                        // Emit ToolOutput event for stderr
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.try_send(AgentEvent::ToolOutput {
-                                id: tool_call_id.clone(),
-                                stream: ToolOutputStream::Stderr,
-                                chunk: stderr_line.clone(),
-                            });
-                        }
-                        // Also fire legacy callback
-                        if let Some(ref mut cb) = *self.output_cb.lock().unwrap() {
-                            cb(&stderr_line);
-                        }
-                        full_output.push_str(&stderr_line);
-                        stderr_line.clear();
                     }
                 }
                 _ = async {
@@ -330,9 +363,8 @@ impl AgentTool for BashTool {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    // Abort signal received during select
                     aborted_early = true;
-                    kill_process_group(pid);
+                    kill_process_group(Some(pid));
                     break;
                 }
                 _ = async {
@@ -343,20 +375,19 @@ impl AgentTool for BashTool {
                     }
                 } => {
                     timed_out = true;
-                    kill_process_group(pid);
+                    kill_process_group(Some(pid));
                     break;
                 }
             }
         }
 
-        // ── Single child.wait() call ──────────────────────────────────────
-        // After the loop exits (all pipes closed, or abort/timeout broke out),
-        // wait for the child process with a timeout. This is the ONLY place
-        // child.wait() is called in the normal execution path.
-        let exit_code = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-            Ok(Ok(status)) => status.code(),
-            _ => None, // Process may have already been reaped or timed out
-        };
+        // Kill the process group so the blocking waitpid returns quickly.
+        kill_process_group(Some(pid));
+
+        // Await the reap result from the OS thread.
+        let exit_code = tokio::time::timeout(Duration::from_secs(6), async { reap_rx.recv().await.flatten() })
+            .await
+            .unwrap_or(None);
 
         // Extract CWD marker from output and update shared CWD
         let cleaned_output = self.extract_cwd_and_clean_output(&full_output);

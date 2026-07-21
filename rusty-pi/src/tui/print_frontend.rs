@@ -65,7 +65,7 @@ impl PrintFrontend {
                 let _ = io::stdout().flush();
                 let _ = io::stderr().flush();
             }
-            AgentEvent::ToolFinished { id: _, result } => {
+            AgentEvent::ToolFinished { id: _, name: _, result } => {
                 self.print_tool_result(result);
             }
             AgentEvent::ProviderError { error } => {
@@ -194,6 +194,7 @@ mod tests {
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolFinished {
             id: "tc_1".into(),
+            name: "bash".into(),
             result: AgentToolResult {
                 content: vec![Content::Text {
                     text: "file.txt".into(),
@@ -208,6 +209,7 @@ mod tests {
         let frontend = PrintFrontend::new();
         frontend.handle_event(&AgentEvent::ToolFinished {
             id: "tc_1".into(),
+            name: "bash".into(),
             result: AgentToolResult {
                 content: vec![Content::Text {
                     text: "command not found".into(),
@@ -254,6 +256,7 @@ mod tests {
         });
         frontend.handle_event(&AgentEvent::ToolFinished {
             id: "tc_1".into(),
+            name: "bash".into(),
             result: AgentToolResult {
                 content: vec![Content::Text {
                     text: "file.txt".into(),

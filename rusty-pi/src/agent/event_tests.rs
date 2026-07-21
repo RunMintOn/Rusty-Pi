@@ -171,8 +171,9 @@ mod tests {
         let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
         assert!(tool_finished.is_some(), "Should have ToolFinished");
         match tool_finished.unwrap() {
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, name, result } => {
                 assert_eq!(id, "tc_1");
+                assert_eq!(name, "echo");
                 assert!(!result.is_error);
             }
             _ => unreachable!(),
@@ -275,8 +276,9 @@ mod tests {
         let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
         assert!(tool_finished.is_some());
         match tool_finished.unwrap() {
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, name, result } => {
                 assert_eq!(id, "tc_fail");
+                assert_eq!(name, "fail");
                 assert!(result.is_error);
             }
             _ => unreachable!(),
@@ -336,8 +338,9 @@ mod tests {
         let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
         assert!(tool_finished.is_some());
         match tool_finished.unwrap() {
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, name, result } => {
                 assert_eq!(id, "tc_timeout");
+                assert_eq!(name, "bash");
                 assert!(result.is_error);
             }
             _ => unreachable!(),
@@ -627,7 +630,8 @@ mod tests {
         // After timeout, ToolFinished should have is_error=true
         let tool_finished = events.iter().find(|e| matches!(e, AgentEvent::ToolFinished { .. }));
         assert!(tool_finished.is_some());
-        if let AgentEvent::ToolFinished { result, .. } = tool_finished.unwrap() {
+        if let AgentEvent::ToolFinished { result, name, .. } = tool_finished.unwrap() {
+            assert_eq!(name, "bash");
             assert!(result.is_error || result.timed_out, "Tool should report error/timeout");
         }
     }

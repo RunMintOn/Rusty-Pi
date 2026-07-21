@@ -8,6 +8,7 @@
 //! - Error state
 
 use crate::agent::events::AgentEvent;
+use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -15,6 +16,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use std::collections::HashMap;
 
 // ── AppState ────────────────────────────────────────────────────────────────
 
@@ -29,8 +31,8 @@ pub struct AppState {
     pub cursor: usize,
     /// Current run state.
     pub run_state: RunState,
-    /// Current tool being executed (if any).
-    pub current_tool: Option<ToolState>,
+    /// Outcome of the last completed run.
+    pub last_outcome: Option<RunOutcome>,
     /// Status message.
     pub status: String,
     /// Last error message.
@@ -41,6 +43,18 @@ pub struct AppState {
     pub quit: bool,
     /// Scroll offset for transcript.
     pub scroll_offset: u16,
+    /// Maps tool call ID to transcript index for updating tool entries.
+    tool_index: HashMap<String, usize>,
+}
+
+/// State of a tool run in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolRunState {
+    Running,
+    Succeeded,
+    Failed,
+    TimedOut,
+    Aborted,
 }
 
 /// A single entry in the transcript.
@@ -50,18 +64,40 @@ pub enum TranscriptEntry {
     User(String),
     /// An agent text response (accumulated).
     Assistant(String),
-    /// A tool call started.
-    ToolStarted { name: String, arguments: serde_json::Value },
-    /// A tool call finished.
-    ToolFinished {
+    /// A tool call with full lifecycle information.
+    Tool {
+        id: String,
         name: String,
-        is_error: bool,
-        output: String,
+        arguments: serde_json::Value,
+        stdout: String,
+        stderr: String,
+        state: ToolRunState,
+        result: Option<AgentToolResult>,
     },
     /// A provider error.
     ProviderError(String),
     /// A system message (abort, etc).
     System(String),
+}
+
+/// Current activity state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityState {
+    /// Idle, waiting for input.
+    Idle,
+    /// Running an agent turn.
+    Running,
+    /// User requested cancel, waiting for agent to stop.
+    Cancelling,
+}
+
+/// Outcome of the most recent completed run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    Completed,
+    Aborted,
+    ProviderError(String),
+    ToolError(String),
 }
 
 /// The state of an agent run.
@@ -71,15 +107,10 @@ pub enum RunState {
     Idle,
     /// Running an agent turn.
     Running,
+    /// User requested cancel.
+    Cancelling,
     /// Run was aborted.
     Aborted,
-}
-
-/// State of a currently executing tool.
-#[derive(Debug, Clone)]
-pub struct ToolState {
-    pub name: String,
-    pub arguments: serde_json::Value,
 }
 
 // ── Action ──────────────────────────────────────────────────────────────────
@@ -123,12 +154,13 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             run_state: RunState::Idle,
-            current_tool: None,
+            last_outcome: None,
             status: String::from("Ready"),
             error: None,
             terminal_size,
             quit: false,
             scroll_offset: 0,
+            tool_index: HashMap::new(),
         }
     }
 
@@ -288,7 +320,8 @@ impl AppState {
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::RunStarted => {
-                // State already set to Running
+                // State already set to Running; clear old tool_index
+                self.tool_index.clear();
             }
             AgentEvent::TextDelta { text } => {
                 // Find or create the last assistant entry
@@ -305,41 +338,97 @@ impl AppState {
                 // Show thinking in status
                 self.status = format!("Thinking: {}", text.chars().take(50).collect::<String>());
             }
-            AgentEvent::ToolStarted { name, arguments, .. } => {
-                self.current_tool = Some(ToolState {
+            AgentEvent::ToolStarted { id, name, arguments } => {
+                let idx = self.transcript.len();
+                self.tool_index.insert(id.clone(), idx);
+                self.transcript.push(TranscriptEntry::Tool {
+                    id,
                     name: name.clone(),
-                    arguments: arguments.clone(),
-                });
-                self.transcript.push(TranscriptEntry::ToolStarted {
-                    name: name.clone(),
-                    arguments: serde_json::json!({}),
+                    arguments,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    state: ToolRunState::Running,
+                    result: None,
                 });
                 self.status = format!("Running {}...", name);
             }
-            AgentEvent::ToolFinished { result, .. } => {
-                let tool_name = self
-                    .current_tool
-                    .as_ref()
-                    .map(|t| t.name.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                self.current_tool = None;
+            AgentEvent::ToolOutput { id, stream, chunk } => {
+                if let Some(&idx) = self.tool_index.get(&id) {
+                    if let Some(TranscriptEntry::Tool { stdout, stderr, .. }) = self.transcript.get_mut(idx) {
+                        match stream {
+                            crate::agent::events::ToolOutputStream::Stdout => {
+                                stdout.push_str(&chunk);
+                            }
+                            crate::agent::events::ToolOutputStream::Stderr => {
+                                stderr.push_str(&chunk);
+                            }
+                        }
+                    }
+                } else {
+                    // Unknown tool ID — create orphan entry so we don't lose output
+                    let idx = self.transcript.len();
+                    self.tool_index.insert(id.clone(), idx);
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+                    match stream {
+                        crate::agent::events::ToolOutputStream::Stdout => {
+                            stdout.push_str(&chunk);
+                        }
+                        crate::agent::events::ToolOutputStream::Stderr => {
+                            stderr.push_str(&chunk);
+                        }
+                    }
+                    self.transcript.push(TranscriptEntry::Tool {
+                        id,
+                        name: "unknown".into(),
+                        arguments: serde_json::Value::Null,
+                        stdout,
+                        stderr,
+                        state: ToolRunState::Running,
+                        result: None,
+                    });
+                }
+            }
+            AgentEvent::ToolFinished { id, name, result } => {
+                let tool_state = if result.timed_out {
+                    ToolRunState::TimedOut
+                } else if result.aborted {
+                    ToolRunState::Aborted
+                } else if result.is_error {
+                    ToolRunState::Failed
+                } else {
+                    ToolRunState::Succeeded
+                };
 
-                let output = result
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        crate::ai::types::Content::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-
-                self.transcript.push(TranscriptEntry::ToolFinished {
-                    name: tool_name,
-                    is_error: result.is_error,
-                    output,
-                });
+                if let Some(&idx) = self.tool_index.get(&id) {
+                    if let Some(TranscriptEntry::Tool {
+                        name: entry_name,
+                        state: entry_state,
+                        result: entry_result,
+                        ..
+                    }) = self.transcript.get_mut(idx)
+                    {
+                        // Update name if it was unknown (orphan from ToolOutput)
+                        if entry_name == "unknown" {
+                            *entry_name = name;
+                        }
+                        *entry_state = tool_state;
+                        *entry_result = Some(result);
+                    }
+                } else {
+                    // ToolFinished for unknown ID — create entry
+                    let idx = self.transcript.len();
+                    self.tool_index.insert(id.clone(), idx);
+                    self.transcript.push(TranscriptEntry::Tool {
+                        id,
+                        name,
+                        arguments: serde_json::Value::Null,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        state: tool_state,
+                        result: Some(result),
+                    });
+                }
                 self.status = "Running...".into();
             }
             AgentEvent::ProviderError { error } => {
@@ -348,42 +437,32 @@ impl AppState {
                 self.error = Some(error.message);
             }
             AgentEvent::RunAborted => {
-                self.run_state = RunState::Aborted;
-                self.current_tool = None;
+                self.run_state = RunState::Idle;
+                self.last_outcome = Some(RunOutcome::Aborted);
                 self.transcript.push(TranscriptEntry::System("Run aborted".into()));
                 self.status = "Aborted".into();
-                // Reset to idle after a brief moment
-                self.run_state = RunState::Idle;
             }
             AgentEvent::RunFinished { stop_reason } => {
                 self.run_state = RunState::Idle;
-                self.current_tool = None;
                 match stop_reason {
                     StopReason::Stop => {
+                        self.last_outcome = Some(RunOutcome::Completed);
                         self.status = "Ready".into();
                     }
                     StopReason::Error => {
+                        self.last_outcome = Some(RunOutcome::ProviderError("Provider error".into()));
                         self.status = "Error".into();
                     }
                     StopReason::Length => {
+                        self.last_outcome = Some(RunOutcome::Completed);
                         self.status = "Truncated".into();
                     }
                     StopReason::Aborted => {
+                        self.last_outcome = Some(RunOutcome::Aborted);
                         self.status = "Aborted".into();
                     }
                     StopReason::ToolUse => {
                         self.status = "Running...".into();
-                    }
-                }
-            }
-            AgentEvent::ToolOutput { chunk, .. } => {
-                // Append to the last assistant entry or create one
-                match self.transcript.last_mut() {
-                    Some(TranscriptEntry::Assistant(s)) => {
-                        s.push_str(&chunk);
-                    }
-                    _ => {
-                        self.transcript.push(TranscriptEntry::Assistant(chunk));
                     }
                 }
             }
@@ -433,32 +512,56 @@ fn render_transcript(frame: &mut Frame, state: &AppState, area: Rect) {
                 }
                 lines.push(Line::from(""));
             }
-            TranscriptEntry::ToolStarted { name, .. } => {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("⚙ {} ", name), Style::default().fg(Color::Yellow)),
-                    Span::styled("running...", Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            TranscriptEntry::ToolFinished { name, is_error, output } => {
-                let style = if *is_error {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::Green)
+            TranscriptEntry::Tool {
+                name,
+                stdout,
+                stderr,
+                state: tool_state,
+                ..
+            } => {
+                let (icon, style) = match tool_state {
+                    ToolRunState::Running => ("⚙", Style::default().fg(Color::Yellow)),
+                    ToolRunState::Succeeded => ("✅", Style::default().fg(Color::Green)),
+                    ToolRunState::Failed => ("❌", Style::default().fg(Color::Red)),
+                    ToolRunState::TimedOut => ("⏰", Style::default().fg(Color::Red)),
+                    ToolRunState::Aborted => ("⏹", Style::default().fg(Color::Yellow)),
                 };
-                let icon = if *is_error { "❌" } else { "✅" };
-                lines.push(Line::from(vec![Span::styled(format!("{} {} ", icon, name), style)]));
-                // Show first few lines of output
-                for line in output.lines().take(3) {
+                let status_label = match tool_state {
+                    ToolRunState::Running => " running...".to_string(),
+                    ToolRunState::Succeeded => String::new(),
+                    ToolRunState::Failed => " [failed]".to_string(),
+                    ToolRunState::TimedOut => " [timed out]".to_string(),
+                    ToolRunState::Aborted => " [aborted]".to_string(),
+                };
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{} {}{}", icon, name, status_label),
+                    style,
+                )]));
+                // Show stdout
+                for line in stdout.lines().take(3) {
                     lines.push(Line::from(vec![Span::styled(
                         format!("  {}", line),
                         Style::default().fg(Color::DarkGray),
                     )]));
                 }
-                if output.lines().count() > 3 {
+                if stdout.lines().count() > 3 {
                     lines.push(Line::from(vec![Span::styled(
                         "  ...",
                         Style::default().fg(Color::DarkGray),
                     )]));
+                }
+                // Show stderr if non-empty
+                if !stderr.trim().is_empty() {
+                    lines.push(Line::from(vec![Span::styled(
+                        "  [stderr]",
+                        Style::default().fg(Color::Red),
+                    )]));
+                    for line in stderr.lines().take(2) {
+                        lines.push(Line::from(vec![Span::styled(
+                            format!("    {}", line),
+                            Style::default().fg(Color::Red),
+                        )]));
+                    }
                 }
                 lines.push(Line::from(""));
             }
@@ -494,7 +597,8 @@ fn render_transcript(frame: &mut Frame, state: &AppState, area: Rect) {
 /// Render the input area.
 fn render_input(frame: &mut Frame, state: &AppState, area: Rect) {
     // Create display text with cursor indicator
-    let display_text = if state.run_state == RunState::Running {
+    let is_active = matches!(state.run_state, RunState::Running | RunState::Cancelling);
+    let display_text = if is_active {
         format!("{} ⏳", state.input)
     } else {
         state.input.clone()
@@ -505,11 +609,7 @@ fn render_input(frame: &mut Frame, state: &AppState, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .title("Input")
-                .border_style(Style::default().fg(if state.run_state == RunState::Running {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                })),
+                .border_style(Style::default().fg(if is_active { Color::Yellow } else { Color::Cyan })),
         )
         .scroll((0, 0));
 
@@ -525,8 +625,10 @@ fn render_input(frame: &mut Frame, state: &AppState, area: Rect) {
 fn render_status(frame: &mut Frame, state: &AppState, area: Rect) {
     let status_style = if state.error.is_some() {
         Style::default().fg(Color::Red)
-    } else if state.run_state == RunState::Running {
+    } else if matches!(state.run_state, RunState::Running | RunState::Cancelling) {
         Style::default().fg(Color::Yellow)
+    } else if state.run_state == RunState::Aborted {
+        Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::Green)
     };
@@ -644,6 +746,17 @@ mod tests {
     }
 
     #[test]
+    fn app_state_cancel_sets_cancelling() {
+        let mut state = AppState::new((80, 24));
+        state.run_state = RunState::Running;
+        let _effects = state.update(Action::Cancel);
+        // Cancel effect is produced; run_state changes on RunAborted event
+        state.handle_agent_event(AgentEvent::RunAborted);
+        assert_eq!(state.run_state, RunState::Idle);
+        assert_eq!(state.last_outcome, Some(RunOutcome::Aborted));
+    }
+
+    #[test]
     fn app_state_resize() {
         let mut state = AppState::new((80, 24));
         state.update(Action::Resize(120, 40));
@@ -663,32 +776,59 @@ mod tests {
     }
 
     #[test]
-    fn app_state_tool_started_updates_status() {
+    fn app_state_tool_started_creates_entry() {
         let mut state = AppState::new((80, 24));
         state.handle_agent_event(AgentEvent::ToolStarted {
             id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
         });
-        assert!(state.current_tool.is_some());
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptEntry::Tool {
+                id,
+                name,
+                state: tool_state,
+                ..
+            } => {
+                assert_eq!(id, "tc_1");
+                assert_eq!(name, "bash");
+                assert_eq!(*tool_state, ToolRunState::Running);
+            }
+            other => panic!("Expected Tool entry, got: {:?}", other),
+        }
         assert!(state.status.contains("bash"));
     }
 
     #[test]
-    fn app_state_tool_finished_clears_tool_state() {
+    fn app_state_tool_finished_updates_entry() {
         let mut state = AppState::new((80, 24));
-        state.current_tool = Some(ToolState {
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({}),
         });
         state.handle_agent_event(AgentEvent::ToolFinished {
             id: "tc_1".into(),
+            name: "bash".into(),
             result: crate::agent::types::AgentToolResult {
                 content: vec![crate::ai::types::Content::Text { text: "output".into() }],
                 ..Default::default()
             },
         });
-        assert!(state.current_tool.is_none());
+        // Should still be exactly 1 entry (no duplicate)
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptEntry::Tool {
+                state: tool_state,
+                result,
+                ..
+            } => {
+                assert_eq!(*tool_state, ToolRunState::Succeeded);
+                assert!(result.is_some());
+            }
+            other => panic!("Expected Tool entry, got: {:?}", other),
+        }
     }
 
     #[test]
@@ -791,46 +931,66 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_started() {
+    fn render_tool_running_entry() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::ToolStarted {
+        state.transcript.push(TranscriptEntry::Tool {
+            id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
+            stdout: String::new(),
+            stderr: String::new(),
+            state: ToolRunState::Running,
+            result: None,
         });
         let output = render_state(&state);
         assert!(output.contains("bash"));
     }
 
     #[test]
-    fn render_tool_output_stdout_stderr() {
+    fn render_tool_stdout_stderr_in_transcript() {
         let mut state = AppState::new((80, 24));
-        state
-            .transcript
-            .push(TranscriptEntry::Assistant("file1.txt\nfile2.txt".into()));
+        state.transcript.push(TranscriptEntry::Tool {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+            stdout: "file1.txt\nfile2.txt".into(),
+            stderr: String::new(),
+            state: ToolRunState::Succeeded,
+            result: None,
+        });
         let output = render_state(&state);
         assert!(output.contains("file1.txt"));
         assert!(output.contains("file2.txt"));
     }
 
     #[test]
-    fn render_tool_finished_success() {
+    fn render_tool_success_entry() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::ToolFinished {
+        state.transcript.push(TranscriptEntry::Tool {
+            id: "tc_1".into(),
             name: "bash".into(),
-            is_error: false,
-            output: "success".into(),
+            arguments: serde_json::json!({}),
+            stdout: "success".into(),
+            stderr: String::new(),
+            state: ToolRunState::Succeeded,
+            result: None,
         });
         let output = render_state(&state);
         assert!(output.contains("bash"));
+        assert!(output.contains("success"));
     }
 
     #[test]
-    fn render_tool_finished_error() {
+    fn render_tool_error_entry() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::ToolFinished {
+        state.transcript.push(TranscriptEntry::Tool {
+            id: "tc_1".into(),
             name: "bash".into(),
-            is_error: true,
-            output: "command failed".into(),
+            arguments: serde_json::json!({}),
+            stdout: String::new(),
+            stderr: "command failed".into(),
+            state: ToolRunState::Failed,
+            result: None,
         });
         let output = render_state(&state);
         assert!(output.contains("bash"));
@@ -912,6 +1072,351 @@ mod tests {
         assert!(!output.is_empty());
     }
 
+    // ── Transcript tool entry tests ──────────────────────────────────────
+
+    #[test]
+    fn transcript_tool_started_creates_tool_entry() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_a".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        });
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptEntry::Tool {
+                id,
+                name,
+                arguments,
+                state: ts,
+                ..
+            } => {
+                assert_eq!(id, "tc_a");
+                assert_eq!(name, "bash");
+                assert_eq!(arguments["command"], "ls");
+                assert_eq!(*ts, ToolRunState::Running);
+            }
+            other => panic!("Expected Tool entry, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_stdout_only_goes_to_stdout() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            id: "tc_1".into(),
+            stream: crate::agent::events::ToolOutputStream::Stdout,
+            chunk: "hello\n".into(),
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { stdout, stderr, .. } => {
+                assert_eq!(stdout, "hello\n");
+                assert!(stderr.is_empty());
+            }
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_stderr_only_goes_to_stderr() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            id: "tc_1".into(),
+            stream: crate::agent::events::ToolOutputStream::Stderr,
+            chunk: "err msg\n".into(),
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { stdout, stderr, .. } => {
+                assert!(stdout.is_empty());
+                assert_eq!(stderr, "err msg\n");
+            }
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_assistant_text_does_not_mix_with_tool() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::TextDelta {
+            text: "some text".into(),
+        });
+        assert_eq!(state.transcript.len(), 2);
+        // Tool entry should not have assistant text
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { stdout, .. } => assert!(stdout.is_empty()),
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+        // Assistant entry should have the text
+        match &state.transcript[1] {
+            TranscriptEntry::Assistant(text) => assert_eq!(text, "some text"),
+            other => panic!("Expected Assistant, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_tool_output_does_not_create_assistant_entry() {
+        let mut state = AppState::new((80, 24));
+        // ToolOutput for an unknown ID should create a Tool entry, not Assistant
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            id: "orphan".into(),
+            stream: crate::agent::events::ToolOutputStream::Stdout,
+            chunk: "data".into(),
+        });
+        assert_eq!(state.transcript.len(), 1);
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { .. } => (),
+            other => panic!("Expected Tool (orphan), got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_tool_finished_updates_original_no_duplicate() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            id: "tc_1".into(),
+            result: crate::agent::types::AgentToolResult {
+                content: vec![],
+                ..Default::default()
+            },
+        });
+        assert_eq!(state.transcript.len(), 1, "Should not create duplicate entry");
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { state: ts, .. } => {
+                assert_eq!(*ts, ToolRunState::Succeeded);
+            }
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_two_tools_outputs_do_not_cross() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_a".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_b".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            id: "tc_a".into(),
+            stream: crate::agent::events::ToolOutputStream::Stdout,
+            chunk: "alpha".into(),
+        });
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            id: "tc_b".into(),
+            stream: crate::agent::events::ToolOutputStream::Stdout,
+            chunk: "beta".into(),
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { stdout, .. } => assert_eq!(stdout, "alpha"),
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+        match &state.transcript[1] {
+            TranscriptEntry::Tool { stdout, .. } => assert_eq!(stdout, "beta"),
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_unknown_tool_id_does_not_panic() {
+        let mut state = AppState::new((80, 24));
+        // Output for an ID that was never started
+        state.handle_agent_event(AgentEvent::ToolOutput {
+            id: "ghost".into(),
+            stream: crate::agent::events::ToolOutputStream::Stdout,
+            chunk: "data".into(),
+        });
+        // Finish for an ID that was never started
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            id: "ghost2".into(),
+            result: crate::agent::types::AgentToolResult::default(),
+        });
+        assert_eq!(state.transcript.len(), 2);
+    }
+
+    #[test]
+    fn transcript_timeout_maps_to_timed_out() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_to".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            id: "tc_to".into(),
+            result: crate::agent::types::AgentToolResult {
+                timed_out: true,
+                is_error: true,
+                ..Default::default()
+            },
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::TimedOut),
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_abort_maps_to_aborted() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_ab".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            id: "tc_ab".into(),
+            result: crate::agent::types::AgentToolResult {
+                aborted: true,
+                is_error: true,
+                ..Default::default()
+            },
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Aborted),
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_nonzero_exit_maps_to_failed() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_err".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            id: "tc_err".into(),
+            result: crate::agent::types::AgentToolResult {
+                is_error: true,
+                exit_code: Some(1),
+                ..Default::default()
+            },
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Failed),
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transcript_success_maps_to_succeeded() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "tc_ok".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        state.handle_agent_event(AgentEvent::ToolFinished {
+            name: "bash".into(),
+            id: "tc_ok".into(),
+            result: crate::agent::types::AgentToolResult {
+                is_error: false,
+                ..Default::default()
+            },
+        });
+        match &state.transcript[0] {
+            TranscriptEntry::Tool { state: ts, .. } => assert_eq!(*ts, ToolRunState::Succeeded),
+            other => panic!("Expected Tool, got: {:?}", other),
+        }
+    }
+
+    // ── Run state model tests ──────────────────────────────────────────────
+
+    #[test]
+    fn run_started_sets_running() {
+        let mut state = AppState::new((80, 24));
+        state.run_state = RunState::Idle;
+        state.handle_agent_event(AgentEvent::RunStarted);
+        // RunStarted doesn't change run_state (it's set by the Enter key handler)
+        // but it clears the tool index
+        assert!(state.tool_index.is_empty());
+    }
+
+    #[test]
+    fn run_aborted_preserves_outcome() {
+        let mut state = AppState::new((80, 24));
+        state.run_state = RunState::Running;
+        state.handle_agent_event(AgentEvent::RunAborted);
+        assert_eq!(state.run_state, RunState::Idle);
+        assert_eq!(state.last_outcome, Some(RunOutcome::Aborted));
+        assert_eq!(state.status, "Aborted");
+    }
+
+    #[test]
+    fn run_finished_stop_sets_completed() {
+        let mut state = AppState::new((80, 24));
+        state.run_state = RunState::Running;
+        state.handle_agent_event(AgentEvent::RunFinished {
+            stop_reason: StopReason::Stop,
+        });
+        assert_eq!(state.run_state, RunState::Idle);
+        assert_eq!(state.last_outcome, Some(RunOutcome::Completed));
+        assert_eq!(state.status, "Ready");
+    }
+
+    #[test]
+    fn provider_error_not_overwritten_by_stop() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ProviderError {
+            error: crate::agent::events::ProviderError {
+                reason: StopReason::Error,
+                message: "limit exceeded".into(),
+            },
+        });
+        assert_eq!(state.last_outcome, None); // ProviderError doesn't set last_outcome
+        state.handle_agent_event(AgentEvent::RunFinished {
+            stop_reason: StopReason::Error,
+        });
+        assert_eq!(
+            state.last_outcome,
+            Some(RunOutcome::ProviderError("Provider error".into()))
+        );
+    }
+
+    #[test]
+    fn new_run_clears_tool_index() {
+        let mut state = AppState::new((80, 24));
+        state.handle_agent_event(AgentEvent::ToolStarted {
+            id: "old_tc".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(!state.tool_index.is_empty());
+        state.handle_agent_event(AgentEvent::RunStarted);
+        assert!(state.tool_index.is_empty());
+    }
+
     // ── Snapshot tests ────────────────────────────────────────────────────
 
     #[test]
@@ -937,13 +1442,14 @@ mod tests {
     fn snapshot_tool_running() {
         let mut state = AppState::new((80, 24));
         state.run_state = RunState::Running;
-        state.current_tool = Some(super::ToolState {
+        state.transcript.push(TranscriptEntry::Tool {
+            id: "tc_1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls"}),
-        });
-        state.transcript.push(TranscriptEntry::ToolStarted {
-            name: "bash".into(),
-            arguments: serde_json::json!({}),
+            stdout: String::new(),
+            stderr: String::new(),
+            state: ToolRunState::Running,
+            result: None,
         });
         let output = render_state(&state);
         insta::assert_snapshot!(output);
@@ -952,10 +1458,14 @@ mod tests {
     #[test]
     fn snapshot_tool_success() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::ToolFinished {
+        state.transcript.push(TranscriptEntry::Tool {
+            id: "tc_1".into(),
             name: "bash".into(),
-            is_error: false,
-            output: "file1.txt\nfile2.txt".into(),
+            arguments: serde_json::json!({}),
+            stdout: "file1.txt\nfile2.txt".into(),
+            stderr: String::new(),
+            state: ToolRunState::Succeeded,
+            result: None,
         });
         let output = render_state(&state);
         insta::assert_snapshot!(output);
@@ -964,10 +1474,14 @@ mod tests {
     #[test]
     fn snapshot_tool_error() {
         let mut state = AppState::new((80, 24));
-        state.transcript.push(TranscriptEntry::ToolFinished {
+        state.transcript.push(TranscriptEntry::Tool {
+            id: "tc_1".into(),
             name: "bash".into(),
-            is_error: true,
-            output: "command not found".into(),
+            arguments: serde_json::json!({}),
+            stdout: String::new(),
+            stderr: "command not found".into(),
+            state: ToolRunState::Failed,
+            result: None,
         });
         let output = render_state(&state);
         insta::assert_snapshot!(output);
@@ -986,6 +1500,7 @@ mod tests {
     #[test]
     fn snapshot_aborted() {
         let mut state = AppState::new((80, 24));
+        state.run_state = RunState::Idle;
         state.handle_agent_event(AgentEvent::RunAborted);
         let output = render_state(&state);
         insta::assert_snapshot!(output);

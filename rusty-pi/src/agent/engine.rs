@@ -406,6 +406,7 @@ impl Agent {
                         };
                         self.emit(AgentEvent::ToolFinished {
                             id: call.id.clone(),
+                            name: call.name.clone(),
                             result: result_for_event,
                         })
                         .await;

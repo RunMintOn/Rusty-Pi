@@ -39,7 +39,11 @@ pub enum AgentEvent {
     },
 
     /// A tool call has finished.
-    ToolFinished { id: String, result: AgentToolResult },
+    ToolFinished {
+        id: String,
+        name: String,
+        result: AgentToolResult,
+    },
 
     /// An error from the LLM provider.
     ProviderError { error: ProviderError },
