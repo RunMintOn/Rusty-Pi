@@ -18,7 +18,7 @@
 //! * All fields (`api`, `provider`, `model`) in the emitted `Done` message
 //!   are set to `"mock"`.
 
-use crate::ai::providers::{Model, ProviderApi, StreamReceiver};
+use crate::ai::providers::{Model, ProviderApi, ProviderRequestContext, ProviderStream};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{AgentMessage, AssistantMessage, StopReason, Tool};
 use async_trait::async_trait;
@@ -127,30 +127,34 @@ impl ProviderApi for MultiToolCallProvider {
         messages: &[AgentMessage],
         _tools: &[&dyn Tool],
         _system_prompt: Option<&str>,
-    ) -> anyhow::Result<StreamReceiver> {
+        context: ProviderRequestContext,
+    ) -> anyhow::Result<ProviderStream> {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         self.captured_requests.lock().unwrap().push(messages.to_vec());
+        let cancellation = context.cancellation.child_token();
+        let producer_cancellation = cancellation.clone();
 
         let already_emitted = *self.emitted.lock().unwrap();
         if already_emitted {
             // Second call: return final text
             let final_text = self.final_text.clone();
-            tokio::spawn(async move {
+            let producer_handle = tokio::spawn(async move {
                 for word in final_text.split(' ') {
                     let chunk = format!("{} ", word);
-                    if tx.send(StreamEvent::TextDelta { delta: chunk }).await.is_err() {
+                    if !send_event(&tx, StreamEvent::TextDelta { delta: chunk }, &producer_cancellation).await {
                         return;
                     }
                 }
                 let acc = MessageAccumulator::new("mock", "mock", "mock");
                 let msg = acc.build();
-                let _ = tx.send(StreamEvent::Done { message: msg }).await;
+                let _ = send_event(&tx, StreamEvent::Done { message: msg }, &producer_cancellation).await;
             });
+            return Ok(ProviderStream::new(rx, producer_handle, cancellation));
         } else {
             // First call: emit tool calls
             *self.emitted.lock().unwrap() = true;
             let calls = self.calls.clone();
-            tokio::spawn(async move {
+            let producer_handle = tokio::spawn(async move {
                 for step in &calls {
                     if let MockStep::ToolCall {
                         id,
@@ -158,23 +162,26 @@ impl ProviderApi for MultiToolCallProvider {
                         arguments,
                         stop_reason: _,
                     } = step
-                    {
-                        let _ = tx
-                            .send(StreamEvent::ToolCall {
+                        && !send_event(
+                            &tx,
+                            StreamEvent::ToolCall {
                                 id: id.clone(),
                                 name: name.clone(),
                                 arguments: arguments.clone(),
-                            })
-                            .await;
+                            },
+                            &producer_cancellation,
+                        )
+                        .await
+                    {
+                        return;
                     }
                 }
                 let acc = MessageAccumulator::new("mock", "mock", "mock");
                 let msg = acc.build();
-                let _ = tx.send(StreamEvent::Done { message: msg }).await;
+                let _ = send_event(&tx, StreamEvent::Done { message: msg }, &producer_cancellation).await;
             });
+            return Ok(ProviderStream::new(rx, producer_handle, cancellation));
         }
-
-        Ok(rx)
     }
 }
 
@@ -186,7 +193,8 @@ impl ProviderApi for MockProvider {
         messages: &[AgentMessage],
         _tools: &[&dyn Tool],
         _system_prompt: Option<&str>,
-    ) -> anyhow::Result<StreamReceiver> {
+        context: ProviderRequestContext,
+    ) -> anyhow::Result<ProviderStream> {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         // Capture messages for test assertions
         self.captured_requests.lock().unwrap().push(messages.to_vec());
@@ -196,19 +204,21 @@ impl ProviderApi for MockProvider {
             steps.remove(0);
         }
         let step = step.unwrap_or(MockStep::Text("(done)".into()));
+        let cancellation = context.cancellation.child_token();
+        let producer_cancellation = cancellation.clone();
 
-        tokio::spawn(async move {
+        let producer_handle = tokio::spawn(async move {
             match step {
                 MockStep::Text(text) => {
                     for word in text.split(' ') {
                         let chunk = format!("{} ", word);
-                        if tx.send(StreamEvent::TextDelta { delta: chunk }).await.is_err() {
+                        if !send_event(&tx, StreamEvent::TextDelta { delta: chunk }, &producer_cancellation).await {
                             return;
                         }
                     }
                     let acc = MessageAccumulator::new("mock", "mock", "mock");
                     let msg = acc.build();
-                    let _ = tx.send(StreamEvent::Done { message: msg }).await;
+                    let _ = send_event(&tx, StreamEvent::Done { message: msg }, &producer_cancellation).await;
                 }
                 MockStep::ToolCall {
                     id,
@@ -216,13 +226,19 @@ impl ProviderApi for MockProvider {
                     arguments,
                     stop_reason,
                 } => {
-                    let _ = tx
-                        .send(StreamEvent::ToolCall {
+                    if !send_event(
+                        &tx,
+                        StreamEvent::ToolCall {
                             id,
                             name: name.clone(),
                             arguments: arguments.clone(),
-                        })
-                        .await;
+                        },
+                        &producer_cancellation,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     let mut acc = MessageAccumulator::new("mock", "mock", "mock");
                     if let Some(reason) = stop_reason {
                         use crate::ai::stream::StreamEvent;
@@ -243,19 +259,37 @@ impl ProviderApi for MockProvider {
                         });
                     }
                     let msg = acc.build();
-                    let _ = tx.send(StreamEvent::Done { message: msg }).await;
+                    let _ = send_event(&tx, StreamEvent::Done { message: msg }, &producer_cancellation).await;
                 }
                 MockStep::Error(msg) => {
-                    let _ = tx
-                        .send(StreamEvent::Error {
+                    let _ = send_event(
+                        &tx,
+                        StreamEvent::Error {
                             reason: StopReason::Error,
                             message: msg,
-                        })
-                        .await;
+                        },
+                        &producer_cancellation,
+                    )
+                    .await;
                 }
             }
         });
 
-        Ok(rx)
+        Ok(ProviderStream::new(rx, producer_handle, cancellation))
+    }
+}
+
+async fn send_event(
+    tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    event: StreamEvent,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => false,
+        result = tx.send(event) => result.is_ok(),
     }
 }

@@ -25,11 +25,12 @@
 //! input array.
 
 use crate::ai::auth::openai_codex::{CodexCredential, resolve_codex_token};
-use crate::ai::providers::{Model, ProviderApi, StreamReceiver};
+use crate::ai::providers::{Model, ProviderApi, ProviderRequestContext, ProviderStream};
 use crate::ai::stream::StreamEvent;
 use crate::ai::types::{AgentMessage, AssistantContent, AssistantMessage, StopReason, Tool};
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const CODEX_TOKEN_ENV: &str = "OPENAI_CODEX_TOKEN";
@@ -72,6 +73,7 @@ pub const OPENAI_CODEX_MODELS: &[Model] = &[
 /// 3. Interactive device-code OAuth login
 pub struct OpenAICodexProvider {
     token: std::sync::Mutex<String>,
+    base_url: String,
 }
 
 impl OpenAICodexProvider {
@@ -90,6 +92,7 @@ impl OpenAICodexProvider {
         {
             return Some(Self {
                 token: std::sync::Mutex::new(token),
+                base_url: CODEX_BASE_URL.to_string(),
             });
         }
         // 2. Stored credentials
@@ -98,6 +101,7 @@ impl OpenAICodexProvider {
         {
             return Some(Self {
                 token: std::sync::Mutex::new(cred.access),
+                base_url: CODEX_BASE_URL.to_string(),
             });
         }
         None
@@ -109,6 +113,7 @@ impl OpenAICodexProvider {
         let token = resolve_codex_token(None).await?;
         Ok(Self {
             token: std::sync::Mutex::new(token),
+            base_url: CODEX_BASE_URL.to_string(),
         })
     }
 
@@ -116,7 +121,14 @@ impl OpenAICodexProvider {
     pub fn new(token: String) -> Self {
         Self {
             token: std::sync::Mutex::new(token),
+            base_url: CODEX_BASE_URL.to_string(),
         }
+    }
+
+    /// Override the base URL for local transport tests or a proxy.
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
     }
 
     fn build_input(messages: &[AgentMessage]) -> Vec<serde_json::Value> {
@@ -221,7 +233,8 @@ impl ProviderApi for OpenAICodexProvider {
         messages: &[AgentMessage],
         tools: &[&dyn Tool],
         system_prompt: Option<&str>,
-    ) -> anyhow::Result<StreamReceiver> {
+        context: ProviderRequestContext,
+    ) -> anyhow::Result<ProviderStream> {
         // Refresh token if expired
         let token = if let Ok(Some(cred)) = CodexCredential::load() {
             if cred.is_expired() {
@@ -249,22 +262,33 @@ impl ProviderApi for OpenAICodexProvider {
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(256);
-        let url = format!("{}/responses", CODEX_BASE_URL);
+        let url = format!("{}/responses", self.base_url);
         let input = Self::build_input(messages);
         let api_tools = Self::build_tools(tools);
         let model_id = model.id.to_string();
         let instructions = system_prompt.map(|s| s.to_string());
+        let cancellation = context.cancellation.child_token();
+        let producer_cancellation = cancellation.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) =
-                do_codex_stream(&url, &token, &model_id, &input, &api_tools, instructions.as_deref(), tx).await
+        let producer_handle = tokio::spawn(async move {
+            if let Err(e) = do_codex_stream(
+                &url,
+                &token,
+                &model_id,
+                &input,
+                &api_tools,
+                instructions.as_deref(),
+                tx,
+                producer_cancellation,
+            )
+            .await
             {
                 // Error already sent through the channel by do_codex_stream.
                 let _ = e;
             }
         });
 
-        Ok(rx)
+        Ok(ProviderStream::new(rx, producer_handle, cancellation))
     }
 
     fn list_models(&self) -> Vec<&Model> {
@@ -273,6 +297,7 @@ impl ProviderApi for OpenAICodexProvider {
 }
 
 /// Manually parse SSE events from an HTTP byte stream and dispatch them as StreamEvents.
+#[allow(clippy::too_many_arguments)]
 async fn do_codex_stream(
     url: &str,
     token: &str,
@@ -281,6 +306,7 @@ async fn do_codex_stream(
     tools: &[serde_json::Value],
     instructions: Option<&str>,
     tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let mut body = serde_json::json!({ "model": model_id, "input": input });
@@ -291,20 +317,37 @@ async fn do_codex_stream(
         body["tools"] = serde_json::Value::Array(tools.to_vec());
     }
 
-    let response = client
-        .post(url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("OpenAI-Beta", "responses=v1")
-        .json(&body)
-        .send()
-        .await?;
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        response = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("OpenAI-Beta", "responses=v1")
+            .json(&body)
+            .send() => response?,
+    };
 
     let status = response.status();
     if !status.is_success() {
-        let error_body: serde_json::Value = response.json().await?;
+        let error_body: serde_json::Value = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            body = response.json() => body?,
+        };
         let error_msg = error_body["error"]["message"].as_str().unwrap_or("Unknown Codex error");
-        anyhow::bail!("Codex API error ({}): {}", status.as_u16(), error_msg);
+        let message = format!("Codex API error ({}): {}", status.as_u16(), error_msg);
+        let _ = send_event(
+            &tx,
+            StreamEvent::Error {
+                reason: StopReason::Error,
+                message: message.clone(),
+            },
+            &cancellation,
+        )
+        .await;
+        anyhow::bail!("{}", message);
     }
 
     let mut stream = response.bytes_stream();
@@ -316,7 +359,14 @@ async fn do_codex_stream(
     let mut partial_tool_calls: std::collections::HashMap<i64, (String, String, String)> =
         std::collections::HashMap::new();
 
-    while let Some(chunk_result) = stream.next().await {
+    while let Some(chunk_result) = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        chunk = stream.next() => chunk,
+    } {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
         let chunk = chunk_result?;
         buf.extend_from_slice(&chunk);
 
@@ -388,12 +438,16 @@ async fn do_codex_stream(
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(data)
                         && let Some(delta) = val["delta"].as_str()
                         && !delta.is_empty()
-                    {
-                        let _ = tx
-                            .send(StreamEvent::TextDelta {
+                        && !send_event(
+                            &tx,
+                            StreamEvent::TextDelta {
                                 delta: delta.to_string(),
-                            })
-                            .await;
+                            },
+                            &cancellation,
+                        )
+                        .await
+                    {
+                        return Ok(());
                     }
                 }
                 "response.function_call_arguments.delta" => {
@@ -419,14 +473,19 @@ async fn do_codex_stream(
                         // If this was a tool call, finalize and emit
                         if let Some((composite_id, name, args_str)) = partial_tool_calls.remove(&output_index) {
                             has_tool_calls = true;
-                            if let Ok(arguments) = serde_json::from_str(&args_str) {
-                                let _ = tx
-                                    .send(StreamEvent::ToolCall {
+                            if let Ok(arguments) = serde_json::from_str(&args_str)
+                                && !send_event(
+                                    &tx,
+                                    StreamEvent::ToolCall {
                                         id: composite_id,
                                         name,
                                         arguments,
-                                    })
-                                    .await;
+                                    },
+                                    &cancellation,
+                                )
+                                .await
+                            {
+                                return Ok(());
                             }
                         }
                     }
@@ -466,7 +525,7 @@ async fn do_codex_stream(
                         error_message: None,
                         timestamp: now,
                     };
-                    let _ = tx.send(StreamEvent::Done { message: msg }).await;
+                    let _ = send_event(&tx, StreamEvent::Done { message: msg }, &cancellation).await;
                     return Ok(());
                 }
                 "error" => {
@@ -475,12 +534,15 @@ async fn do_codex_stream(
                     } else {
                         "Codex SSE error event".to_string()
                     };
-                    let _ = tx
-                        .send(StreamEvent::Error {
+                    let _ = send_event(
+                        &tx,
+                        StreamEvent::Error {
                             reason: StopReason::Error,
                             message: err_msg.clone(),
-                        })
-                        .await;
+                        },
+                        &cancellation,
+                    )
+                    .await;
                     anyhow::bail!("{}", err_msg);
                 }
                 "response.failed" => {
@@ -500,12 +562,15 @@ async fn do_codex_stream(
                     } else {
                         "Codex response failed".to_string()
                     };
-                    let _ = tx
-                        .send(StreamEvent::Error {
+                    let _ = send_event(
+                        &tx,
+                        StreamEvent::Error {
                             reason: StopReason::Error,
                             message: err_msg.clone(),
-                        })
-                        .await;
+                        },
+                        &cancellation,
+                    )
+                    .await;
                     anyhow::bail!("{}", err_msg);
                 }
                 _ => {
@@ -516,6 +581,21 @@ async fn do_codex_stream(
     }
 
     Ok(())
+}
+
+async fn send_event(
+    tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    event: StreamEvent,
+    cancellation: &CancellationToken,
+) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => false,
+        result = tx.send(event) => result.is_ok(),
+    }
 }
 
 /// Find the position of the first double-newline separator (\n\n or \r\n\r\n)
@@ -540,6 +620,10 @@ mod tests {
         AgentMessage, AssistantContent, AssistantMessage, MessageContent, StopReason, TextOrImageContent,
         ToolResultMessage, UserMessage,
     };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
 
     #[test]
     fn build_input_includes_function_call_items_for_tool_calls() {
@@ -859,6 +943,65 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    async fn start_stalled_server() -> (String, Arc<Notify>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_started = Arc::new(Notify::new());
+        let notify = request_started.clone();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n")
+                .await
+                .unwrap();
+            notify.notify_one();
+            let mut closed = [0_u8; 1];
+            let _ = socket.read(&mut closed).await;
+        });
+        (format!("http://{address}"), request_started, handle)
+    }
+
+    #[tokio::test]
+    async fn codex_stalled_transport_stops_with_request_cancellation() {
+        let (base_url, request_started, server) = start_stalled_server().await;
+        let provider = OpenAICodexProvider::new("test-token".into()).with_base_url(base_url);
+        let cancellation = CancellationToken::new();
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: MessageContent::Text("wait".into()),
+            timestamp: 1000,
+        })];
+        let mut stream = provider
+            .stream(
+                &Model {
+                    id: "gpt-5.5",
+                    api: "openai-codex-responses",
+                },
+                &messages,
+                &[],
+                None,
+                ProviderRequestContext::new(cancellation.clone()),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_started.notified())
+            .await
+            .expect("server should observe the request");
+        cancellation.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.shutdown())
+            .await
+            .expect("producer should stop promptly");
+        assert!(stream.producer_finished());
+        assert!(
+            stream.recv().await.is_none(),
+            "cancelled transport must emit no late event"
+        );
+        server.abort();
+        let _ = server.await;
+    }
 
     /// Helper: build a Codex request body the same way do_codex_stream does,
     /// then return it as a serde_json::Value for assertions.

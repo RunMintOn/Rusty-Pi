@@ -30,13 +30,14 @@
 //! Tool calls are parsed from the `tool_calls` delta field in each SSE chunk.
 //! Tool call arguments are accumulated across multiple chunks before being parsed.
 
-use crate::ai::providers::{Model, ProviderApi, StreamReceiver};
+use crate::ai::providers::{Model, ProviderApi, ProviderRequestContext, ProviderStream};
 use crate::ai::stream::{MessageAccumulator, StreamEvent};
 use crate::ai::types::{AgentMessage, AssistantContent, AssistantMessage, StopReason, Tool};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEEPSEEK_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
@@ -225,16 +226,29 @@ impl ProviderApi for DeepSeekProvider {
         messages: &[AgentMessage],
         tools: &[&dyn Tool],
         system_prompt: Option<&str>,
-    ) -> anyhow::Result<StreamReceiver> {
+        context: ProviderRequestContext,
+    ) -> anyhow::Result<ProviderStream> {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let url = format!("{}/chat/completions", self.base_url);
         let api_key = self.api_key.clone();
         let api_messages = Self::build_messages(messages, system_prompt);
         let api_tools = Self::build_tools(tools);
         let model_id = model.id.to_string();
+        let cancellation = context.cancellation.child_token();
+        let producer_cancellation = cancellation.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = do_stream(&url, &api_key, &model_id, &api_messages, &api_tools, tx).await {
+        let producer_handle = tokio::spawn(async move {
+            if let Err(e) = do_stream(
+                &url,
+                &api_key,
+                &model_id,
+                &api_messages,
+                &api_tools,
+                tx,
+                producer_cancellation,
+            )
+            .await
+            {
                 // Error already sent through the channel by do_stream.
                 // Intentionally not writing to stderr here — all terminal output
                 // goes through AgentEvent / frontend.
@@ -242,7 +256,7 @@ impl ProviderApi for DeepSeekProvider {
             }
         });
 
-        Ok(rx)
+        Ok(ProviderStream::new(rx, producer_handle, cancellation))
     }
 
     fn list_models(&self) -> Vec<&Model> {
@@ -319,29 +333,40 @@ async fn do_stream(
     messages: &[serde_json::Value],
     tools: &[serde_json::Value],
     tx: tokio::sync::mpsc::Sender<StreamEvent>,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     let http_client = Client::new();
     let body = build_request_body(model_id, messages, tools);
 
-    let response = http_client
-        .post(url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    let response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        response = http_client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send() => response?,
+    };
 
     let status = response.status();
     if !status.is_success() {
-        let error_body: serde_json::Value = response.json().await.unwrap_or_default();
+        let error_body: serde_json::Value = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            body = response.json() => body.unwrap_or_default(),
+        };
         let error_msg = error_body["error"]["message"].as_str().unwrap_or("Unknown API error");
         let err = format!("DeepSeek API error ({}): {}", status.as_u16(), error_msg);
-        let _ = tx
-            .send(StreamEvent::Error {
+        send_event(
+            &tx,
+            StreamEvent::Error {
                 reason: StopReason::Error,
                 message: err.clone(),
-            })
-            .await;
+            },
+            &cancellation,
+        )
+        .await;
         anyhow::bail!("{}", err);
     }
 
@@ -351,7 +376,14 @@ async fn do_stream(
     let mut tool_accum = ToolCallAccumulator::new();
     let mut has_tool_calls = false;
 
-    while let Some(chunk_result) = stream.next().await {
+    while let Some(chunk_result) = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Ok(()),
+        chunk = stream.next() => chunk,
+    } {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
         let chunk = chunk_result?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -373,12 +405,16 @@ async fn do_stream(
                                 // Text content delta
                                 if let Some(content) = delta["content"].as_str()
                                     && !content.is_empty()
-                                {
-                                    let _ = tx
-                                        .send(StreamEvent::TextDelta {
+                                    && !send_event(
+                                        &tx,
+                                        StreamEvent::TextDelta {
                                             delta: content.to_string(),
-                                        })
-                                        .await;
+                                        },
+                                        &cancellation,
+                                    )
+                                    .await
+                                {
+                                    return Ok(());
                                 }
 
                                 // Tool call delta — accumulate arguments across chunks
@@ -403,7 +439,15 @@ async fn do_stream(
 
                                     // Emit accumulated tool calls
                                     for (id, name, arguments) in tool_accum.finalize() {
-                                        let _ = tx.send(StreamEvent::ToolCall { id, name, arguments }).await;
+                                        if !send_event(
+                                            &tx,
+                                            StreamEvent::ToolCall { id, name, arguments },
+                                            &cancellation,
+                                        )
+                                        .await
+                                        {
+                                            return Ok(());
+                                        }
                                     }
 
                                     acc.push(StreamEvent::Done {
@@ -427,12 +471,15 @@ async fn do_stream(
                         }
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(StreamEvent::Error {
+                        send_event(
+                            &tx,
+                            StreamEvent::Error {
                                 reason: StopReason::Error,
                                 message: format!("SSE parse error: {}", e),
-                            })
-                            .await;
+                            },
+                            &cancellation,
+                        )
+                        .await;
                         anyhow::bail!("SSE parse error: {}", e);
                     }
                 }
@@ -446,13 +493,30 @@ async fn do_stream(
     if !remaining.is_empty() && !has_tool_calls {
         // Shouldn't normally happen, but be safe
         for (id, name, arguments) in remaining {
-            let _ = tx.send(StreamEvent::ToolCall { id, name, arguments }).await;
+            if !send_event(&tx, StreamEvent::ToolCall { id, name, arguments }, &cancellation).await {
+                return Ok(());
+            }
         }
     }
 
     let msg = acc.build();
-    let _ = tx.send(StreamEvent::Done { message: msg }).await;
+    let _ = send_event(&tx, StreamEvent::Done { message: msg }, &cancellation).await;
     Ok(())
+}
+
+async fn send_event(
+    tx: &tokio::sync::mpsc::Sender<StreamEvent>,
+    event: StreamEvent,
+    cancellation: &CancellationToken,
+) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => false,
+        result = tx.send(event) => result.is_ok(),
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -464,6 +528,10 @@ mod tests {
         AgentMessage, AssistantContent, AssistantMessage, MessageContent, StopReason, TextOrImageContent,
         ToolResultMessage, UserMessage,
     };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
 
     // ── build_messages tests ────────────────────────────────────────────────
 
@@ -768,6 +836,65 @@ mod tests {
         matchers::{method, path},
     };
 
+    async fn start_stalled_server() -> (String, Arc<Notify>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_started = Arc::new(Notify::new());
+        let notify = request_started.clone();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n")
+                .await
+                .unwrap();
+            notify.notify_one();
+            let mut closed = [0_u8; 1];
+            let _ = socket.read(&mut closed).await;
+        });
+        (format!("http://{address}"), request_started, handle)
+    }
+
+    #[tokio::test]
+    async fn deepseek_stalled_transport_stops_with_request_cancellation() {
+        let (base_url, request_started, server) = start_stalled_server().await;
+        let provider = DeepSeekProvider::new("test-key".into()).with_base_url(base_url);
+        let cancellation = CancellationToken::new();
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: MessageContent::Text("wait".into()),
+            timestamp: 1000,
+        })];
+        let mut stream = provider
+            .stream(
+                &Model {
+                    id: "deepseek-v4-flash",
+                    api: "openai-completions",
+                },
+                &messages,
+                &[],
+                None,
+                ProviderRequestContext::new(cancellation.clone()),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_started.notified())
+            .await
+            .expect("server should observe the request");
+        cancellation.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.shutdown())
+            .await
+            .expect("producer should stop promptly");
+        assert!(stream.producer_finished());
+        assert!(
+            stream.recv().await.is_none(),
+            "cancelled transport must emit no late event"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn http_500_returns_error_stop_reason() {
         let mock_server = MockServer::start().await;
@@ -796,6 +923,7 @@ mod tests {
                 &messages,
                 &[],
                 None,
+                ProviderRequestContext::new(CancellationToken::new()),
             )
             .await
             .unwrap();
@@ -846,6 +974,7 @@ mod tests {
                 &messages,
                 &[],
                 None,
+                ProviderRequestContext::new(CancellationToken::new()),
             )
             .await
             .unwrap();
@@ -896,6 +1025,7 @@ mod tests {
                 &messages,
                 &[],
                 None,
+                ProviderRequestContext::new(CancellationToken::new()),
             )
             .await
             .unwrap();
