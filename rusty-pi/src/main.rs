@@ -14,6 +14,7 @@ use rusty_pi::ai::mock::{MockProvider, MockStep};
 use rusty_pi::ai::providers::deepseek::{DEEPSEEK_MODELS, DeepSeekProvider};
 use rusty_pi::ai::providers::openai_codex::{OPENAI_CODEX_MODELS, OpenAICodexProvider};
 use rusty_pi::ai::providers::{Model, ProviderApi};
+use rusty_pi::coding_agent::command::{Command, CommandContext, CommandInvocation, CommandOutcome};
 use rusty_pi::coding_agent::prompt_session::PromptSession;
 use rusty_pi::coding_agent::repl::{self, RunConfig};
 use rusty_pi::coding_agent::system_prompt::ContextFile;
@@ -24,6 +25,7 @@ use rusty_pi::coding_agent::tools::write::WriteTool;
 use rusty_pi::format::OutputFormatter;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Default configuration (TOML file).
 #[derive(Debug, Default, serde::Deserialize)]
@@ -103,6 +105,35 @@ struct Cli {
     /// Launch the Ratatui TUI frontend instead of the print-based REPL
     #[arg(long = "tui")]
     tui: bool,
+}
+
+/// Test-only command seam used by the PTY cancellation smoke. It is not
+/// registered unless the integration test opts in through an environment
+/// variable, so it is not a production-facing user command.
+struct DelayedTuiTestCommand;
+
+#[async_trait::async_trait]
+impl Command for DelayedTuiTestCommand {
+    fn name(&self) -> &str {
+        "test-delayed"
+    }
+
+    fn description(&self) -> &str {
+        "internal delayed command test seam"
+    }
+
+    async fn execute(
+        &self,
+        _invocation: &CommandInvocation,
+        context: &mut CommandContext<'_>,
+    ) -> anyhow::Result<CommandOutcome> {
+        loop {
+            tokio::select! {
+                _ = context.cancellation.cancelled() => return Ok(CommandOutcome::none()),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+            }
+        }
+    }
 }
 
 fn build_provider(name: &str, model_id: Option<&str>) -> anyhow::Result<(Box<dyn ProviderApi>, Model)> {
@@ -353,7 +384,10 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
     session.agent().set_event_sender(event_tx);
     let mut current_token = tokio_util::sync::CancellationToken::new();
     session.agent().set_abort_flag(current_token.clone());
-    let registry = rusty_pi::coding_agent::command::builtin_registry();
+    let mut registry = rusty_pi::coding_agent::command::builtin_registry();
+    if cfg!(debug_assertions) && std::env::var_os("RUSTY_PI_TUI_TEST_DELAYED_COMMAND").is_some() {
+        registry.register(Box::new(DelayedTuiTestCommand));
+    }
     let interaction = rusty_pi::coding_agent::command::UnavailableCommandInteraction;
 
     // Run TUI loop — agent runs inline when a prompt is submitted
@@ -468,65 +502,17 @@ async fn drive_command_with_ui(
     interaction: &dyn rusty_pi::coding_agent::command::CommandInteraction,
     invocation: rusty_pi::coding_agent::command::CommandInvocation,
 ) -> anyhow::Result<bool> {
-    use rusty_pi::tui::app::{Action, Effect};
-
     let cancellation = tokio_util::sync::CancellationToken::new();
     let mut context = rusty_pi::coding_agent::command::CommandContext::new(session, interaction, cancellation.clone());
     let command = registry.dispatch(&invocation, &mut context);
-    tokio::pin!(command);
-
-    loop {
-        terminal.draw(|frame| rusty_pi::tui::app::view(frame, state))?;
-        if crossterm::event::poll(std::time::Duration::from_millis(10))? {
-            let event = crossterm::event::read()?;
-            let effects = match event {
-                crossterm::event::Event::Key(key) => state.update(Action::KeyInput(key)),
-                crossterm::event::Event::Paste(text) => state.update(Action::Paste(text)),
-                crossterm::event::Event::Resize(width, height) => state.update(Action::Resize(width, height)),
-                _ => Vec::new(),
-            };
-            for effect in effects {
-                match effect {
-                    Effect::CancelCommand => cancellation.cancel(),
-                    Effect::Quit => {
-                        cancellation.cancel();
-                        return Ok(true);
-                    }
-                    Effect::RunAgent(_) | Effect::SubmitInput(_) | Effect::CancelAgent => {}
-                }
-            }
-        }
-
-        if state.quit {
-            cancellation.cancel();
-            return Ok(true);
-        }
-
-        tokio::select! {
-            result = &mut command => {
-                match result {
-                    Ok(outcome)
-                        if cancellation.is_cancelled()
-                            && outcome.result.is_none()
-                            && outcome.control == rusty_pi::coding_agent::command::CommandControl::Continue =>
-                    {
-                        state.update(Action::CommandCancelled);
-                    }
-                    Ok(outcome) => {
-                        let effects = state.update(Action::CommandCompleted(outcome));
-                        if effects.iter().any(|effect| matches!(effect, Effect::Quit)) {
-                            return Ok(true);
-                        }
-                    }
-                    Err(error) => {
-                        state.update(Action::CommandFailed(error.to_string()));
-                    }
-                }
-                return Ok(state.quit);
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(40)) => {}
-        }
-    }
+    let events = rusty_pi::tui::command_driver::CrosstermCommandEventSource::default();
+    let renderer = rusty_pi::tui::command_driver::RatatuiCommandRenderer::new(terminal);
+    let outcome =
+        rusty_pi::tui::command_driver::drive_command_core(command, events, renderer, state, cancellation).await?;
+    Ok(matches!(
+        outcome,
+        rusty_pi::tui::command_driver::CommandDriveOutcome::Quit
+    ))
 }
 
 /// Poll one agent turn while continuing to service keyboard and AgentEvent

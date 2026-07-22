@@ -27,10 +27,18 @@ struct PtyProcess {
 
 impl PtyProcess {
     fn spawn(agent_dir: &std::path::Path) -> Self {
-        Self::spawn_with_tool(agent_dir, None)
+        Self::spawn_inner(agent_dir, None, false)
     }
 
     fn spawn_with_tool(agent_dir: &std::path::Path, mock_tool: Option<&str>) -> Self {
+        Self::spawn_inner(agent_dir, mock_tool, false)
+    }
+
+    fn spawn_with_delayed_command(agent_dir: &std::path::Path) -> Self {
+        Self::spawn_inner(agent_dir, None, true)
+    }
+
+    fn spawn_inner(agent_dir: &std::path::Path, mock_tool: Option<&str>, delayed_command: bool) -> Self {
         let system = native_pty_system();
         let pair = system
             .openpty(PtySize {
@@ -48,6 +56,9 @@ impl PtyProcess {
         command.env("RUSTY_PI_AGENT_DIR", agent_dir);
         if let Some(mock_tool) = mock_tool {
             command.env("RUSTY_PI_MOCK_TOOL", mock_tool);
+        }
+        if delayed_command {
+            command.env("RUSTY_PI_TUI_TEST_DELAYED_COMMAND", "1");
         }
 
         let child = pair
@@ -264,6 +275,27 @@ fn real_tui_pty_ctrl_c_aborts_running_tool() {
     process.wait_for("running", Duration::from_secs(5));
     process.send_bytes(b"\x03");
     process.wait_for("Aborted", Duration::from_secs(5));
+    process.send_bytes(b"/quit\r");
+    process.finish();
+}
+
+#[test]
+fn real_tui_pty_ctrl_c_cancels_delayed_command_and_accepts_next_input() {
+    let agent_dir = tempfile::tempdir().expect("temporary agent directory");
+    let mut process = PtyProcess::spawn_with_delayed_command(agent_dir.path());
+    process.wait_for("Transcript", Duration::from_secs(5));
+
+    process.send_bytes(b"/test-delayed\r");
+    process.wait_for("Command running", Duration::from_secs(5));
+
+    // Navigation is delivered through the real PTY before the cancellation.
+    process.send_bytes(b"\x1b[5~");
+    // 0x03 is the real PTY Ctrl+C byte, not a direct token cancellation.
+    process.send_bytes(b"\x03");
+    process.wait_for("Command cancelled", Duration::from_secs(5));
+
+    process.send_bytes(b"/help\r");
+    process.wait_for("Commands:", Duration::from_secs(5));
     process.send_bytes(b"/quit\r");
     process.finish();
 }

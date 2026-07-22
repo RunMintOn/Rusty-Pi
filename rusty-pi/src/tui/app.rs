@@ -1876,6 +1876,35 @@ mod tests {
     }
 
     #[test]
+    fn command_error_is_one_error_block_idle_and_ready_for_next_input() {
+        let mut state = AppState::new((80, 24));
+        state.update(Action::CommandStarted { name: "context".into() });
+        state.update(Action::CommandCompleted(CommandOutcome {
+            result: Some(CommandResult::Error("Cannot read missing.md".into())),
+            control: CommandControl::Continue,
+        }));
+
+        assert_eq!(state.activity, ActivityState::Idle);
+        assert_eq!(state.error.as_deref(), Some("Cannot read missing.md"));
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [TranscriptBlock::Error { message }] if message == "Cannot read missing.md"
+        ));
+        assert!(
+            !state
+                .transcript
+                .iter()
+                .any(|block| matches!(block, TranscriptBlock::User { .. }))
+        );
+
+        state.input.set_text("ordinary prompt".into());
+        assert!(matches!(
+            state.update(Action::Submit).as_slice(),
+            [Effect::SubmitInput(input)] if input == "ordinary prompt"
+        ));
+    }
+
+    #[test]
     fn command_ctrl_c_is_distinct_from_agent_cancellation() {
         let mut state = AppState::new((80, 24));
         state.update(Action::CommandStarted {
