@@ -1,14 +1,21 @@
-# Known Issues & Solutions
+# Known Issues and Current Limitations
 
-## 测试并行运行时挂起 (已修复)
+This list contains only limitations still present in the current source and tests.
 
-**症状**: `cargo test` 并行运行时 50%+ 概率挂死，单线程正常。
+## TUI model/context picker is not native
 
-**根因**: `tokio::process::Child::drop` 不调用 `waitpid`。Runtime 被 drop 时子进程变 zombie，阻塞 `do_wait()`。
+`/model` and `/context` without an argument display usage in the Ratatui TUI. The TUI does not hand terminal ownership to `inquire`, and there is no native picker yet. Use an explicit command argument where supported or use the thin REPL adapter. Native TUI pickers are planned.
 
-**修复**: bash 工具用 `std::process::Command` + OS 线程 blocking I/O 和 `waitpid`，绕过 tokio 进程管理。
+## Thinking/reasoning transport is incomplete
 
-**防范规则**:
-- 任何需要 spawn 子进程并等待的代码，**不要用 `tokio::process::Command`**，用 `std::process::Command` + OS 线程。
-- 如果必须用 tokio process，确保在所有代码路径上都调用 `child.wait().await`，且不能被 runtime drop 取消。
-- 并行测试挂起时，先 `ps -eo pid,ppid,stat,comm | grep " Z "` 检查 zombie，再查 `pstree -p` 找残留子进程。
+Thinking message/content types, Session metadata, `AgentEvent::ThinkingDelta`, and frontend rendering exist, but the production Provider request-setting and reasoning-stream parsing path is absent. Users cannot enable complete thinking/reasoning behavior. This is recorded as `Infrastructure` in [the capability matrix](../docs/capabilities.md), not as supported reasoning.
+
+## Automatic compaction is not orchestrated
+
+Compaction entries, JSONL serialization, context transforms, and summary reconstruction are tested infrastructure. Automatic thresholds, summary-model calls, automatic business orchestration, and a `/compact` command are not present. Automatic compaction is `Planned` in [the capability matrix](../docs/capabilities.md).
+
+## Future interfaces are not current interfaces
+
+JSON output, RPC/headless mode, native TUI session/tree navigation, the independent plugin protocol, SDKs, and live-provider evaluation are roadmap items. See [the roadmap](../docs/roadmap.md) rather than treating these as current runtime features.
+
+If a newly observed problem cannot be confirmed from source and tests, record it as **Needs verification** instead of guessing.

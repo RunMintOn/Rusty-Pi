@@ -1,146 +1,86 @@
-# Development Rules
+# Rusty-Pi Agent Development Rules
 
-## Project Goal
+## Source of truth
 
-用 Rust 完整重写 [earendil-works/pi](https://github.com/earendil-works/pi)（一个 AI coding agent），最终产物为 `rusty-pi`。
+When sources disagree, use this order:
 
-## Design Principle
+1. Source code and tests
+2. `docs/capabilities.md`
+3. `SPEC.md`
+4. `docs/architecture.md`
+5. Accepted ADRs in `docs/adr/`
+6. `README.md`
+7. Historical tickets
 
-**全权参考原实现。** 所有架构决策、接口设计、行为细节，一律以原版 TypeScript 代码为准，不自创、不臆想。原版代码位于 `reference/earendil-works-pi/`。
+If README and source code conflict, do not guess. Inspect the relevant Rust source and tests first, then update the documentation or report the conflict.
 
-## Testing
+`reference/earendil-works-pi/` is read-only research material. PI is a design reference, not a compatibility specification. Historical tickets are research and task records, not current implementation requirements.
 
-- **测试先行。** 核心逻辑在实现之前先写测试。
-- **全部本地运行，全部 mock。** 不使用任何在线 API、LLM 端点、或本机已安装的 pi。LLM provider 层使用 mock provider 返回预设响应，文件系统和进程操作根据测试场景酌情 mock。
-- **目标是：Rust 版测试覆盖原版 TypeScript 测试的每一个行为点**，而非直接运行原版测试（原版为 vitest + TypeScript，无法在 Rust 中执行）。
-- 非 e2e 测试应能通过 `cargo test` 一条命令全部运行通过。
+## Product and architecture boundaries
 
-## Code Quality
+- Rusty-Pi is an independent Rust coding agent.
+- Do not mechanically translate PI. First read the current Rust code and the relevant PI source, then decide whether a capability should align, borrow, or be rejected.
+- Keep Agent, Session, Command, and frontend ownership separate.
+- Agent and Provider do not write to terminals; frontends consume `AgentEvent`.
+- `AgentEvent` is the sole Agent-to-frontend business event path, with `RunFinished`, `RunAborted`, and `RunFailed` as the terminal event contract.
+- Commands return frontend-neutral results, do not write to terminals, and do not create Agent user messages.
+- Skills and prompt templates expand into Agent prompts.
+- `PromptSession` is a bounded transition layer. Do not let it grow without an explicit SessionController decision.
+- Do not add core built-in tools as a proxy for PI coverage; the fixed core is `bash`, `read`, `write`, and `edit`.
+- A feature is not Available merely because a type or helper exists. Require production wiring and automated tests, and mark incomplete plumbing Infrastructure in `docs/capabilities.md`.
+- Update the capability matrix when behavior changes.
+- Record an accepted architecture decision in an ADR when a boundary or long-term direction changes.
+- Do not use a historical ticket as the current specification.
 
-- 读透原版代码再动手改。对复杂模块，先完整阅读对应原版文件再做移植。
-- 类型安全优先。善用 Rust 的类型系统，避免不必要的 `unwrap()` / `expect()`。
-- 错误处理使用 `anyhow` / `thiserror`，不 panic。
-- 遵循 Rust 社区惯例（clippy、rustfmt）。
+## Development rules
 
-## Working Directory
+- Work from the repository root for documentation and from `rusty-pi/` for Cargo commands.
+- Read complex Rust modules and their relevant PI source completely before changing them.
+- Use test-first development for core behavior.
+- Keep normal tests offline and mock providers; do not call real LLM APIs from CI or ordinary tests.
+- Prefer typed errors with `anyhow`/`thiserror`; avoid unnecessary `unwrap()` and `expect()` in production paths.
+- Do not modify the reference tree.
+- Do not clean up historical Clippy warnings unless the task explicitly asks for it.
+- Do not implement roadmap features merely to make documentation true.
 
-所有产物（代码、测试、文档、配置文件）均放置于本工作区 `pi-rust/` 下，不散落到系统路径或其他目录。
+## Required validation
 
-## Project Structure
-
-```
-pi-rust/
-├── AGENTS.md               ← 本文件
-├── reference/
-│   └── earendil-works-pi/  ← 原版 pi 参考代码（只读，不修改）
-├── rusty-pi/               ← Rust 项目（待创建）
-│   └── ...
-```
-
-## Agent skills
-
-### Issue tracker
-
-Issues tracked as local markdown files in the repo root. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Default labels configured (not actively used — solo project). See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context repo. See `docs/agents/domain.md`.
-
-## Multi-Agent Collaboration
-
-本仓库可能同时有多个 agent 在工作。你可能会遇到：
-
-- **文件在你两次工作之间被修改** — 别的 agent 正在处理相邻的 ticket。重新读取文件，理解当前状态，然后决定你的改动如何适应。
-- **你依赖的代码发生了变化** — 如果别的 agent 重构了你准备改的模块，先读新代码，调整你的方案，而不是回退别人的改动。
-- **测试覆盖率在变化** — 每次跑 `cargo test` 时应看到最全的通过状态。如果别的 agent 引入了测试失败，不要不管——停下来看看是不是你的改动暴露了它的问题。
-
-基本原则：**把其他 agent 视为协作完成任务的人类同事**。它们做的改动和你的一样有效。遇到变化，先读、再适应、不抱怨、不重写。
-
-## Commit
-
-- 不要提交除非用户要求。
-- 阶段性的成果确认后，由用户决定何时提交。
-
-## Known Pitfalls（踩坑记录）
-
-### 1. 子进程杀死不完整导致测试死锁
-
-**症状**：`cargo test` 卡死，运行几分钟甚至几小时不结束。
-
-**原因**：在 `bash.rs` 中，`kill_process` 只杀 shell 进程（`sh`），不杀其子进程（如 `sleep`）。被杀的 shell 留下孤儿子进程，这些子进程占用 stdout/stderr 管道的写端，导致 `child.wait()` 和 `read_line()` 永远阻塞。
-
-**修复**：
-1. 用 `process_group(0)` 让子进程成为独立进程组的组长
-2. 用 `libc::killpg(pgid, SIGKILL)` 杀整个进程组
-3. 不要用 `Command::new("kill").spawn()`，它会产生僵尸进程
-
-**教训**：杀进程要杀整个进程组，不能只杀父进程。
-
-### 2. Agent 未传递 abort signal 给工具
-
-**症状**：`agent_cancellation_aborts_long_running_tool` 测试失败。
-
-**原因**：`engine.rs` 的 `execute_tool` 方法调用工具时传了 `signal: None`，工具收不到 abort 信号，无法被取消。
-
-**修复**：
-1. 创建 `tokio::sync::watch::channel`
-2. 启动后台任务监控 `abort_flag`，状态变化时通过 channel 通知
-3. 把 `watch::Receiver` 传递给工具
-
-**教训**：abort/cancel 信号必须端到端传递，不能在中间断掉。
-
-### 3. tokio::process::Child::drop 不调用 waitpid
-
-**症状**：并行 `cargo test` 50%+ 概率挂死，单线程正常。`ps` 显示 zombie `sh` 进程，主线程卡在 `do_wait`。
-
-**原因**：`tokio::process::Child::drop` 只 detach 不 reaping。Runtime 被 drop 后 SIGCHLD handler 也失效，zombie 无人清理。
-
-**修复**：用 `std::process::Command` + OS 线程 blocking `waitpid`，完全绕过 tokio 进程管理。
-
-**防范**：spawn 子进程的工具一律用 `std::process::Command`，不用 `tokio::process::Command`。
-
-### 5. 测试卡住时如何诊断
+From `rusty-pi/`:
 
 ```bash
-# 查看进程树
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features
+cargo test --locked
+```
+
+Do not write fixed test counts into documentation. Do not add `#[allow]` to hide warnings or `#[ignore]` to avoid running tests. New behavior needs production wiring and automated coverage.
+
+## Known engineering pitfalls
+
+### Process cleanup
+
+Tools that spawn and wait for child processes must clean up the whole process group and reap children. The bash tool uses `std::process::Command`, an independent process group, `libc::killpg`, and blocking wait/reaping; do not reintroduce detached `tokio::process::Child` behavior.
+
+### Cancellation
+
+Cancellation must travel end-to-end through Agent, Provider, Command, and Tool boundaries. A tool that cannot observe the current cancellation token is not cancellable.
+
+### TUI lifecycle
+
+Keep `TerminalGuard` responsible for terminal restoration. The TUI command driver must await command settlement before accepting the next input. Keep `RunId` filtering so late events from an old run cannot alter a new transcript.
+
+### Diagnostics
+
+When a test hangs, inspect the process tree, thread wait channels, and zombie processes before changing async code:
+
+```bash
 pstree -p <test_pid>
-
-# 查看线程状态
 cat /proc/<test_pid>/task/*/wchan | sort | uniq -c
-
-# 查看僵尸进程
 ps -eo pid,ppid,stat,comm | grep Z
 ```
 
-如果看到大量 `futex_wait_queue`（等锁）或 `do_epoll_wait`（等 I/O），且有僵尸子进程，很可能是上述问题 1 或 2。
+## Issue tracker and collaboration
 
-## Architecture Decisions
+Issues are local Markdown records. See `docs/agents/issue-tracker.md` and `docs/agents/triage-labels.md`. Preserve useful work from other agents: reread changed files and adapt instead of reverting collaborators' work.
 
-### AgentEvent + RunId 隔离
-
-每个 `AgentEvent` 都携带 `run_id: RunId`（单调递增 u64）。TUI 根据 `current_run_id` 过滤事件，防止旧 run 的迟到事件污染新 run 的 transcript。
-
-### ToolExecutionContext 替代 configure_streaming
-
-工具不再通过 `configure_streaming()` 共享 sender。每次执行接收独立的 `ToolExecutionContext`，包含：
-- `output_tx: mpsc::Sender<ToolOutputEvent>` — 流式输出通道
-- `cancellation: CancellationToken` — 取消信号
-
-这样同一工具实例可以安全地并发执行。
-
-### CancellationToken 直接传递
-
-取消信号通过 `CancellationToken` 树直接传递。不再使用 watch channel 转发。工具内部通过 `tokio::select!` 直接等待 `context.cancellation.cancelled()`。
-
-### ActivityState + RunOutcome 分离
-
-TUI 状态模型分为：
-- `ActivityState`：当前活动（Idle / Running / Cancelling）
-- `RunOutcome`：上一轮结果（Completed / Aborted / ProviderError / ToolError）
-
-这样 `RunAborted` 事件不会被立即覆盖为 `Idle`，UI 可以观察到 aborted 状态。
+Do not commit unless the task requests it. For this execution brief, all actual changes must be committed and `.gitignore` must remain untouched.

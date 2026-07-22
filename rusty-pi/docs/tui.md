@@ -1,66 +1,51 @@
-# Rusty-pi TUI interaction
+# Ratatui TUI
 
-The Ratatui frontend keeps a structured transcript and does not write agent or
-command output directly to stdout. Start it with `rusty-pi --tui -p mock`.
+Ratatui is Rusty-Pi's primary interactive frontend. Start it with:
 
-## Focus and keys
+```bash
+cargo run --locked -- --tui
+```
 
-The default focus is **Input**. `Tab` switches between the input editor and
-transcript. `i` returns to input from transcript focus. `Esc` clears the current
-transcript selection and returns to input. `q` is an ordinary input character;
-it does not quit the application.
+The TUI owns the terminal, renders a structured transcript, routes input through the shared asynchronous Command system, and consumes the unified `AgentEvent` stream. It is the formal primary interactive frontend.
+
+## Input and history
+
+The editor accepts multiline prompts. `Ctrl+J`, `Shift+Enter`, or `Alt+Enter` inserts a newline when the terminal reports the modifier. `Enter` submits a non-empty prompt when idle. While an Agent run is active, Enter is unavailable; the draft remains editable and is not queued concurrently.
+
+Process-local prompt history records successful non-empty prompts and removes consecutive duplicates. History is not persisted to disk.
 
 | Key | Input focus | Transcript focus |
 | --- | --- | --- |
-| `Enter` | Submit a non-empty prompt | Toggle selected Tool/Thinking block |
-| `Ctrl+J` | Insert a newline | — |
-| `Shift+Enter`, `Alt+Enter` | Insert a newline when the terminal reports the modifier | — |
 | `Tab` | Focus transcript | Focus input |
-| `Up` / `Down` | Edit vertically; on a single-line/empty draft, browse history | Move expandable-block selection |
+| `Up` / `Down` | Vertical editing; history on a single-line/empty draft | Select expandable block |
 | `PageUp` / `PageDown` | Scroll transcript | Scroll transcript |
-| `Home` | Current input line start | Transcript beginning |
-| `End` | Current input line end and follow latest | Follow latest |
-| `Space` | — | Expand/collapse selected Tool/Thinking block |
-| `Ctrl+A`, `Ctrl+E` | Line start/end | — |
-| `Ctrl+U`, `Ctrl+K` | Delete to line start/end | — |
-| `Ctrl+W` | Delete the previous word | — |
-| `Backspace`, `Delete` | Delete Unicode characters safely | — |
-| `Ctrl+C` | Clear a non-empty idle draft; no-op for an empty idle draft | — |
-| `Ctrl+C` while running | Cancel the current run | Cancel the current run |
+| `Home` / `End` | Input line start/end | Transcript beginning/follow latest |
+| `Ctrl+A` / `Ctrl+E` | Line start/end | — |
+| `Ctrl+U` / `Ctrl+K` | Delete to line start/end | — |
+| `Ctrl+W` | Delete previous word | — |
+| `Backspace` / `Delete` | Unicode-safe deletion | — |
+| `Ctrl+C` while idle | Clear a non-empty draft | — |
+| `Ctrl+C` while running | Cancel the Agent run | Cancel the Agent run |
 | `/quit` or `/exit` | Exit | — |
 
-Enter is deliberately unavailable while an agent run is active. The next
-prompt remains in the editor as a draft and is not queued or run concurrently.
-A successful, non-empty submitted prompt is recorded in process-local history;
-consecutive duplicates are removed. History is not written to disk.
+## Transcript and navigation
 
-## Transcript
+The transcript renders User, Assistant, Thinking, Tool, Error, and System blocks. Assistant deltas merge into one block. Tool calls retain arguments and separate stdout/stderr streams, and tool states include running, success, failed, timed out, and aborted. Thinking blocks are collapsed summaries when `ThinkingDelta` events exist.
 
-Blocks are independent: `You`, `Assistant`, `Thinking`, `Tool`, `Error`, and
-`System`. Assistant deltas append to one streaming block. Tool stdout and
-stderr append to separate bounded fields and ToolFinished only updates the
-existing Tool block. A Tool is collapsed by default and shows its name, state,
-and exit code. Expanded tools show cached JSON arguments followed by separate
-stdout and stderr sections. Thinking is collapsed by default and displays a
-line-count summary.
+Scrolling follows the latest output by default. PageUp, Home, PageDown, End, selection movement, and unread-output tracking provide transcript navigation. Tool streams and the transcript have bounded memory with UTF-8-safe truncation.
 
-The tool state labels are `running`, `success`, `failed`, `timed out`, and
-`aborted`. Unknown tool IDs become an explicit `unknown` Tool block instead of
-causing a panic.
+## Commands and pickers
 
-## Scrolling and limits
+Commands use the same async registry and frontend-neutral results as the REPL. Command lifecycle is polled alongside redraw, resize, navigation, and cancellation; the driver waits for command settlement before the next prompt.
 
-The transcript follows new output at the bottom by default. `PageUp`, `Home`,
-or an upward selection movement enters browsing mode. New content then leaves
-the viewport in place and increments the unread count shown in the transcript
-title. `End` (or scrolling back to offset zero) restores follow mode and clears
-that count.
+The TUI does not call an external terminal picker. `/model` and `/context` without arguments currently display usage; there is no native model or context picker yet. The `inquire` crate is confined to the REPL adapter.
 
-Each tool stdout and stderr stream retains at most 64 KiB. Overflow keeps a
-UTF-8-safe head and tail around one `… output truncated …` marker. The frontend
-also applies a soft 2,000-block transcript limit.
+## Cancellation and terminal ownership
 
-The input area grows from three rows to at most eight rows (and at most 30% of
-the terminal height). It internally scrolls to keep the UTF-8 cursor visible.
-The layout is tested down to 20x8 and accounts for double-width Unicode
-characters.
+`Ctrl+C` cancels the active Agent run or active Command through its cancellation boundary. It does not create a user-message transcript block. `TerminalGuard` restores terminal state on normal exit, command/Agent errors, and panic unwinding.
+
+PTY smoke tests exercise the real TUI, multiline input, AgentEvent rendering, tool output and scrolling, command cancellation, Agent cancellation, exit, and terminal restoration. They use mock behavior and do not contact a live provider.
+
+## Explicit limits
+
+Production providers currently do not emit a complete thinking/reasoning stream, so TUI thinking rendering is infrastructure rather than a user-enabled reasoning feature. Native session selectors, tree navigation, Markdown/diff product UX, and other pickers remain roadmap work; this document does not describe them as implemented.
