@@ -192,17 +192,31 @@ impl Agent {
         self.tools.iter().map(|t| t.as_ref() as &dyn Tool).collect()
     }
 
+    /// Allocate the identifier for the next run without starting it.
+    ///
+    /// The SessionController uses this small seam to acknowledge a prompt
+    /// with the real RunId before polling the run future.  The method is
+    /// crate-visible so frontends cannot obtain an Agent or manufacture run
+    /// lifecycle state.
+    pub(crate) fn allocate_run_id(&mut self) -> RunId {
+        self.run_counter += 1;
+        RunId::new(self.run_counter)
+    }
+
     /// Run the agent with a prompt. All events are emitted through the event channel.
     ///
     /// Every `RunStarted` produces exactly one terminal event: `RunFinished`,
     /// `RunAborted`, or `RunFailed`. Each exit path in `run_inner` emits its
     /// terminal event before returning the API result.
     pub async fn run(&mut self, prompt: &str) -> Result<()> {
-        let now = Self::now_ms();
+        let run_id = self.allocate_run_id();
+        self.run_allocated(prompt, run_id).await
+    }
 
-        // Generate a unique RunId for this run
-        self.run_counter += 1;
-        let run_id = RunId::new(self.run_counter);
+    /// Run a previously allocated run. This is the orchestration seam used by
+    /// SessionController; callers outside this crate continue to use `run`.
+    pub(crate) async fn run_allocated(&mut self, prompt: &str, run_id: RunId) -> Result<()> {
+        let now = Self::now_ms();
 
         let user_msg = AgentMessage::User(UserMessage {
             content: MessageContent::Text(prompt.to_string()),

@@ -11,9 +11,12 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::engine::Agent;
+use crate::agent::events::{AgentEvent, RunId};
 use crate::agent::session::session::Session;
 use crate::agent::types::AgentTool;
 use crate::ai::providers::{Model, ProviderApi};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::prompt_templates::{self, PromptTemplate};
 use super::skills::{self, Skill};
@@ -121,19 +124,9 @@ impl PromptSession {
         prompt_session
     }
 
-    /// Access the underlying agent for event subscription etc.
+    #[cfg(test)]
     pub fn agent(&mut self) -> &mut Agent {
         &mut self.agent
-    }
-
-    /// Consume the PromptSession and return the underlying Agent.
-    pub fn into_agent(self) -> Agent {
-        self.agent
-    }
-
-    /// Access the underlying session.
-    pub fn session(&self) -> &Session {
-        self.agent.session()
     }
 
     /// Set the session backing the agent (e.g., a JSONL-persisted session).
@@ -191,16 +184,6 @@ impl PromptSession {
         self.rebuild_system_prompt();
     }
 
-    /// Send a prompt to the agent, expanding templates and skills first.
-    ///
-    /// 1. If the text starts with `/skill:name`, expand the skill command
-    /// 2. Otherwise, if it starts with `/name`, expand the prompt template
-    /// 3. Then send the expanded text to the agent
-    pub async fn prompt(&mut self, text: &str) -> anyhow::Result<()> {
-        let expanded = self.expand(text);
-        self.agent.run(&expanded).await
-    }
-
     /// Try to expand a known skill or prompt template without conflating a
     /// successful identity expansion with an unknown command.
     pub fn try_expand_prompt_command(&self, text: &str) -> PromptExpansion {
@@ -222,12 +205,12 @@ impl PromptSession {
     }
 
     /// Switch the model used by the underlying agent at runtime.
-    pub fn switch_model(&mut self, model: crate::ai::providers::Model) {
+    pub(crate) fn switch_model(&mut self, model: crate::ai::providers::Model) {
         self.agent.switch_model(model);
     }
 
     /// Get the current model from the underlying agent.
-    pub fn model(&self) -> &crate::ai::providers::Model {
+    pub(crate) fn model(&self) -> &crate::ai::providers::Model {
         self.agent.model()
     }
 
@@ -245,6 +228,65 @@ impl PromptSession {
     /// Get the current working directory.
     pub fn cwd(&self) -> &Path {
         &self.prompt_state.cwd
+    }
+
+    // ── Controller-only Agent seam ───────────────────────────────────────
+
+    /// Configure the one event channel owned by the SessionController task.
+    pub(crate) fn set_event_sender(&mut self, tx: mpsc::Sender<AgentEvent>) {
+        self.agent.set_event_sender(tx);
+    }
+
+    /// Replace the current run cancellation parent. Frontends never receive
+    /// this token; the controller keeps the only operational handle.
+    pub(crate) fn set_abort_token(&mut self, token: CancellationToken) {
+        self.agent.set_abort_flag(token);
+    }
+
+    /// Allocate a RunId before the controller acknowledges a prompt.
+    pub(crate) fn allocate_run_id(&mut self) -> RunId {
+        self.agent.allocate_run_id()
+    }
+
+    /// Run expanded prompt text with a RunId allocated by the controller.
+    pub(crate) async fn run_expanded(&mut self, expanded: String, run_id: RunId) -> anyhow::Result<()> {
+        self.agent.run_allocated(&expanded, run_id).await
+    }
+
+    pub(crate) fn list_models(&self) -> Vec<Model> {
+        self.agent.list_models().into_iter().cloned().collect()
+    }
+
+    pub(crate) async fn message_count(&self) -> usize {
+        self.agent.messages().await.len()
+    }
+
+    pub(crate) async fn session_metadata(&self) -> crate::agent::session::types::SessionMetadata {
+        self.agent.session().get_metadata().await
+    }
+
+    pub(crate) async fn session_entries(&self) -> Vec<crate::agent::session::types::SessionTreeEntry> {
+        self.agent.session().get_entries().await
+    }
+
+    pub(crate) fn context_paths(&self) -> Vec<PathBuf> {
+        self.prompt_state
+            .context_files
+            .iter()
+            .map(|context| context.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn skill_names(&self) -> Vec<String> {
+        self.prompt_state
+            .skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect()
+    }
+
+    pub(crate) fn template_names(&self) -> Vec<String> {
+        self.templates.iter().map(|template| template.name.clone()).collect()
     }
 }
 
