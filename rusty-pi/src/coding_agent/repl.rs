@@ -293,6 +293,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_error_keeps_repl_alive_for_following_prompt() {
+        let registry = builtin_registry();
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing/file");
+        let mut session = mock_session();
+        let before = session.system_prompt().to_string();
+        let mut reader = crate::coding_agent::command::MockLineReader::new(vec![
+            format!("/context {}", missing.display()),
+            "ordinary prompt".into(),
+            "/quit".into(),
+        ]);
+        let mut frontend = crate::frontends::PrintFrontend::with_output(crate::frontends::print::MemoryOutput::new());
+
+        run_repl_with_frontend(
+            &mut session,
+            &registry,
+            &mut reader,
+            Path::new("/tmp/history"),
+            &mut frontend,
+        )
+        .await
+        .unwrap();
+
+        let output = frontend.output();
+        assert_eq!(output.stderr_str().matches("Cannot read").count(), 1);
+        assert_eq!(
+            reader.history,
+            vec![
+                format!("/context {}", missing.display()),
+                "ordinary prompt".into(),
+                "/quit".into(),
+            ]
+        );
+        let messages = session.agent().messages().await;
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            crate::ai::types::AgentMessage::User(user)
+                if matches!(&user.content, crate::ai::types::MessageContent::Text(text) if text == "ordinary prompt")
+        )));
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            crate::ai::types::AgentMessage::User(user)
+                if matches!(&user.content, crate::ai::types::MessageContent::Text(text) if text.contains("/context"))
+        )));
+        assert_eq!(session.system_prompt(), before);
+    }
+
+    #[tokio::test]
+    async fn context_invalid_utf8_keeps_repl_alive_for_following_prompt() {
+        let registry = builtin_registry();
+        let directory = tempfile::tempdir().unwrap();
+        let invalid = directory.path().join("invalid.txt");
+        tokio::fs::write(&invalid, [0xff, 0xfe, 0xfd]).await.unwrap();
+        let mut session = mock_session();
+        let before = session.system_prompt().to_string();
+        let mut reader = crate::coding_agent::command::MockLineReader::new(vec![
+            format!("/context {}", invalid.display()),
+            "ordinary prompt".into(),
+            "/quit".into(),
+        ]);
+        let mut frontend = crate::frontends::PrintFrontend::with_output(crate::frontends::print::MemoryOutput::new());
+
+        run_repl_with_frontend(
+            &mut session,
+            &registry,
+            &mut reader,
+            Path::new("/tmp/history"),
+            &mut frontend,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(frontend.output().stderr_str().matches("Cannot read").count(), 1);
+        assert!(session.agent().messages().await.iter().any(|message| matches!(
+            message,
+            crate::ai::types::AgentMessage::User(user)
+                if matches!(&user.content, crate::ai::types::MessageContent::Text(text) if text == "ordinary prompt")
+        )));
+        assert_eq!(session.system_prompt(), before);
+    }
+
+    #[tokio::test]
     async fn repl_model_cancel_continues() {
         let registry = builtin_registry();
         let mut session = mock_session();

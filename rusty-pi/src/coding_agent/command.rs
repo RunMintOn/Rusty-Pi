@@ -40,6 +40,12 @@ impl CommandInvocation {
     pub fn parse(input: &str) -> Option<Self> {
         let input = input.trim_start();
         let rest = input.strip_prefix('/')?;
+        if rest.is_empty() {
+            return Some(Self {
+                name: String::new(),
+                raw_args: String::new(),
+            });
+        }
         let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         if name_end == 0 {
             return None;
@@ -77,13 +83,17 @@ pub enum InputRoute {
 
 /// Resolve input without executing a command or contacting the provider.
 pub fn resolve_input(input: &str, registry: &CommandRegistry, session: &PromptSession) -> InputRoute {
-    match registry.resolve(input) {
+    // Keep command/template recognition identical for the REPL and TUI. The
+    // REPL trims before calling this function, while the TUI passes the draft
+    // verbatim, so normalization belongs at this shared boundary.
+    let normalized = input.trim_start();
+    match registry.resolve(normalized) {
         CommandMatch::Known(invocation) => InputRoute::Command(invocation),
         CommandMatch::NotSlash => InputRoute::AgentPrompt {
             original: input.to_string(),
             expanded: input.to_string(),
         },
-        CommandMatch::UnknownSlash(invocation) => match session.try_expand_prompt_command(input) {
+        CommandMatch::UnknownSlash(invocation) => match session.try_expand_prompt_command(normalized) {
             crate::coding_agent::prompt_session::PromptExpansion::Expanded(expanded) => InputRoute::AgentPrompt {
                 original: input.to_string(),
                 expanded,
@@ -614,7 +624,18 @@ impl Command for ContextCommand {
             tokio::pin!(read);
             tokio::select! {
                 _ = context.cancellation.cancelled() => return Ok(CommandOutcome::none()),
-                result = &mut read => result.map_err(|error| anyhow!("Cannot read {}: {}", path_text, error))?,
+                result = &mut read => match result {
+                    Ok(content) => content,
+                    Err(error) => {
+                        return Ok(CommandOutcome {
+                            result: Some(CommandResult::Error(format!(
+                                "Cannot read {}: {}",
+                                path_text, error
+                            ))),
+                            control: CommandControl::Continue,
+                        });
+                    }
+                },
             }
         };
         if context.cancelled() {
@@ -1032,6 +1053,7 @@ mod tests {
         assert!(matches!(registry.resolve("hello"), CommandMatch::NotSlash));
         assert!(matches!(registry.resolve("/help"), CommandMatch::Known(_)));
         assert!(matches!(registry.resolve("/unknown"), CommandMatch::UnknownSlash(_)));
+        assert!(matches!(registry.resolve("/"), CommandMatch::UnknownSlash(_)));
     }
 
     #[test]
@@ -1262,6 +1284,18 @@ mod tests {
         assert_eq!(session.system_prompt(), before);
     }
 
+    #[tokio::test]
+    async fn context_interaction_infrastructure_failure_remains_a_rust_error() {
+        let mut session = session();
+        let interaction = FailingCommandInteraction::new("terminal failed");
+        let mut context = command_context(&mut session, &interaction);
+        let error = ContextCommand
+            .execute(&CommandInvocation::new("context", ""), &mut context)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("terminal failed"));
+    }
+
     #[test]
     fn truncate_preview_is_unicode_safe() {
         let result = truncate_preview("中文🙂文本", 4);
@@ -1379,18 +1413,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_missing_file_is_an_error_without_mutation() {
+    async fn context_missing_file_is_a_structured_error_without_mutation() {
         let mut session = session();
         let before = session.system_prompt().to_string();
         let interaction = FailingCommandInteraction::new("must not interact");
         let mut context = command_context(&mut session, &interaction);
-        assert!(
-            ContextCommand
-                .execute(&CommandInvocation::new("context", "/missing/context"), &mut context)
-                .await
-                .is_err()
-        );
+        let outcome = builtin_registry()
+            .dispatch(&CommandInvocation::new("context", "/missing/context"), &mut context)
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CommandOutcome {
+                result: Some(CommandResult::Error(message)),
+                control: CommandControl::Continue,
+            } if message.contains("Cannot read /missing/context")
+        ));
         assert_eq!(session.system_prompt(), before);
+    }
+
+    #[tokio::test]
+    async fn context_directory_is_a_structured_error_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = session();
+        let before = session.system_prompt().to_string();
+        let interaction = FailingCommandInteraction::new("must not interact");
+        let mut context = command_context(&mut session, &interaction);
+        let outcome = ContextCommand
+            .execute(
+                &CommandInvocation::new("context", directory.path().to_string_lossy()),
+                &mut context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome.result, Some(CommandResult::Error(message)) if message.contains("Cannot read")));
+        assert_eq!(session.system_prompt(), before);
+    }
+
+    #[tokio::test]
+    async fn context_invalid_utf8_is_a_structured_error_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid.txt");
+        tokio::fs::write(&path, [0xff, 0xfe, 0xfd]).await.unwrap();
+        let mut session = session();
+        let before = session.system_prompt().to_string();
+        let interaction = FailingCommandInteraction::new("must not interact");
+        let mut context = command_context(&mut session, &interaction);
+        let outcome = ContextCommand
+            .execute(&CommandInvocation::new("context", path.to_string_lossy()), &mut context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome.result, Some(CommandResult::Error(message)) if message.contains("Cannot read")));
+        assert_eq!(session.system_prompt(), before);
+    }
+
+    #[test]
+    fn slash_root_is_unknown_slash_not_an_agent_prompt() {
+        let session = session();
+        assert!(matches!(
+            resolve_input("/", &builtin_registry(), &session),
+            InputRoute::UnknownSlash { name } if name.is_empty()
+        ));
+    }
+
+    #[test]
+    fn leading_skill_whitespace_is_normalized_by_shared_router() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("review.md"), "Review $1").unwrap();
+        let session = session_with_resources(vec![directory.path().join("review.md")], vec![]);
+        assert!(matches!(
+            resolve_input("  /review src/", &builtin_registry(), &session),
+            InputRoute::AgentPrompt { expanded, .. } if expanded == "Review src/"
+        ));
     }
 
     #[tokio::test]
