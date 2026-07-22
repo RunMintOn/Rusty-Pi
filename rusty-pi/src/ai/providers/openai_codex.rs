@@ -1,10 +1,9 @@
 //! OpenAI Codex provider — ChatGPT Plus/Pro API.
 //!
 //! Communicates with the `chatgpt.com/backend-api` endpoint using the
-//! OpenAI Responses API wire format. Supports both SSE (HTTP streaming)
-//! and WebSocket transports in the original implementation; the Rust port
-//! currently uses HTTP with full-response reading (SSE streaming planned
-//! in ticket 06).
+//! OpenAI Responses API wire format and HTTP SSE streaming. The Rust provider
+//! owns chunked event parsing and request cancellation; WebSocket transport
+//! is not part of the current provider implementation.
 //!
 //! # Authentication
 //!

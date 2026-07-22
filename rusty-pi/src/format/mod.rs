@@ -4,7 +4,9 @@
 //! [`sparcli`] components and produces `String` output suitable for
 //! testing via `assert!(contains(...))`.
 //!
-//! See `tickets/spec-bare-terminal-architecture.md` for the full design.
+//! The current frontend boundary is documented in `docs/architecture.md` and
+//! the capability status in `docs/capabilities.md`. Earlier bare-terminal
+//! planning is retained under `tickets/` as historical material.
 
 mod out;
 

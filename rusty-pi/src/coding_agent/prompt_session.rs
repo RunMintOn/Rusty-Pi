@@ -1,12 +1,12 @@
-//! PromptSession — a thin session layer that wraps the agent with prompt template and skill expansion.
+//! PromptSession — the current bounded transition layer around the Agent.
 //!
-//! This is the entry point for user prompts. It handles:
-//! - Loading and caching prompt templates and skills
-//! - Expanding /template commands and /skill:name commands before sending to the agent
-//! - Building the system prompt from tools, skills, and project context
+//! This is the current entry point for user prompts. It handles canonical
+//! prompt state, resource loading, Skill/template expansion, context files,
+//! system-prompt rebuilding, and selected model/Agent access used by commands.
 //!
-//! Mirrors the expansion logic in `@earendil-works/pi-coding-agent/src/core/agent-session.ts`
-//! without the event system, compaction, retry, or extension hooks.
+//! It is intentionally a transition layer, not the final SessionController.
+//! Lifecycle orchestration such as steering, follow-up, retry, automatic
+//! compaction, branching, and hooks belongs to the future controller boundary.
 
 use std::path::{Path, PathBuf};
 
