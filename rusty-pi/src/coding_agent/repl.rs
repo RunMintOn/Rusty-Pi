@@ -137,7 +137,14 @@ async fn run_with_abort<O: crate::frontends::print::FrontendOutput>(
     prompt: &str,
     frontend: &mut crate::frontends::print::PrintFrontend<O>,
 ) -> std::io::Result<crate::frontends::print::PrintRunOutcome> {
-    crate::frontends::print::drive_print_run(controller, events, prompt, frontend).await
+    crate::frontends::print::drive_print_run_with_interrupt(
+        controller,
+        events,
+        prompt,
+        frontend,
+        tokio::signal::ctrl_c(),
+    )
+    .await
 }
 
 async fn run_single_shot(

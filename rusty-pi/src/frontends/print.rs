@@ -509,11 +509,33 @@ pub enum PrintRunOutcome {
 ///
 /// The controller remains the owner of the run future and cancellation token;
 /// this adapter only submits input and consumes the one event receiver.
+///
+/// The optional `interrupt_future` is polled alongside controller events. When
+/// it resolves, `cancel_current()` is called once and the driver continues
+/// consuming events until `RunAborted` and `StateChanged(Idle)` are observed.
 pub async fn drive_print_run<O: FrontendOutput>(
     controller: &SessionControllerHandle,
     events: &mut SessionControllerEventReceiver,
     prompt: &str,
     frontend: &mut PrintFrontend<O>,
+) -> io::Result<PrintRunOutcome> {
+    let interrupt = tokio::signal::ctrl_c();
+    drive_print_run_with_interrupt(controller, events, prompt, frontend, interrupt).await
+}
+
+/// Drive a print run with an injectable interrupt future.
+///
+/// Production callers should use [`drive_print_run`] which passes
+/// `tokio::signal::ctrl_c()`. Tests pass a controllable future.
+pub async fn drive_print_run_with_interrupt<
+    O: FrontendOutput,
+    I: std::future::Future<Output = Result<(), tokio::io::Error>>,
+>(
+    controller: &SessionControllerHandle,
+    events: &mut SessionControllerEventReceiver,
+    prompt: &str,
+    frontend: &mut PrintFrontend<O>,
+    interrupt_future: I,
 ) -> io::Result<PrintRunOutcome> {
     let submission = controller
         .submit_prompt(prompt.to_string())
@@ -534,75 +556,95 @@ pub async fn drive_print_run<O: FrontendOutput>(
     let mut output_error: Option<io::Error> = None;
     let mut terminal_seen = false;
     let mut settled = false;
+    let mut interrupt_seen = false;
+    tokio::pin!(interrupt_future);
 
     loop {
         if settled {
             break;
         }
-        let Some(event) = events.recv().await else {
-            let error = crate::agent::events::AgentRunError {
-                phase: crate::agent::events::AgentRunPhase::AgentLoop,
-                message: "controller event channel closed before run settlement".into(),
-            };
-            if output_error.is_none() {
-                output_error = frontend.report_run_error(&error).err();
-            }
-            outcome.get_or_insert(PrintRunOutcome::Failed(error));
-            break;
-        };
-        match event {
-            SessionControllerEvent::Agent {
-                request_id: event_request,
-                event,
-            } if event_request == request_id => {
-                if output_error.is_none()
-                    && let Err(error) = frontend.handle_event(&event)
-                {
-                    let _ = controller.cancel_current().await;
-                    output_error = Some(error);
-                }
+        tokio::select! {
+            event = events.recv() => {
+                let Some(event) = event else {
+                    let error = crate::agent::events::AgentRunError {
+                        phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                        message: "controller event channel closed before run settlement".into(),
+                    };
+                    if output_error.is_none() {
+                        output_error = frontend.report_run_error(&error).err();
+                    }
+                    outcome.get_or_insert(PrintRunOutcome::Failed(error));
+                    break;
+                };
                 match event {
-                    AgentEvent::RunFinished { stop_reason, .. } => {
-                        terminal_seen = true;
-                        outcome = Some(PrintRunOutcome::Finished(stop_reason));
+                    SessionControllerEvent::Agent {
+                        request_id: event_request,
+                        event,
+                    } if event_request == request_id => {
+                        if output_error.is_none()
+                            && let Err(error) = frontend.handle_event(&event)
+                        {
+                            let _ = controller.cancel_current().await;
+                            output_error = Some(error);
+                        }
+                        match event {
+                            AgentEvent::RunFinished { stop_reason, .. } => {
+                                terminal_seen = true;
+                                outcome = Some(PrintRunOutcome::Finished(stop_reason));
+                            }
+                            AgentEvent::RunAborted { .. } => {
+                                terminal_seen = true;
+                                outcome = Some(PrintRunOutcome::Aborted);
+                            }
+                            AgentEvent::RunFailed { error, .. } => {
+                                terminal_seen = true;
+                                outcome = Some(PrintRunOutcome::Failed(error));
+                            }
+                            _ => {}
+                        }
                     }
-                    AgentEvent::RunAborted { .. } => {
-                        terminal_seen = true;
-                        outcome = Some(PrintRunOutcome::Aborted);
+                    SessionControllerEvent::PromptRejected {
+                        request_id: event_request,
+                        reason,
+                    } if event_request == request_id => {
+                        outcome = Some(PrintRunOutcome::Rejected(reason));
                     }
-                    AgentEvent::RunFailed { error, .. } => {
-                        terminal_seen = true;
+                    SessionControllerEvent::StateChanged(activity)
+                        if terminal_seen
+                            && matches!(
+                                activity,
+                                crate::coding_agent::session_controller::ControllerActivity::Idle
+                            ) =>
+                    {
+                        settled = true;
+                    }
+                    SessionControllerEvent::ControllerError { message, .. } if !terminal_seen => {
+                        let error = crate::agent::events::AgentRunError {
+                            phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                            message,
+                        };
+                        if output_error.is_none() {
+                            output_error = frontend.report_run_error(&error).err();
+                        }
                         outcome = Some(PrintRunOutcome::Failed(error));
                     }
                     _ => {}
                 }
             }
-            SessionControllerEvent::PromptRejected {
-                request_id: event_request,
-                reason,
-            } if event_request == request_id => {
-                outcome = Some(PrintRunOutcome::Rejected(reason));
-            }
-            SessionControllerEvent::StateChanged(activity)
-                if terminal_seen
-                    && matches!(
-                        activity,
-                        crate::coding_agent::session_controller::ControllerActivity::Idle
-                    ) =>
-            {
-                settled = true;
-            }
-            SessionControllerEvent::ControllerError { message, .. } if !terminal_seen => {
-                let error = crate::agent::events::AgentRunError {
-                    phase: crate::agent::events::AgentRunPhase::AgentLoop,
-                    message,
-                };
-                if output_error.is_none() {
-                    output_error = frontend.report_run_error(&error).err();
+            result = &mut interrupt_future, if !interrupt_seen => {
+                match result {
+                    Ok(()) => {
+                        interrupt_seen = true;
+                        let _ = controller.cancel_current().await;
+                    }
+                    Err(error) => {
+                        // Infrastructure error in signal handling — treat as interrupt.
+                        interrupt_seen = true;
+                        let _ = controller.cancel_current().await;
+                        let _ = output_error.get_or_insert(error);
+                    }
                 }
-                outcome = Some(PrintRunOutcome::Failed(error));
             }
-            _ => {}
         }
     }
 
@@ -618,6 +660,9 @@ mod tests {
     use super::*;
     use crate::agent::events::{AgentEvent, ProviderError, RunId};
     use crate::ai::types::{Content, StopReason};
+    use crate::coding_agent::session_controller::{
+        CancelResult, ControllerActivity, SessionController, SessionControllerConnection,
+    };
     use crate::test_support::drive_print_run;
     use tokio_util::sync::CancellationToken;
 
@@ -1827,5 +1872,384 @@ mod tests {
         let outcome2 = drive_print_run(&mut agent2, "go", &mut frontend, token2).await;
         assert!(matches!(outcome2, Ok(PrintRunOutcome::Finished(_))));
         assert!(frontend.output().stdout_str().contains("recovered"));
+    }
+
+    // ── Interrupt seam tests (drive_print_run_with_interrupt) ──────────────
+
+    #[tokio::test]
+    async fn print_driver_interrupt_settlement() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+
+        // Use a stalled provider to simulate a long-running tool
+        struct StalledProvider {
+            started: Arc<Notify>,
+            finished: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::ai::providers::ProviderApi for StalledProvider {
+            async fn stream(
+                &self,
+                _model: &crate::ai::providers::Model,
+                _messages: &[crate::ai::types::AgentMessage],
+                _tools: &[&dyn crate::ai::types::Tool],
+                _system_prompt: Option<&str>,
+                context: crate::ai::providers::ProviderRequestContext,
+            ) -> anyhow::Result<crate::ai::providers::ProviderStream> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let cancellation = context.cancellation.child_token();
+                let worker_cancellation = cancellation.clone();
+                let started = self.started.clone();
+                let finished = self.finished.clone();
+                let producer = tokio::spawn(async move {
+                    started.notify_one();
+                    worker_cancellation.cancelled().await;
+                    finished.store(true, Ordering::SeqCst);
+                    drop(tx);
+                });
+                Ok(crate::ai::providers::ProviderStream::new(rx, producer, cancellation))
+            }
+        }
+
+        let session = crate::coding_agent::prompt_session::PromptSession::new(
+            Box::new(StalledProvider {
+                started: started.clone(),
+                finished: finished.clone(),
+            }),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+            vec![],
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp/.pi/agent"),
+            vec![],
+            vec![],
+            false,
+            None,
+            vec![],
+        );
+        let SessionControllerConnection {
+            handle,
+            mut events,
+            task,
+        } = SessionController::spawn(session);
+
+        // Wait for idle state
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, SessionControllerEvent::StateChanged(ControllerActivity::Idle)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("should reach idle");
+
+        // Create a controllable interrupt future
+        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel::<()>();
+        let interrupt_future = async move {
+            interrupt_rx
+                .await
+                .map_err(|_| std::io::Error::other("interrupt channel closed"))
+        };
+        let interrupt_tx = Arc::new(tokio::sync::Mutex::new(Some(interrupt_tx)));
+        let interrupt_tx_clone = interrupt_tx.clone();
+
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        let handle_clone = handle.clone();
+        let mut events_clone = events; // move events into the driver task
+
+        // Spawn the driver task - it will submit the prompt and wait for events
+        let driver_handle = tokio::spawn(async move {
+            drive_print_run_with_interrupt(
+                &handle_clone,
+                &mut events_clone,
+                "stall me",
+                &mut frontend,
+                interrupt_future,
+            )
+            .await
+        });
+
+        // Wait for the provider to start (driver has submitted the prompt)
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("provider should start");
+
+        // Trigger the interrupt
+        if let Some(tx) = interrupt_tx_clone.lock().await.take() {
+            let _ = tx.send(());
+        }
+
+        // Wait for the driver to complete
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), driver_handle)
+            .await
+            .expect("driver should complete")
+            .expect("driver should not panic");
+
+        assert!(matches!(outcome, Ok(PrintRunOutcome::Aborted)));
+        assert!(finished.load(Ordering::SeqCst), "provider should have settled");
+
+        // Shutdown the controller
+        handle.shutdown().await.unwrap();
+        task.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_then_next_run_succeeds() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+
+        struct StalledProvider {
+            started: Arc<Notify>,
+            finished: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::ai::providers::ProviderApi for StalledProvider {
+            async fn stream(
+                &self,
+                _model: &crate::ai::providers::Model,
+                _messages: &[crate::ai::types::AgentMessage],
+                _tools: &[&dyn crate::ai::types::Tool],
+                _system_prompt: Option<&str>,
+                context: crate::ai::providers::ProviderRequestContext,
+            ) -> anyhow::Result<crate::ai::providers::ProviderStream> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let cancellation = context.cancellation.child_token();
+                let worker_cancellation = cancellation.clone();
+                let started = self.started.clone();
+                let finished = self.finished.clone();
+                let producer = tokio::spawn(async move {
+                    started.notify_one();
+                    worker_cancellation.cancelled().await;
+                    finished.store(true, Ordering::SeqCst);
+                    drop(tx);
+                });
+                Ok(crate::ai::providers::ProviderStream::new(rx, producer, cancellation))
+            }
+        }
+
+        let session = crate::coding_agent::prompt_session::PromptSession::new(
+            Box::new(StalledProvider {
+                started: started.clone(),
+                finished: finished.clone(),
+            }),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+            vec![],
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp/.pi/agent"),
+            vec![],
+            vec![],
+            false,
+            None,
+            vec![],
+        );
+        let SessionControllerConnection {
+            handle,
+            mut events,
+            task,
+        } = SessionController::spawn(session);
+
+        // Wait for idle
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, SessionControllerEvent::StateChanged(ControllerActivity::Idle)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("should reach idle");
+
+        // Start a stalled run
+        let _ = handle.submit_prompt("stall").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("provider should start");
+
+        // Cancel via controller
+        let cancel_result = handle.cancel_current().await.unwrap();
+        assert!(matches!(cancel_result, CancelResult::CancellationRequested { .. }));
+
+        // Wait for RunAborted and Idle
+        let mut saw_abort = false;
+        let mut saw_idle = false;
+        while let Some(event) = events.recv().await {
+            match &event {
+                SessionControllerEvent::Agent {
+                    event: AgentEvent::RunAborted { .. },
+                    ..
+                } => saw_abort = true,
+                SessionControllerEvent::StateChanged(ControllerActivity::Idle) if saw_abort => {
+                    saw_idle = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_abort, "should see RunAborted");
+        assert!(saw_idle, "should see Idle after RunAborted");
+        assert!(finished.load(Ordering::SeqCst), "provider should have settled");
+
+        // Next run should succeed
+
+        // We can't easily swap the provider in the controller, so just verify
+        // the controller accepts a new prompt and reaches Running state
+        let submission = handle.submit_prompt("next").await.unwrap();
+        assert!(matches!(submission, PromptSubmission::Accepted { .. }));
+
+        // Wait for the second run to start (StateChanged to Running)
+        let mut saw_running = false;
+        while let Some(event) = events.recv().await {
+            if let SessionControllerEvent::StateChanged(ControllerActivity::Running { .. }) = &event {
+                saw_running = true;
+                break;
+            }
+        }
+        assert!(saw_running, "second run should reach Running state");
+
+        // Cancel the second run too
+        let _ = handle.cancel_current().await.unwrap();
+
+        // Wait for idle
+        while let Some(event) = events.recv().await {
+            if let SessionControllerEvent::StateChanged(ControllerActivity::Idle) = &event {
+                break;
+            }
+        }
+
+        handle.shutdown().await.unwrap();
+        task.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_error_still_cancels_and_settles() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+
+        struct StalledProvider {
+            started: Arc<Notify>,
+            finished: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::ai::providers::ProviderApi for StalledProvider {
+            async fn stream(
+                &self,
+                _model: &crate::ai::providers::Model,
+                _messages: &[crate::ai::types::AgentMessage],
+                _tools: &[&dyn crate::ai::types::Tool],
+                _system_prompt: Option<&str>,
+                context: crate::ai::providers::ProviderRequestContext,
+            ) -> anyhow::Result<crate::ai::providers::ProviderStream> {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let cancellation = context.cancellation.child_token();
+                let worker_cancellation = cancellation.clone();
+                let started = self.started.clone();
+                let finished = self.finished.clone();
+                let producer = tokio::spawn(async move {
+                    started.notify_one();
+                    worker_cancellation.cancelled().await;
+                    finished.store(true, Ordering::SeqCst);
+                    drop(tx);
+                });
+                Ok(crate::ai::providers::ProviderStream::new(rx, producer, cancellation))
+            }
+        }
+
+        let session = crate::coding_agent::prompt_session::PromptSession::new(
+            Box::new(StalledProvider {
+                started: started.clone(),
+                finished: finished.clone(),
+            }),
+            crate::ai::providers::Model {
+                id: "mock",
+                api: "mock",
+            },
+            vec![],
+            std::path::PathBuf::from("/tmp"),
+            std::path::PathBuf::from("/tmp/.pi/agent"),
+            vec![],
+            vec![],
+            false,
+            None,
+            vec![],
+        );
+        let SessionControllerConnection {
+            handle,
+            mut events,
+            task,
+        } = SessionController::spawn(session);
+
+        // Wait for idle
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, SessionControllerEvent::StateChanged(ControllerActivity::Idle)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("should reach idle");
+
+        // Create an interrupt future that immediately errors
+        let interrupt_future = async { Err(std::io::Error::other("signal handling failure")) };
+
+        let mut frontend = PrintFrontend::with_output(MemoryOutput::new());
+        let handle_clone = handle.clone();
+        let mut events_clone = events;
+
+        // The driver should submit the prompt, immediately get an interrupt error,
+        // cancel the run, and wait for settlement even with the error
+        let driver_handle = tokio::spawn(async move {
+            drive_print_run_with_interrupt(
+                &handle_clone,
+                &mut events_clone,
+                "stall",
+                &mut frontend,
+                interrupt_future,
+            )
+            .await
+        });
+
+        // Wait for provider to start (driver submitted the prompt)
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("provider should start");
+
+        // Wait for the driver to complete
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), driver_handle)
+            .await
+            .expect("driver should complete")
+            .expect("driver should not panic");
+
+        // The error should be propagated, but the run should still be cancelled
+        assert!(outcome.is_err(), "interrupt error should propagate");
+        assert!(finished.load(Ordering::SeqCst), "provider should have settled");
+
+        // Verify the error message
+        let error = outcome.unwrap_err();
+        assert!(error.to_string().contains("signal handling failure"));
+
+        handle.shutdown().await.unwrap();
+        task.join().await.unwrap();
     }
 }
