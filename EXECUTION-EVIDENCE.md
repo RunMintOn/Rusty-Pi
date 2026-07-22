@@ -1,182 +1,144 @@
-# M0-B2 Execution Evidence
+# M0-B2 Execution Evidence — correction
 
-## A. Repository state
-
-- Expected baseline: `158ecff16ac8953bd81e5be7685d277710b0b3b6`.
-- Actual initial HEAD: `f3f1d7ad177b983a1ddca6a9b1932d125971b927` (`MAINTENANCE.md` documentation-only commit), accepted by the user before implementation.
-- Initial branch: `master`.
-- Initial status: ` M .gitignore` only.
-- Implementation HEAD before this evidence document: `a68faf5`.
-- Final delivery HEAD: see `git rev-parse HEAD`; this document is tracked separately from production changes.
-- `.gitignore` was never staged, changed, restored, or committed.
-
-## B. Async command boundary
-
-`rusty-pi/src/coding_agent/command.rs` now provides:
-
-- async-trait `Command::execute(&CommandInvocation, &mut CommandContext) -> Result<CommandOutcome>`;
-- `CommandInvocation { name, raw_args }`, with `has_args()` and `trimmed_args()`;
-- `CommandContext { session, interaction, cancellation }`;
-- `CommandOutcome { result: Option<CommandResult>, control: CommandControl }`;
-- `CommandControl::{Continue, Quit}`.
-
-`/session`, `/tree`, and `/list-sessions` directly await Session/JSONL APIs. Tree previews use character-count truncation (`truncate_preview`) and never byte-slice UTF-8. Production command code has no `OnceLock`, `Runtime::new`, `block_on`, or `thread::scope` workaround.
-
-`CommandResult::Quit` and `CommandResult::Noop` were removed. Quit is represented only by `CommandControl::Quit`.
-
-## C. Input routing
-
-`resolve_input()` in `command.rs` is shared by REPL and TUI:
-
-| Input | Route | Agent called | Session message | TUI User block |
-|---|---|---:|---:|---:|
-| normal prompt | `AgentPrompt(original, expanded)` | yes | yes | yes |
-| `/help` | `Command` | no | no | no |
-| `/model codex` | `Command` | no | no | no |
-| `/skill:known` | expanded `AgentPrompt` | yes | yes | yes, original text |
-| `/template-known` | expanded `AgentPrompt` | yes | yes | yes, original text |
-| `/unknown` | `UnknownSlash` | no | no | no |
-
-The registry only recognizes built-ins. PromptSession now exposes exact `PromptExpansion` matching; Skill matching precedes template matching, and a matched expansion equal to the original text remains matched. Built-ins therefore take precedence over same-name templates. Unknown `/skill:xxx` is not sent to the provider.
-
-## D. Interaction ownership
-
-- REPL: `InquireCommandInteraction` in `coding_agent/repl.rs`; `Select` and `Text` run via `tokio::task::spawn_blocking`. User cancellation maps to `InteractionResult::Cancelled`; join and terminal errors remain `Err`.
-- TUI: `UnavailableCommandInteraction`; it never reads stdin, writes stdout, imports the blocking picker, or changes terminal mode.
-- Tests: `MockCommandInteraction`, `DelayedCommandInteraction`, and `FailingCommandInteraction`.
-
-Static check:
+## Repository state
 
 ```text
-rg inquire rusty-pi/src/tui rusty-pi/src/main.rs rusty-pi/src/coding_agent/command.rs
-(no matches)
+Initial HEAD: b83f8dcd576df309853b12c02e96ff19e91c2007
+Final code HEAD: ff5a2136eba31f7e77b65cebc85d0862e776f08b
+Branch: master
+Initial status: M .gitignore
 ```
 
-The removed `Picker`, `RealPicker`, and `MockPicker` APIs have no remaining source/test references.
-
-## E. TUI lifecycle
-
-`AppState::submit()` records history and emits `Effect::SubmitInput` without creating a User block or starting an Agent run. Routing then emits either:
-
-- `AgentPromptStarted { original, expanded }`: creates the original User block and starts the Agent with expanded text;
-- `CommandStarted`: enters `CommandRunning`, with no User block;
-- `InputRouteError`: creates one Error block for unknown slash input.
-
-Activity states are `Idle`, `AgentRunning`, `AgentCancelling`, `CommandRunning`, and `CommandCancelling`. Ctrl+C emits the matching cancellation effect. Command Enter is rejected while running. `drive_command_with_ui()` in `main.rs` redraws, processes resize/navigation, polls the command future, and waits for cooperative cancellation without a detached task, extra runtime, or extra OS thread. Command completion renders System/Error blocks and returns to Idle; cancellation produces one `Command cancelled` block.
-
-The existing Agent cancellation path remains covered by the prior and current PTY/unit tests.
-
-## F. Command matrix
-
-| Command | Async operation | REPL no-arg | TUI no-arg | Parameter mode |
-|---|---|---|---|---|
-| `/help` | registry metadata | metadata output | System block | N/A |
-| `/exit`, `/quit` | none | quit control and save history | `Effect::Quit`, guard restores terminal | N/A |
-| `/model` | provider model listing | Inquire select | usage message, no picker | exact model ID; already-current and invalid/list cases tested |
-| `/context` | `tokio::fs::read_to_string` | Inquire input | usage message, no picker | raw path text retained; Unicode/spaces supported |
-| `/session` | await metadata/count/model | message | System block | N/A |
-| `/tree` | await entries | message | System block | UTF-8-safe preview |
-| `/list-sessions` | async `read_dir`, JSONL open/entries | message/table | System block | corrupt JSONL skipped and counted |
-
-## G. Session isolation
-
-Command tests and TUI reducer tests verify that commands do not create Agent user transcript blocks or invoke the provider. `/context` changes only canonical system-prompt state. `/model` changes the active model without a provider request. `/help`, `/session`, `/tree`, and `/list-sessions` are read-only with respect to the Agent conversation. Command paths do not allocate an Agent RunId or emit AgentEvents.
-
-## H. Skill/template evidence
-
-`PromptSession::try_expand_prompt_command()` uses `skills::try_expand_skill_command()` followed by `prompt_templates::try_expand_prompt_template()`. Tests cover known Skill, known template, built-in/template precedence, unknown slash, unknown Skill, preserved argument/path text, and identity expansion.
-
-## I. PTY evidence
-
-`tests/pty_smoke.rs` now covers:
-
-- `/model` without arguments: sees `Use: /model`, exits successfully within the existing five-second process timeout, and restores the terminal;
-- `/context` without arguments: sees `Use: /context`, does not enter a hidden picker, exits successfully, and restores the terminal;
-- `/context <temporary path>`: sees `Added`, exits successfully, and restores the terminal;
-- existing prompt, tool, resize/navigation, Ctrl+C, and `/quit` cases.
-
-PTY tests assert successful exit, join the reader thread, reap the child, verify the PID disappears, and check no zombie remains. PTY suite was run 30 consecutive times.
-
-## J. PI references read
-
-Reference files read:
-
-- `packages/coding-agent/src/core/agent-session.ts`: `AgentSession.prompt`, `_tryExecuteExtensionCommand`, `_expandSkillCommand`, `sendUserMessage`, model management;
-- `packages/coding-agent/src/modes/interactive/interactive-mode.ts`: interactive initialization, autocomplete composition, mode ownership, startup/run flow;
-- `packages/coding-agent/src/modes/print-mode.ts`: `runPrintMode` and output/disposal flow;
-- `packages/coding-agent/docs/usage.md`: slash command, session, prompt, model, and mode behavior;
-- `packages/coding-agent/docs/extensions.md`: extension command handling, UI interaction ports, input routing, and `ctx.waitForIdle()`.
-
-Adopted principles: command handlers are async and frontend-neutral; command checks precede prompt expansion; Skill/template expansion is distinct from command handling; frontend UI owns interaction. Rejected for this milestone: native TUI pickers, extension/plugin registry, Session Controller, RPC, and SDK compatibility.
-
-## K. Test results
-
-Final validation from `rusty-pi/`:
+`.gitignore` was not modified, staged, or committed by this execution. The two
+implementation commits are:
 
 ```text
-cargo fmt --check: exit 0
-cargo clippy --locked --all-targets --all-features: exit 0
-cargo test --locked: exit 0
+0a202c8 fix(commands): keep user errors inside the frontend
+ff5a213 test(tui): exercise command polling and cancellation
 ```
 
-Final suite counts:
+## Context error matrix
+
+| Scenario | Rust Err | CommandResult::Error | Frontend exits | State mutated |
+| -------- | -------: | -------------------: | -------------: | ------------: |
+| Missing file | no | yes | no | no |
+| Directory path | no | yes | no | no |
+| Invalid UTF-8 | no | yes | no | no |
+| Cancelled read | no | no (`CommandOutcome::none`) | no | no |
+| Interaction infrastructure failure | yes | no | caller-defined | no |
+
+The `ContextCommand` maps `tokio::fs::read_to_string` errors—including
+not-found, directory, and invalid UTF-8 errors—to `CommandResult::Error` while
+preserving the canonical system prompt. Cancellation remains
+`CommandOutcome::none()`. Interaction failures still propagate as `anyhow::Error`.
+
+## REPL evidence
+
+`context_error_keeps_repl_alive_for_following_prompt` drives the real chain:
 
 ```text
-discovered: 468
-executed:   467
-passed:     467
-failed:     0
-ignored:    1
+MockLineReader → shared resolve_input → CommandRegistry → ContextCommand → PrintFrontend<MemoryOutput>
 ```
 
-Breakdown: 442 library tests, 7 binary tests, 10 binary smoke tests, 7 PTY tests, 1 passing doctest, 1 ignored doctest. No new Clippy warning category was introduced; existing historical warnings remain and were not hidden with new `allow` attributes.
+The sequence `/context <missing>`, `ordinary prompt`, `/quit` renders one
+context error, calls the mock Agent for the ordinary prompt, excludes `/context`
+from the Agent session, leaves the system prompt unchanged, and exits through
+`/quit`. Invalid UTF-8 has the same continuous-REPL coverage in
+`context_invalid_utf8_keeps_repl_alive_for_following_prompt`.
 
-Repeated validation:
+## Driver evidence
+
+`rusty-pi/src/tui/command_driver.rs` provides the injectable
+`drive_command_core<C, E, R>` seam. The command future is pinned and awaited;
+no command task is detached.
+
+| Event | Command pending | State effect | Verified test |
+| ----- | --------------: | ------------ | ------------- |
+| No event tick | yes | redraw | `driver_redraws_on_no_event_ticks_until_command_finishes` |
+| Synthetic Resize | yes | terminal size reduced | `driver_polls_pending_command_with_resize_navigation_ctrl_c_and_redraw` |
+| Synthetic PageUp | yes | browsing mode | `driver_polls_pending_command_with_resize_navigation_ctrl_c_and_redraw` |
+| Synthetic Enter | yes | no second submit/command | `driver_polls_pending_command_with_resize_navigation_ctrl_c_and_redraw` |
+| Synthetic Ctrl+C | yes | cancellation effect/token | `driver_polls_pending_command_with_resize_navigation_ctrl_c_and_redraw` |
+| Command settlement | until settled | one `CommandCancelled`, then Idle | `driver_waits_for_command_settlement_after_cancellation` |
+
+The reducer test `command_error_is_one_error_block_idle_and_ready_for_next_input`
+verifies that `CommandResult::Error` creates one Error block, returns to Idle,
+creates no User block, and accepts the next input. Driver tests also verify no
+Agent RunId or AgentEvent is created during command polling and that a normal
+prompt can be submitted after cancellation.
+
+## Lifecycle evidence
 
 ```text
-Full suite:             10 consecutive runs, all passed
-Command/resolver:       30 consecutive runs, all passed (40 tests/run)
-TUI lifecycle/state:     30 consecutive runs, all passed (24 tests/run)
-PTY:                    30 consecutive runs, all passed (7 tests/run)
-Race/hang observed:     none after the cancellation pre-check fix
-Residual tasks/processes: none observed
+Ctrl+C → token cancelled → command observed cancellation →
+command settlement confirmed → driver returned → next input succeeded
 ```
 
-## L. Commits
+The delayed test command observes cancellation only after a real pending period
+and performs settlement work before returning. Redraw, resize, navigation,
+Ctrl+C, settlement, and post-cancellation input were exercised without
+`--test-threads=1`.
+
+## PTY smoke
+
+`real_tui_pty_ctrl_c_cancels_delayed_command_and_accepts_next_input` opts into
+the debug-only `RUSTY_PI_TUI_TEST_DELAYED_COMMAND` registry seam, starts the
+TUI on a real PTY, submits `/test-delayed`, sends navigation and real PTY
+`0x03`, waits for `Command cancelled`, submits `/help`, then `/quit`. The PTY
+helper waits for successful child exit, reaps the child, joins its reader, and
+checks that the PID is gone and not a zombie.
+
+No real provider or network endpoint is used.
+
+## Routing boundaries
+
+- `/` resolves to `UnknownSlash`, never an Agent prompt.
+- Leading whitespace is normalized at the shared router, so REPL and TUI both
+  expand `  /review src/` as the same template/skill route.
+- No shell parser was introduced for this boundary.
+
+## Validation
 
 ```text
-3fa5708 refactor(commands): make command execution asynchronous
-  Async command contract, invocation/context/outcome, built-in registry,
-  async Session commands, exact expansion APIs, UTF-8 tree preview, picker removal.
-
-6706aa5 refactor(commands): move interaction behind frontend adapters
-  REPL Inquire adapter, async REPL routing, structured command rendering.
-
-8327b95 fix(tui): drive slash commands without blocking terminal ownership
-  Shared TUI resolver wiring, command lifecycle states/driver, deferred User block,
-  command PTY smoke coverage and updated snapshots.
-
-0103f0e fix(commands): honor cancellation before session listing
-  Prevents a pre-cancelled list command from returning an empty result.
-
-a68faf5 test(commands): cover builtin session isolation
-  Verifies built-ins do not append conversation messages or call the provider.
+cargo fmt --check                         passed
+cargo clippy --locked --all-targets --all-features passed
+cargo test --locked                       passed
 ```
 
-## M. Deviations
+The suite reported 453 library tests, 7 binary tests, 10 binary smoke tests,
+8 PTY tests, 1 passing doctest, and 1 existing ignored doctest. No new
+`#[ignore]` was added. The full suite passed 10 consecutive runs. Each of the
+following passed 30 consecutive runs:
 
-- The brief's accepted documentation-only HEAD divergence was used after explicit user confirmation.
-- No native Ratatui model/file picker was implemented; TUI no-argument commands intentionally return usage messages.
-- No full shell quoting parser, RPC, SDK, Session Controller, plugin registry, or single-shot built-in command behavior was added.
-- The command driver remains wired to the existing crossterm event source in the binary; reducer/lifecycle behavior is independently testable without a real terminal.
-- Existing Clippy warnings outside the changed command boundary were intentionally left untouched.
+```text
+context_error_keeps_repl_alive_for_following_prompt
+context_invalid_utf8_keeps_repl_alive_for_following_prompt
+driver_polls_pending_command_with_resize_navigation_ctrl_c_and_redraw
+driver_waits_for_command_settlement_after_cancellation
+driver_redraws_on_no_event_ticks_until_command_finishes
+real_tui_pty_ctrl_c_cancels_delayed_command_and_accepts_next_input
+```
 
-## N. Final Git state
+Clippy's pre-existing warnings outside this change remain; no warning was
+introduced by the new driver or command tests.
 
-Expected final status after committing this evidence document:
+## Deviations
+
+None from the requested scope. Native TUI pickers, Session Controller, RPC,
+SDK, plugins, autocomplete, and visual redesign remain untouched. The delayed
+PTY command exists only behind a debug-build test environment variable and is
+not in the normal production registry.
+
+## Delivery
+
+```text
+Archive: pi-rust-head-<final-head-7>.tar.gz
+Archive SHA-256: reported with the final delivery
+Bundle: pi-rust-head-<final-head-7>.bundle
+```
+
+Expected final working-tree status (the pre-existing user change only):
 
 ```text
  M .gitignore
 ```
-
-The evidence document does not modify `.gitignore`.
