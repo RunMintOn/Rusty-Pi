@@ -11,16 +11,25 @@ Context:
 
 Decision:
 
-Keep `PromptSession` as the current transition business layer. It may continue to provide the shared prompt/resource seam needed by the existing REPL, single-shot path, TUI, and Command system, but it must not grow without a deliberate boundary decision. Future orchestration will move incrementally to `SessionController`/`AgentSession` rather than requiring a broad refactor in this milestone.
+Keep `PromptSession` as a bounded transition layer and move ownership and
+orchestration into the task-owned `SessionController`. PromptSession remains
+the canonical prompt-state/resource seam, but no frontend or CommandContext
+may hold it. Future orchestration will move incrementally to the controller
+rather than making PromptSession a second lifecycle owner.
 
 ADR 006 records the related future controller direction. It complements this decision rather than superseding it.
 
 Consequences:
 
-- Existing code can keep using PromptSession without a disruptive rewrite.
+- Existing prompt-state behavior remains in PromptSession without a disruptive
+  wire-format or Agent-loop rewrite.
+- The M1-A controller owns the long-lived PromptSession and exposes explicit
+  business requests instead of internal-object access.
 - Documentation must describe its current responsibilities and its transitional status.
 - New lifecycle concerns such as steering, follow-up, retry, compaction orchestration, branching, and hooks belong in the future controller direction.
-- This ADR does not claim that SessionController exists or that those capabilities are Available.
+- M1-A makes only the ownership/lifecycle foundation Available. Steering,
+  follow-up, retry, compaction orchestration, branching, and hooks remain
+  Planned.
 
 Supersedes: None
 Superseded by: None

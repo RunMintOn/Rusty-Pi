@@ -23,12 +23,15 @@ This is the authoritative list of what Rusty-Pi currently supports. Statuses des
 | Run cancellation | Available |
 | Provider transport cancellation | Available |
 | Tool process cleanup | Available |
+| SessionController ownership/lifecycle foundation | Available |
 | Retry orchestration | Planned |
 | Steering | Planned |
 | Follow-up queue | Planned |
 | Hook lifecycle | Planned |
 
-`AgentEvent` is the sole business event path from Agent to frontend. `RunFinished`, `RunAborted`, and `RunFailed` form the terminal event contract.
+`AgentEvent` is the sole business event path from Agent to frontend. The
+task-owned SessionController forwards the event unchanged; `RunFinished`,
+`RunAborted`, and `RunFailed` form the terminal event contract.
 
 ## Providers
 
@@ -65,6 +68,7 @@ The four core tools are a product choice. Bash provides broad capability; the st
 | Resume | Available |
 | Session listing | Available |
 | Tree inspection | Available |
+| Controller-owned prompt lifecycle | Available |
 | Branch data/API | Infrastructure |
 | Interactive branch navigation | Planned |
 | Thinking-level metadata | Infrastructure |

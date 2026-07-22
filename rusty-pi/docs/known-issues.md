@@ -16,6 +16,12 @@ Compaction entries, JSONL serialization, context transforms, and summary reconst
 
 ## Future interfaces are not current interfaces
 
-JSON output, RPC/headless mode, native TUI session/tree navigation, the independent plugin protocol, SDKs, and live-provider evaluation are roadmap items. See [the roadmap](../docs/roadmap.md) rather than treating these as current runtime features.
+Steering, follow-up, retry, prompt queueing, automatic compaction, branch
+navigation, hooks, JSON output, RPC/headless mode, native TUI session/tree
+navigation, the independent plugin protocol, SDKs, and live-provider
+evaluation are roadmap items. SessionController owns the M1-A lifecycle
+foundation, but it deliberately does not provide those future operations. See
+[the roadmap](../docs/roadmap.md) rather than treating these as current runtime
+features.
 
 If a newly observed problem cannot be confirmed from source and tests, record it as **Needs verification** instead of guessing.

@@ -6,7 +6,13 @@ This roadmap is directional, not a release-date commitment. Rusty-Pi does not us
 
 Make product positioning, current runtime behavior, architecture boundaries, capability status, and historical planning documents agree.
 
-## M1 — SessionController / AgentSession
+## M1-A — SessionController ownership and lifecycle foundation (complete)
+
+- task-owned PromptSession, Agent, session storage, run future, and cancellation;
+- shared prompt submission for single-shot, REPL, and TUI;
+- controller event forwarding, snapshots, model/context/session operations, and shutdown.
+
+## M1 — SessionController / AgentSession follow-up work
 
 - prompt lifecycle;
 - steering;
@@ -19,6 +25,10 @@ Make product positioning, current runtime behavior, architecture boundaries, cap
 - compaction orchestration;
 - branching;
 - hooks.
+
+M1-A intentionally does not implement steering, follow-up, retry, queueing,
+automatic compaction, branch navigation, hooks, or controller-owned resource
+reload orchestration. Those remain Planned.
 
 ## M2 — TUI productization
 

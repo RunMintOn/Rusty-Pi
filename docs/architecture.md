@@ -8,10 +8,13 @@ This document describes the code that exists today. Future boundaries are labell
 CLI arguments / REPL / TUI
           ↓
 Shared input routing
-          ↓
-Built-in Command or PromptSession
-          ↓
-Agent
+          ├── Built-in Command → SessionControllerHandle
+          └── Prompt candidate → SessionControllerHandle
+                                      ↓
+                              SessionController task
+                              ├── PromptSession
+                              ├── Agent
+                              └── Session storage
           ↓
 Provider / Tool / Session storage
 ```
@@ -48,7 +51,10 @@ AgentEvent
    └── Ratatui TUI
 ```
 
-`AgentEvent` is the only Agent-to-frontend business event path. Legacy text and tool callbacks have been removed. A run emits one terminal event: `RunFinished`, `RunAborted`, or `RunFailed`.
+`AgentEvent` is the only Agent-to-frontend business event path. The
+SessionController forwards it without reconstructing or altering events.
+Legacy text and tool callbacks have been removed. A run emits one terminal
+event: `RunFinished`, `RunAborted`, or `RunFailed`.
 
 ## Domain ownership
 
@@ -61,6 +67,9 @@ Agent owns:
 - run cancellation;
 - tool execution;
 - provider streaming.
+
+The Agent is owned by the SessionController task. Frontends do not configure,
+run, or cancel it directly.
 
 Agent does not own:
 
@@ -80,14 +89,27 @@ Agent and Provider do not write to the terminal. They emit data and events for f
 - Skill and prompt-template expansion;
 - context files;
 - resource-reload infrastructure (a reload method and unit tests, without a CLI, Command, or TUI entry point);
-- access to the current model and Agent;
-- the parts of the business surface needed by the Command system.
+- canonical prompt-state operations used by the controller;
+- system-prompt rebuilding and resource expansion.
 
 Skill/template expansion becomes an Agent prompt. A built-in Command is not written as a user message into the Agent Session.
 
 PromptSession is a transition layer and must not expand without a boundary:
 
 > PromptSession is a transition layer; it must not continue growing without limit.
+
+### SessionController
+
+The SessionController is a permanent, frontend-neutral Tokio task. It owns the
+PromptSession, Agent, session storage, active run future, cancellation token,
+and Agent event receiver. Frontends receive only a cloneable handle and one
+event receiver. Requests use explicit oneshot replies; mutations received
+while a run is active return `Busy` rather than queueing.
+
+It currently owns prompt acceptance/rejection, resource expansion, model and
+context mutations, read-only snapshots, tree access, cancellation, event
+forwarding, and orderly shutdown. Steering, follow-up, retry, compaction,
+branch navigation, hooks, and resource reload orchestration remain planned.
 
 ### Command system
 
@@ -107,7 +129,7 @@ REPL and TUI use the same command registry and async command contract. The REPL 
 
 ### Frontends
 
-`PrintFrontend` owns the single-shot and REPL adapters, stdout/stderr semantics, and an automation-friendly output sink. It consumes AgentEvent and never becomes a second Agent implementation.
+`PrintFrontend` owns the single-shot and REPL adapters, stdout/stderr semantics, and an automation-friendly output sink. It consumes AgentEvent forwarded by SessionController and never becomes a second Agent implementation.
 
 Ratatui owns the primary interactive interface: input and terminal ownership, transcript state, command lifecycle, cancellation effects, and AgentEvent rendering. `TerminalGuard` restores terminal state on normal exit, errors, and panic unwinding.
 
@@ -117,19 +139,21 @@ The TUI currently provides multiline input, process-local history, scrolling/nav
 
 The current Agent uses `PromptSession` and the high-level `Session` API. Session storage has JSONL and in-memory implementations. JSONL persistence, resume, listing, and tree inspection are current tested entry points. Branch APIs and thinking/compaction metadata are recorded as infrastructure in the capability matrix; interactive branch navigation, complete thinking/reasoning transport, and automatic compaction are future work.
 
-## Future SessionController insertion point
+## SessionController insertion point
 
-The accepted future insertion point is:
+The implemented insertion point is:
 
 ```text
 Frontends
     ↓
-SessionController / AgentSession
+SessionControllerHandle
+    ↓
+SessionController task
     ↓
 PromptSession / Agent / Session storage
 ```
 
-The future controller should own:
+Future controller work should add:
 
 - prompt lifecycle;
 - steering;
@@ -143,4 +167,6 @@ The future controller should own:
 - resource reload;
 - hooks.
 
-This controller is not present today. Its accepted architecture direction does not make any of those capabilities Available. See the [ADR directory](adr/) and [roadmap](roadmap.md).
+The ownership/lifecycle foundation is Available. The listed future concerns
+remain Planned until independently wired and tested. See the [ADR directory](adr/)
+and [roadmap](roadmap.md).

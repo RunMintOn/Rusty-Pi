@@ -11,24 +11,37 @@ Prompt lifecycle and session orchestration are currently spread across transitio
 
 Decision:
 
-Introduce a future `SessionController`/`AgentSession` layer between frontends and the current PromptSession, Agent, and Session storage layers:
+Introduce a task-owned `SessionController` layer between frontends and the
+current PromptSession, Agent, and Session storage layers:
 
 ```text
 Frontends
     ↓
-SessionController / AgentSession
+SessionControllerHandle
+    ↓
+SessionController task
     ↓
 PromptSession / Agent / Session storage
 ```
 
-The controller's intended responsibilities are prompt lifecycle, steering, follow-up, retry, compaction orchestration, branching, model changes, enabled tools, context transformation, resource reload, and hooks. Frontends remain adapters and must not independently implement these concerns.
+The controller currently owns prompt lifecycle, resource expansion, model and
+context mutations, snapshots, cancellation, AgentEvent forwarding, and
+shutdown. Its intended future responsibilities include steering, follow-up,
+retry, compaction orchestration, branching, enabled tools, context
+transformation, resource reload, and hooks. Frontends remain adapters and must
+not independently implement these concerns.
 
 Consequences:
 
 - Lifecycle behavior will have one business owner shared by REPL, TUI, single-shot, and future headless modes.
 - PromptSession can remain a bounded transition seam while responsibilities move gradually.
-- The direction enables future native pickers and protocol frontends without duplicating Agent/Session behavior.
-- Accepted architecture direction does not mean implemented capability. The controller is not present in the current runtime, and its responsibilities remain Planned until production wiring and tests exist.
+- The ownership/lifecycle foundation is production-wired and tested; it is
+  Available in the capability matrix.
+- The direction enables future native pickers and protocol frontends without
+  duplicating Agent/Session behavior.
+- Accepted architecture direction does not make the future orchestration
+  responsibilities Available; they remain Planned until independently wired
+  and tested.
 
 Supersedes: None
 Superseded by: None

@@ -99,6 +99,40 @@ fn source_positioning_does_not_claim_a_complete_rewrite() {
 }
 
 #[test]
+fn controller_ownership_boundaries_are_not_regressed() {
+    for file in [
+        "rusty-pi/src/main.rs",
+        "rusty-pi/src/coding_agent/repl.rs",
+        "rusty-pi/src/frontends/print.rs",
+        "rusty-pi/src/tui/app.rs",
+        "rusty-pi/src/tui/command_driver.rs",
+    ] {
+        let source = read_repo_file(file);
+        for forbidden in [
+            ".agent().run",
+            "Agent::run",
+            "set_event_sender",
+            "set_abort_flag",
+            "tokio::sync::broadcast",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{file} bypasses controller with {forbidden}"
+            );
+        }
+    }
+
+    let command = read_repo_file("rusty-pi/src/coding_agent/command.rs");
+    assert!(!command.contains("&mut PromptSession"));
+    assert!(!command.contains("session: &mut PromptSession"));
+
+    let controller = read_repo_file("rusty-pi/src/coding_agent/session_controller.rs");
+    assert!(controller.contains("pub struct SessionControllerConnection"));
+    assert!(controller.contains("tokio::spawn(run_controller"));
+    assert!(!controller.contains("tokio::sync::broadcast"));
+}
+
+#[test]
 fn cli_help_uses_independent_product_positioning() {
     let output = Command::new(env!("CARGO_BIN_EXE_rusty-pi"))
         .arg("--help")
