@@ -320,6 +320,124 @@ fn single_shot_tool_call_stderr_has_diagnostics() {
 }
 
 #[test]
+/// Real single-shot SIGINT test: spawns the binary with a slow mock tool,
+/// sends a real SIGINT signal to the child PID, and verifies exit code 130.
+///
+/// Uses `RUSTY_PI_MOCK_TOOL=sleep 30` so the bash tool runs a slow command
+/// that can be interrupted. The mock provider emits a single tool call, then
+/// the agent engine executes it via the bash tool.
+///
+/// This is NOT a pipe-level Ctrl+C byte — it is a real OS signal.
+#[test]
+fn real_single_shot_sigint_cancels_settles_and_exits_130() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let mut cmd = Command::new(binary_path());
+    cmd.arg("-p")
+        .arg("mock")
+        .env("RUSTY_PI_MOCK_TOOL", "sleep 30")
+        .arg("run a slow tool");
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn rusty-pi");
+    let pid = child.id();
+
+    // Read stderr in a background thread to detect tool start.
+    let stderr = child.stderr.take().expect("stderr pipe");
+    let (tx, rx) = mpsc::channel();
+    let reader_thread = thread::spawn(move || {
+        let mut reader = stderr;
+        let mut buf = String::new();
+        let mut full_output = String::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&chunk[..n]).to_string();
+                    full_output.push_str(&s);
+                    buf.push_str(&s);
+                    // Look for the tool-start marker rendered by PrintFrontend.
+                    if buf.contains("\u{2699}") || buf.contains("bash") {
+                        let _ = tx.send(full_output.clone());
+                        // Keep reading until EOF so the pipe is drained.
+                        loop {
+                            match reader.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n2) => {
+                                    let s2 = String::from_utf8_lossy(&chunk[..n2]).to_string();
+                                    full_output.push_str(&s2);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for the tool to start (up to 15 seconds).
+    rx.recv_timeout(Duration::from_secs(15))
+        .expect("Timed out waiting for tool to start on stderr");
+
+    // Send real SIGINT to the child process.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGINT);
+    }
+
+    // Wait for the process to exit (up to 10 seconds after SIGINT).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let exit_status = loop {
+        if std::time::Instant::now() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("Child did not exit within 10 seconds after SIGINT");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    };
+
+    reader_thread.join().expect("stderr reader thread must not panic");
+
+    // --- Assertions ---
+
+    // Exit code must be 130 (128 + SIGINT).
+    assert_eq!(
+        exit_status.code(),
+        Some(130),
+        "Expected exit code 130 after SIGINT, got {:?}",
+        exit_status.code()
+    );
+
+    // PID must be gone (no zombie).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if !pid_exists(pid) {
+            assert!(!pid_is_zombie(pid), "Child became a zombie");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("Child PID {pid} still exists after wait");
+}
+
+fn pid_exists(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn pid_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next()) == Some('Z')
+}
+
 fn single_shot_invalid_provider_is_nonzero_and_stdout_clean() {
     let mut cmd = Command::new(binary_path());
     cmd.arg("-p").arg("not-a-provider").arg("hello");

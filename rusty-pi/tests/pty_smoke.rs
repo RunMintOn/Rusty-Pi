@@ -38,6 +38,68 @@ impl PtyProcess {
         Self::spawn_inner(agent_dir, None, true)
     }
 
+    fn spawn_repl(agent_dir: &std::path::Path) -> Self {
+        Self::spawn_repl_inner(agent_dir, None)
+    }
+
+    fn spawn_repl_with_tool(agent_dir: &std::path::Path, mock_tool: Option<&str>) -> Self {
+        Self::spawn_repl_inner(agent_dir, mock_tool)
+    }
+
+    fn spawn_repl_inner(agent_dir: &std::path::Path, mock_tool: Option<&str>) -> Self {
+        let system = native_pty_system();
+        let pair = system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty must be available on Unix");
+
+        let mut command = CommandBuilder::new(binary_path());
+        // No --tui flag: runs the print-mode REPL.
+        command.arg("-p");
+        command.arg("mock");
+        command.env("RUSTY_PI_AGENT_DIR", agent_dir);
+        if let Some(mock_tool) = mock_tool {
+            command.env("RUSTY_PI_MOCK_TOOL", mock_tool);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("REPL child must start on the PTY slave");
+        let pid = child.process_id().expect("PTY child must expose a PID");
+        let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+        let writer = pair.master.take_writer().expect("take PTY writer");
+        drop(pair.slave);
+
+        let (output_tx, output_rx) = mpsc::channel();
+        let reader_thread = thread::spawn(move || {
+            let mut reader = reader;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(size) => {
+                        if output_tx.send(buffer[..size].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            child,
+            writer,
+            output_rx,
+            reader_thread,
+            pid,
+        }
+    }
+
     fn spawn_inner(agent_dir: &std::path::Path, mock_tool: Option<&str>, delayed_command: bool) -> Self {
         let system = native_pty_system();
         let pair = system
@@ -296,6 +358,47 @@ fn real_tui_pty_ctrl_c_cancels_delayed_command_and_accepts_next_input() {
 
     process.send_bytes(b"/help\r");
     process.wait_for("Commands:", Duration::from_secs(5));
+    process.send_bytes(b"/quit\r");
+    process.finish();
+}
+
+// ── Non-TUI REPL PTY tests ───────────────────────────────────────────────
+
+/// Real non-TUI REPL PTY SIGINT test.
+///
+/// Starts rusty-pi in print-mode REPL (no `--tui`), sends a slow task,
+/// interrupts it with a real PTY Ctrl+C, verifies the REPL continues,
+/// then confirms a second prompt succeeds and /quit exits cleanly.
+///
+/// This test must NOT be replaced by any TUI PTY test.
+#[test]
+fn real_repl_pty_sigint_cancels_run_and_accepts_next_input() {
+    let agent_dir = tempfile::tempdir().expect("temporary agent directory");
+    let mut process = PtyProcess::spawn_repl_with_tool(agent_dir.path(), Some("sleep 30; echo should-not-finish"));
+
+    // Wait for the REPL banner and prompt.
+    process.wait_for("> ", Duration::from_secs(5));
+
+    // Submit a slow task.
+    process.send_bytes(b"run a slow tool\r");
+
+    // Wait for the tool to start (the gear icon + bash on stderr).
+    process.wait_for("\u{2699}", Duration::from_secs(10));
+
+    // Send real PTY Ctrl+C (0x03) to cancel the running agent run.
+    process.send_bytes(b"\x03");
+
+    // The driver should emit "Aborted" or "Run aborted".
+    process.wait_for("bort", Duration::from_secs(5));
+
+    // The REPL must still be alive — wait for the prompt.
+    process.wait_for("> ", Duration::from_secs(5));
+
+    // Submit a quick prompt to confirm the REPL is fully operational.
+    process.send_bytes(b"/help\r");
+    process.wait_for("Commands:", Duration::from_secs(5));
+
+    // Clean exit.
     process.send_bytes(b"/quit\r");
     process.finish();
 }

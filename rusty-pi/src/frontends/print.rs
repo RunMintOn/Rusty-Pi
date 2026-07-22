@@ -2004,19 +2004,19 @@ mod tests {
     #[tokio::test]
     async fn cancel_then_next_run_succeeds() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Notify;
 
-        let started = Arc::new(Notify::new());
-        let finished = Arc::new(AtomicBool::new(false));
-
-        struct StalledProvider {
-            started: Arc<Notify>,
-            finished: Arc<AtomicBool>,
+        /// Provider that stalls on the first call (waits for cancellation)
+        /// and completes normally on the second call with a text response.
+        struct StallThenCompleteProvider {
+            call_count: Arc<AtomicUsize>,
+            first_started: Arc<Notify>,
+            first_settled: Arc<AtomicBool>,
         }
 
         #[async_trait::async_trait]
-        impl crate::ai::providers::ProviderApi for StalledProvider {
+        impl crate::ai::providers::ProviderApi for StallThenCompleteProvider {
             async fn stream(
                 &self,
                 _model: &crate::ai::providers::Model,
@@ -2025,25 +2025,45 @@ mod tests {
                 _system_prompt: Option<&str>,
                 context: crate::ai::providers::ProviderRequestContext,
             ) -> anyhow::Result<crate::ai::providers::ProviderStream> {
-                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
                 let cancellation = context.cancellation.child_token();
-                let worker_cancellation = cancellation.clone();
-                let started = self.started.clone();
-                let finished = self.finished.clone();
+                let producer_cancellation = cancellation.clone();
+                let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+                let first_started = self.first_started.clone();
+                let first_settled = self.first_settled.clone();
+
                 let producer = tokio::spawn(async move {
-                    started.notify_one();
-                    worker_cancellation.cancelled().await;
-                    finished.store(true, Ordering::SeqCst);
-                    drop(tx);
+                    if call == 0 {
+                        // First call: stall until cancelled.
+                        first_started.notify_one();
+                        producer_cancellation.cancelled().await;
+                        first_settled.store(true, Ordering::SeqCst);
+                        drop(tx);
+                    } else {
+                        // Second call: emit text and finish.
+                        use crate::ai::stream::{MessageAccumulator, StreamEvent};
+                        for word in "recovered".split(' ') {
+                            let chunk = format!("{} ", word);
+                            let _ = tx.send(StreamEvent::TextDelta { delta: chunk }).await;
+                        }
+                        let acc = MessageAccumulator::new("mock", "mock", "mock");
+                        let msg = acc.build();
+                        let _ = tx.send(StreamEvent::Done { message: msg }).await;
+                    }
                 });
                 Ok(crate::ai::providers::ProviderStream::new(rx, producer, cancellation))
             }
         }
 
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(Notify::new());
+        let first_settled = Arc::new(AtomicBool::new(false));
+
         let session = crate::coding_agent::prompt_session::PromptSession::new(
-            Box::new(StalledProvider {
-                started: started.clone(),
-                finished: finished.clone(),
+            Box::new(StallThenCompleteProvider {
+                call_count: call_count.clone(),
+                first_started: first_started.clone(),
+                first_settled: first_settled.clone(),
             }),
             crate::ai::providers::Model {
                 id: "mock",
@@ -2075,13 +2095,12 @@ mod tests {
         .await
         .expect("should reach idle");
 
-        // Start a stalled run
+        // --- First run: stall then cancel ---
         let _ = handle.submit_prompt("stall").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
             .await
-            .expect("provider should start");
+            .expect("provider should start first call");
 
-        // Cancel via controller
         let cancel_result = handle.cancel_current().await.unwrap();
         assert!(matches!(cancel_result, CancelResult::CancellationRequested { .. }));
 
@@ -2101,36 +2120,48 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(saw_abort, "should see RunAborted");
-        assert!(saw_idle, "should see Idle after RunAborted");
-        assert!(finished.load(Ordering::SeqCst), "provider should have settled");
+        assert!(saw_abort, "first run: should see RunAborted");
+        assert!(saw_idle, "first run: should see Idle after RunAborted");
+        assert!(
+            first_settled.load(Ordering::SeqCst),
+            "first run: provider should have settled"
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "only one stream() call so far");
 
-        // Next run should succeed
-
-        // We can't easily swap the provider in the controller, so just verify
-        // the controller accepts a new prompt and reaches Running state
-        let submission = handle.submit_prompt("next").await.unwrap();
+        // --- Second run: should complete with TextDelta → RunFinished → Idle ---
+        let submission = handle.submit_prompt("complete").await.unwrap();
         assert!(matches!(submission, PromptSubmission::Accepted { .. }));
 
-        // Wait for the second run to start (StateChanged to Running)
-        let mut saw_running = false;
+        let mut saw_text = false;
+        let mut saw_finish = false;
+        let mut saw_idle_after_finish = false;
         while let Some(event) = events.recv().await {
-            if let SessionControllerEvent::StateChanged(ControllerActivity::Running { .. }) = &event {
-                saw_running = true;
-                break;
+            match &event {
+                SessionControllerEvent::Agent {
+                    event: AgentEvent::TextDelta { text, .. },
+                    ..
+                } => {
+                    if text.contains("recovered") {
+                        saw_text = true;
+                    }
+                }
+                SessionControllerEvent::Agent {
+                    event: AgentEvent::RunFinished { .. },
+                    ..
+                } => {
+                    saw_finish = true;
+                }
+                SessionControllerEvent::StateChanged(ControllerActivity::Idle) if saw_finish => {
+                    saw_idle_after_finish = true;
+                    break;
+                }
+                _ => {}
             }
         }
-        assert!(saw_running, "second run should reach Running state");
-
-        // Cancel the second run too
-        let _ = handle.cancel_current().await.unwrap();
-
-        // Wait for idle
-        while let Some(event) = events.recv().await {
-            if let SessionControllerEvent::StateChanged(ControllerActivity::Idle) = &event {
-                break;
-            }
-        }
+        assert!(saw_text, "second run: should see TextDelta with 'recovered'");
+        assert!(saw_finish, "second run: should see RunFinished");
+        assert!(saw_idle_after_finish, "second run: should reach Idle after RunFinished");
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "exactly two stream() calls");
 
         handle.shutdown().await.unwrap();
         task.join().await.unwrap();
