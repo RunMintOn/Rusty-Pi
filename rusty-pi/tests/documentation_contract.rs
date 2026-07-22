@@ -45,6 +45,14 @@ fn readme_documents_current_entry_points_and_authoritative_docs() {
 }
 
 #[test]
+fn execution_evidence_is_not_tracked_as_product_documentation() {
+    assert!(
+        !repository_root().join("EXECUTION-EVIDENCE.md").exists(),
+        "execution evidence must remain outside the product repository"
+    );
+}
+
+#[test]
 fn authoritative_documents_do_not_reintroduce_retired_positioning() {
     let files = [
         "README.md",
