@@ -48,4 +48,4 @@ PTY smoke tests exercise the real TUI, multiline input, AgentEvent rendering, to
 
 ## Explicit limits
 
-Production providers currently do not emit a complete thinking/reasoning stream, so TUI thinking rendering is infrastructure rather than a user-enabled reasoning feature. Native session selectors, tree navigation, Markdown/diff product UX, and other pickers remain roadmap work; this document does not describe them as implemented.
+Thinking content/message types, thinking-level metadata, `AgentEvent::ThinkingDelta`, and TUI rendering are existing infrastructure. Provider request options, DeepSeek/Codex reasoning parsing, production stream event wiring, complete persistence, and a user configuration entry are not implemented, so TUI thinking rendering is not a user-enabled reasoning feature. Native session selectors, tree navigation, Markdown/diff product UX, and other pickers remain roadmap work; this document does not describe them as implemented.

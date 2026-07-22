@@ -79,7 +79,7 @@ Agent and Provider do not write to the terminal. They emit data and events for f
 - system-prompt rebuilding;
 - Skill and prompt-template expansion;
 - context files;
-- resource reload;
+- resource-reload infrastructure (a reload method and unit tests, without a CLI, Command, or TUI entry point);
 - access to the current model and Agent;
 - the parts of the business surface needed by the Command system.
 
@@ -111,11 +111,11 @@ REPL and TUI use the same command registry and async command contract. The REPL 
 
 Ratatui owns the primary interactive interface: input and terminal ownership, transcript state, command lifecycle, cancellation effects, and AgentEvent rendering. `TerminalGuard` restores terminal state on normal exit, errors, and panic unwinding.
 
-The TUI currently provides multiline input, process-local history, scrolling/navigation, structured transcript blocks, async command lifecycle, and PTY smoke coverage. It does not provide native model/context pickers; no-argument `/model` and `/context` show usage. Thinking blocks can render an event if one exists, but production providers do not currently produce `ThinkingDelta`.
+The TUI currently provides multiline input, process-local history, scrolling/navigation, structured transcript blocks, async command lifecycle, and PTY smoke coverage. It does not provide native model/context pickers; no-argument `/model` and `/context` show usage. Thinking content/message types, thinking-level metadata, `AgentEvent::ThinkingDelta`, and frontend rendering are infrastructure. Provider request options, DeepSeek/Codex reasoning parsing, production stream event wiring, complete persistence, and user configuration are not implemented.
 
 ## Session storage boundary
 
-The current Agent uses `PromptSession` and the high-level `Session` API. Session storage has JSONL and in-memory implementations. JSONL persistence, resume, listing, and tree inspection are current tested entry points. Branch APIs and thinking/compaction metadata are recorded as infrastructure in the capability matrix; interactive branch navigation and automatic compaction are future work.
+The current Agent uses `PromptSession` and the high-level `Session` API. Session storage has JSONL and in-memory implementations. JSONL persistence, resume, listing, and tree inspection are current tested entry points. Branch APIs and thinking/compaction metadata are recorded as infrastructure in the capability matrix; interactive branch navigation, complete thinking/reasoning transport, and automatic compaction are future work.
 
 ## Future SessionController insertion point
 

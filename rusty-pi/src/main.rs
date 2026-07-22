@@ -1,4 +1,4 @@
-//! rusty-pi — Rust rewrite of the pi coding agent.
+//! rusty-pi — an independent Rust coding agent.
 //!
 //! Binary entry point. Supports:
 //! - `rusty-pi` — interactive REPL with mock provider
@@ -69,7 +69,7 @@ fn config_paths() -> Vec<PathBuf> {
 }
 
 #[derive(Parser)]
-#[command(name = "rusty-pi", version, about = "Rust rewrite of earendil-works/pi")]
+#[command(name = "rusty-pi", version, about = "Independent Rust coding agent")]
 struct Cli {
     /// Provider to use (mock, deepseek, codex). Default from config or "mock".
     #[arg(short, long)]

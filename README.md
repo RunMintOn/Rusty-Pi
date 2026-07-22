@@ -6,7 +6,7 @@ Each capability is decided independently: align, borrow, or reject. The project 
 
 ## Current status
 
-The current binary has a tested Agent/tool loop, JSONL sessions, prompt templates, Skills, the four core tools, Mock/DeepSeek/OpenAI Codex providers, a thin REPL, single-shot execution, and a formal Ratatui TUI. Thinking/reasoning transport and automatic compaction remain infrastructure or planned work; see the [capability matrix](docs/capabilities.md).
+The current binary has a tested Agent/tool loop, JSONL sessions, prompt templates, Skills, the four core tools, Mock/DeepSeek/OpenAI Codex providers, a thin REPL, single-shot execution, and a formal Ratatui TUI. Thinking content/message types, thinking-level metadata, AgentEvent support, and frontend rendering are infrastructure. Provider thinking/reasoning transport, user-configurable thinking/reasoning, and automatic compaction remain planned; see the [capability matrix](docs/capabilities.md).
 
 ## Quick start
 
@@ -73,7 +73,7 @@ Adding more core built-in tools is not a product goal.
 
 ## Sessions and resources
 
-Sessions are persisted as JSONL under `~/.pi/agent/sessions/` by default. Set `RUSTY_PI_AGENT_DIR` to change the agent directory. Prompt templates, Skills, context files, and resource reload are available through `PromptSession` and the current command system.
+Sessions are persisted as JSONL under `~/.pi/agent/sessions/` by default. Set `RUSTY_PI_AGENT_DIR` to change the agent directory. Prompt templates, Skills, and context files are available. `PromptSession` contains reload infrastructure, but production reload orchestration remains planned for `SessionController`.
 
 ## Development
 

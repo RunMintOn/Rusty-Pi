@@ -38,7 +38,9 @@ This is the authoritative list of what Rusty-Pi currently supports. Statuses des
 | DeepSeek | Available |
 | OpenAI Codex | Available |
 | Generic OpenAI-compatible | Planned |
-| Thinking/reasoning transport | Infrastructure |
+| Thinking types, metadata, events, and frontend scaffolding | Infrastructure |
+| Provider thinking/reasoning transport | Planned |
+| User-configurable thinking/reasoning | Planned |
 
 The current provider set is not a claim of complete feature parity with any other product. Thinking data types and rendering exist, but production providers do not currently produce the complete reasoning stream.
 
@@ -79,7 +81,8 @@ Compaction entry serialization, context transformation, summary-context reconstr
 | Prompt templates | Available |
 | Skills | Available |
 | Context files | Available |
-| Resource reload | Available |
+| Resource reload infrastructure | Infrastructure |
+| Controller-owned resource reload orchestration | Planned |
 | Unified Resource Loader product | Planned |
 
 Skills and templates expand into Agent prompts; they are not command messages in the Agent Session.
@@ -125,7 +128,22 @@ Regular `cargo test` must remain offline. Live evaluations require explicit opt-
 
 ## Thinking status
 
-The repository contains thinking content/message types, thinking-level Session metadata, `AgentEvent::ThinkingDelta`, a PrintFrontend renderer, and a TUI thinking block. The production chain is incomplete:
+Existing Infrastructure:
+
+- content/message types;
+- thinking-level metadata;
+- an `AgentEvent` variant (`ThinkingDelta`);
+- frontend rendering scaffolding.
+
+Not implemented:
+
+- provider request option;
+- DeepSeek/Codex reasoning parsing;
+- production stream event wiring;
+- complete persistence;
+- user configuration entry.
+
+The production chain is incomplete:
 
 ```text
 Provider request setting
@@ -135,7 +153,7 @@ Provider request setting
 → frontend
 ```
 
-Users cannot currently enable complete thinking/reasoning behavior. The capability is therefore `Infrastructure`, not `Available`.
+Users cannot currently enable complete thinking/reasoning behavior. The types, metadata, events, and frontend scaffolding are `Infrastructure`; provider transport and user configuration are `Planned`.
 
 ## Compaction status
 

@@ -14,7 +14,7 @@ Make product positioning, current runtime behavior, architecture boundaries, cap
 - retry;
 - enabled tools;
 - model change;
-- resource reload;
+- controller-owned resource reload orchestration;
 - context transform;
 - compaction orchestration;
 - branching;

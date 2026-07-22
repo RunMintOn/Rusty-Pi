@@ -31,11 +31,11 @@ The product's fixed core built-in tools are `bash`, `read`, `write`, and `edit`.
 
 The formal providers are Mock, DeepSeek, and OpenAI Codex. Mock is the offline test seam. DeepSeek uses `DEEPSEEK_API_KEY`; Codex uses `OPENAI_CODEX_TOKEN` or its stored credential flow. A generic OpenAI-compatible provider is a future direction. Quality, cancellation, and tested behavior take priority over provider count and unverified feature parity.
 
-Thinking/reasoning types and display infrastructure exist, but a production provider does not currently complete the request-setting, reasoning-stream parsing, AgentEvent, persistence, and frontend chain. It is therefore not a completed product capability.
+Thinking content/message types, thinking-level metadata, an `AgentEvent` variant, and frontend rendering are Infrastructure. Provider request options, DeepSeek/Codex reasoning parsing, production stream event wiring, complete persistence, and a user configuration entry are not implemented; provider transport and user-configurable thinking/reasoning remain Planned rather than Available.
 
 ## 6. Session and business-layer direction
 
-JSONL persistence, resume, listing, tree inspection, resource expansion, and context transformation are current capabilities where the capability matrix says Available. The current `PromptSession` is a transition business layer that owns canonical prompt state, system-prompt rebuilding, resource expansion, context files, and selected Agent/model access.
+JSONL persistence, resume, listing, tree inspection, resource expansion, and context-file injection are current capabilities where the capability matrix says Available. The current `PromptSession` is a transition business layer that owns canonical prompt state, system-prompt rebuilding, resource expansion, context files, and selected Agent/model access. It also contains resource-reload infrastructure, but production reload orchestration remains planned for `SessionController`.
 
 The long-term direction is a `SessionController`/`AgentSession` layer for prompt lifecycle, steering, follow-up, retry, compaction orchestration, branching, model changes, enabled tools, context transforms, resource reload, and hooks. This direction is accepted architecture, not an implementation claim.
 

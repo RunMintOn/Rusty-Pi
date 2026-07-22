@@ -1,11 +1,8 @@
-//! rusty-pi — Rust rewrite of the pi coding agent.
+//! rusty-pi — an independent Rust coding agent library.
 //!
-//! Module structure mirrors the original TypeScript monorepo packages:
-//! - `ai` → `@earendil-works/pi-ai`
-//! - `agent` → `@earendil-works/pi-agent-core`
-//! - `coding_agent` → `@earendil-works/pi-coding-agent`
-//! - `tui` → `@earendil-works/pi-tui`
-//! - `orchestrator` → `@earendil-works/pi-orchestrator`
+//! The modules implement Rusty-Pi's own Agent, Provider, Session, Command,
+//! and frontend boundaries. PI is a design reference, not a compatibility
+//! specification for this crate.
 
 pub mod agent;
 pub mod ai;

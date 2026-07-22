@@ -13,6 +13,8 @@ Decision:
 
 Keep `PromptSession` as the current transition business layer. It may continue to provide the shared prompt/resource seam needed by the existing REPL, single-shot path, TUI, and Command system, but it must not grow without a deliberate boundary decision. Future orchestration will move incrementally to `SessionController`/`AgentSession` rather than requiring a broad refactor in this milestone.
 
+ADR 006 records the related future controller direction. It complements this decision rather than superseding it.
+
 Consequences:
 
 - Existing code can keep using PromptSession without a disruptive rewrite.
@@ -21,4 +23,4 @@ Consequences:
 - This ADR does not claim that SessionController exists or that those capabilities are Available.
 
 Supersedes: None
-Superseded by: ADR 006
+Superseded by: None

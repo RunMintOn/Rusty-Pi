@@ -6,9 +6,9 @@ This list contains only limitations still present in the current source and test
 
 `/model` and `/context` without an argument display usage in the Ratatui TUI. The TUI does not hand terminal ownership to `inquire`, and there is no native picker yet. Use an explicit command argument where supported or use the thin REPL adapter. Native TUI pickers are planned.
 
-## Thinking/reasoning transport is incomplete
+## Thinking/reasoning transport and configuration are incomplete
 
-Thinking message/content types, Session metadata, `AgentEvent::ThinkingDelta`, and frontend rendering exist, but the production Provider request-setting and reasoning-stream parsing path is absent. Users cannot enable complete thinking/reasoning behavior. This is recorded as `Infrastructure` in [the capability matrix](../docs/capabilities.md), not as supported reasoning.
+Thinking content/message types, thinking-level metadata, `AgentEvent::ThinkingDelta`, and frontend rendering exist as Infrastructure. Provider request options, DeepSeek/Codex reasoning parsing, production stream event wiring, complete persistence, and a user configuration entry are not implemented. Users cannot enable complete thinking/reasoning behavior; provider transport and user-configurable thinking/reasoning are Planned in [the capability matrix](../docs/capabilities.md), not supported reasoning.
 
 ## Automatic compaction is not orchestrated
 
