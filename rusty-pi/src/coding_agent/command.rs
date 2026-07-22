@@ -6,7 +6,9 @@
 
 use crate::agent::session::types::SessionTreeEntry;
 use crate::ai::types::{AgentMessage, AssistantContent, MessageContent};
-use crate::coding_agent::prompt_session::PromptSession;
+use crate::coding_agent::session_controller::ControllerRequestError;
+#[cfg(not(test))]
+use crate::coding_agent::session_controller::SessionControllerHandle;
 use crate::format::{OutputFormatter, SessionInfo, SessionSummary};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -77,30 +79,19 @@ pub enum CommandMatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputRoute {
     Command(CommandInvocation),
-    AgentPrompt { original: String, expanded: String },
-    UnknownSlash { name: String },
+    AgentPrompt { original: String },
 }
 
 /// Resolve input without executing a command or contacting the provider.
-pub fn resolve_input(input: &str, registry: &CommandRegistry, session: &PromptSession) -> InputRoute {
-    // Keep command/template recognition identical for the REPL and TUI. The
-    // REPL trims before calling this function, while the TUI passes the draft
-    // verbatim, so normalization belongs at this shared boundary.
+pub fn resolve_input(input: &str, registry: &CommandRegistry) -> InputRoute {
+    // Only built-ins are resolved here. Resource state belongs
+    // to SessionController, which is the authority for expansion and unknown
+    // slash rejection.
     let normalized = input.trim_start();
     match registry.resolve(normalized) {
         CommandMatch::Known(invocation) => InputRoute::Command(invocation),
-        CommandMatch::NotSlash => InputRoute::AgentPrompt {
+        CommandMatch::NotSlash | CommandMatch::UnknownSlash(_) => InputRoute::AgentPrompt {
             original: input.to_string(),
-            expanded: input.to_string(),
-        },
-        CommandMatch::UnknownSlash(invocation) => match session.try_expand_prompt_command(normalized) {
-            crate::coding_agent::prompt_session::PromptExpansion::Expanded(expanded) => InputRoute::AgentPrompt {
-                original: input.to_string(),
-                expanded,
-            },
-            crate::coding_agent::prompt_session::PromptExpansion::NotMatched => {
-                InputRoute::UnknownSlash { name: invocation.name }
-            }
         },
     }
 }
@@ -310,20 +301,40 @@ impl CommandOutcome {
     }
 }
 
+#[cfg(test)]
+use crate::test_support::{CommandContextOwner, CommandController};
+
 pub struct CommandContext<'a> {
-    pub session: &'a mut PromptSession,
+    #[cfg(not(test))]
+    pub controller: &'a SessionControllerHandle,
+    #[cfg(test)]
+    pub(crate) controller: CommandController<'a>,
     pub interaction: &'a dyn CommandInteraction,
     pub cancellation: CancellationToken,
 }
 
 impl<'a> CommandContext<'a> {
+    #[cfg(not(test))]
     pub fn new(
-        session: &'a mut PromptSession,
+        controller: &'a SessionControllerHandle,
         interaction: &'a dyn CommandInteraction,
         cancellation: CancellationToken,
     ) -> Self {
         Self {
-            session,
+            controller,
+            interaction,
+            cancellation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new<O: CommandContextOwner<'a>>(
+        owner: O,
+        interaction: &'a dyn CommandInteraction,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            controller: owner.into_controller(),
             interaction,
             cancellation,
         }
@@ -501,9 +512,9 @@ impl Command for ModelCommand {
         invocation: &CommandInvocation,
         context: &mut CommandContext<'_>,
     ) -> Result<CommandOutcome> {
-        let models: Vec<_> = context.session.agent().list_models().into_iter().cloned().collect();
-        let ids: Vec<String> = models.iter().map(|model| model.id.to_string()).collect();
-        let current = context.session.model().id.to_string();
+        let models = context.controller.list_models().await.map_err(controller_error)?;
+        let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
+        let current = context.controller.snapshot().await.map_err(controller_error)?.model.id;
 
         let selected = if invocation.has_args() {
             let requested = invocation.trimmed_args();
@@ -559,19 +570,36 @@ impl Command for ModelCommand {
         if selected == current {
             return Ok(CommandOutcome::message(format!("Already using {selected}")));
         }
-        let model = models
-            .into_iter()
-            .find(|model| model.id == selected)
-            .ok_or_else(|| anyhow!("selected model disappeared from provider model list"))?;
-        context.session.switch_model(model);
-        Ok(CommandOutcome {
-            result: Some(CommandResult::ModelChanged { model: selected }),
-            control: CommandControl::Continue,
-        })
+        match context.controller.switch_model(selected.clone()).await {
+            Ok(change) if change.changed => Ok(CommandOutcome {
+                result: Some(CommandResult::ModelChanged { model: selected }),
+                control: CommandControl::Continue,
+            }),
+            Ok(_) => Ok(CommandOutcome::message(format!("Already using {selected}"))),
+            Err(error) if is_user_controller_error(&error) => Ok(CommandOutcome {
+                result: Some(CommandResult::Error(error.to_string())),
+                control: CommandControl::Continue,
+            }),
+            Err(error) => Err(controller_error(error)),
+        }
     }
 }
 
 pub struct ContextCommand;
+
+fn controller_error(error: ControllerRequestError) -> anyhow::Error {
+    anyhow!(error.to_string())
+}
+
+fn is_user_controller_error(error: &ControllerRequestError) -> bool {
+    matches!(
+        error,
+        ControllerRequestError::Busy(_)
+            | ControllerRequestError::InvalidModel(_)
+            | ControllerRequestError::InvalidPrompt(_)
+            | ControllerRequestError::Session(_)
+    )
+}
 
 #[async_trait]
 impl Command for ContextCommand {
@@ -614,11 +642,8 @@ impl Command for ContextCommand {
             return Ok(CommandOutcome::none());
         }
         let path = PathBuf::from(&path_text);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            context.session.cwd().join(path)
-        };
+        let cwd = context.controller.snapshot().await.map_err(controller_error)?.cwd;
+        let path = if path.is_absolute() { path } else { cwd.join(path) };
         let content = {
             let read = tokio::fs::read_to_string(path.clone());
             tokio::pin!(read);
@@ -642,11 +667,17 @@ impl Command for ContextCommand {
             return Ok(CommandOutcome::none());
         }
         let size_kb = content.len() / 1024;
-        context.session.add_context_file(path, content);
-        Ok(CommandOutcome::message(format!(
-            "Added {} ({}KB) to system prompt",
-            path_text, size_kb
-        )))
+        match context.controller.add_context(path, content).await {
+            Ok(_) => Ok(CommandOutcome::message(format!(
+                "Added {} ({}KB) to system prompt",
+                path_text, size_kb
+            ))),
+            Err(error) if is_user_controller_error(&error) => Ok(CommandOutcome {
+                result: Some(CommandResult::Error(error.to_string())),
+                control: CommandControl::Continue,
+            }),
+            Err(error) => Err(controller_error(error)),
+        }
     }
 }
 
@@ -669,24 +700,12 @@ impl Command for SessionCommand {
         if context.cancelled() {
             return Ok(CommandOutcome::none());
         }
-        let session = context.session.session();
-        let metadata = session.get_metadata().await;
-        if context.cancelled() {
-            return Ok(CommandOutcome::none());
-        }
-        let (total, _, _, _) = session.count_messages().await;
-        if context.cancelled() {
-            return Ok(CommandOutcome::none());
-        }
-        let model = session.derive_model().await.unwrap_or_default();
-        if context.cancelled() {
-            return Ok(CommandOutcome::none());
-        }
+        let snapshot = context.controller.snapshot().await.map_err(controller_error)?;
         let info = SessionInfo {
-            id: metadata.id,
-            model,
-            msg_count: total,
-            cwd: metadata.cwd,
+            id: snapshot.session_id.unwrap_or_default(),
+            model: snapshot.model.id,
+            msg_count: snapshot.message_count,
+            cwd: snapshot.cwd.to_string_lossy().to_string(),
         };
         Ok(CommandOutcome::message(OutputFormatter::new().session_info(&info)))
     }
@@ -711,10 +730,16 @@ impl Command for TreeCommand {
         if context.cancelled() {
             return Ok(CommandOutcome::none());
         }
-        let entries = context.session.session().get_entries().await;
-        if context.cancelled() {
-            return Ok(CommandOutcome::none());
-        }
+        let entries = match context.controller.session_tree().await {
+            Ok(tree) => tree.entries().to_vec(),
+            Err(error) if is_user_controller_error(&error) => {
+                return Ok(CommandOutcome {
+                    result: Some(CommandResult::Error(error.to_string())),
+                    control: CommandControl::Continue,
+                });
+            }
+            Err(error) => return Err(controller_error(error)),
+        };
         if entries.is_empty() {
             return Ok(CommandOutcome::message("(empty session)"));
         }
@@ -824,7 +849,13 @@ impl Command for ListSessionsCommand {
         if context.cancelled() {
             return Ok(CommandOutcome::none());
         }
-        let sessions_dir = context.session.agent_dir().join("sessions");
+        let sessions_dir = context
+            .controller
+            .snapshot()
+            .await
+            .map_err(controller_error)?
+            .agent_dir
+            .join("sessions");
         let directory = match tokio::fs::read_dir(&sessions_dir).await {
             Ok(directory) => directory,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -964,10 +995,11 @@ mod tests {
     use super::*;
     use crate::ai::mock::MockProvider;
     use crate::ai::providers::Model;
+    use crate::test_support::TestResourceOwner;
     use std::path::Path;
 
-    fn session() -> PromptSession {
-        PromptSession::new(
+    fn session() -> TestResourceOwner {
+        TestResourceOwner::new(
             Box::new(MockProvider::text("reply")),
             Model {
                 id: "mock",
@@ -984,8 +1016,8 @@ mod tests {
         )
     }
 
-    fn session_with_resources(template_paths: Vec<PathBuf>, skill_paths: Vec<PathBuf>) -> PromptSession {
-        PromptSession::new(
+    fn session_with_resources(template_paths: Vec<PathBuf>, skill_paths: Vec<PathBuf>) -> TestResourceOwner {
+        TestResourceOwner::new(
             Box::new(MockProvider::text("reply")),
             Model {
                 id: "mock",
@@ -1002,8 +1034,8 @@ mod tests {
         )
     }
 
-    fn session_with_models() -> PromptSession {
-        PromptSession::new(
+    fn session_with_models() -> TestResourceOwner {
+        TestResourceOwner::new(
             Box::new(MockProvider::with_models(
                 vec![crate::ai::mock::MockStep::Text("reply".into())],
                 vec![
@@ -1033,7 +1065,7 @@ mod tests {
     }
 
     fn command_context<'a>(
-        session: &'a mut PromptSession,
+        session: &'a mut TestResourceOwner,
         interaction: &'a dyn CommandInteraction,
     ) -> CommandContext<'a> {
         CommandContext::new(session, interaction, CancellationToken::new())
@@ -1064,31 +1096,28 @@ mod tests {
         let skill_dir = directory.path().join("known-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), "---\ndescription: known\n---\n\nDo review").unwrap();
-        let session = session_with_resources(
+        let _session = session_with_resources(
             vec![directory.path().join("help.md"), directory.path().join("review.md")],
             vec![skill_dir],
         );
         let registry = builtin_registry();
 
         assert!(
-            matches!(resolve_input("hello", &registry, &session), InputRoute::AgentPrompt { expanded, .. } if expanded == "hello")
+            matches!(resolve_input("hello", &registry), InputRoute::AgentPrompt { original } if original == "hello")
         );
-        assert!(matches!(
-            resolve_input("/help", &registry, &session),
-            InputRoute::Command(_)
-        ));
+        assert!(matches!(resolve_input("/help", &registry), InputRoute::Command(_)));
         assert!(
-            matches!(resolve_input("/review src/", &registry, &session), InputRoute::AgentPrompt { expanded, .. } if expanded == "Review src/")
+            matches!(resolve_input("/review src/", &registry), InputRoute::AgentPrompt { original } if original == "/review src/")
         );
         assert!(matches!(
-            resolve_input("/skill:known-skill", &registry, &session),
+            resolve_input("/skill:known-skill", &registry),
             InputRoute::AgentPrompt { .. }
         ));
         assert!(
-            matches!(resolve_input("/not-known", &registry, &session), InputRoute::UnknownSlash { name } if name == "not-known")
+            matches!(resolve_input("/not-known", &registry), InputRoute::AgentPrompt { original } if original == "/not-known")
         );
         assert!(
-            matches!(resolve_input("/skill:not-known", &registry, &session), InputRoute::UnknownSlash { name } if name == "skill:not-known")
+            matches!(resolve_input("/skill:not-known", &registry), InputRoute::AgentPrompt { original } if original == "/skill:not-known")
         );
     }
 
@@ -1202,7 +1231,7 @@ mod tests {
         .await
         .unwrap();
         let provider = MockProvider::text("reply");
-        let mut session = PromptSession::new(
+        let mut session = TestResourceOwner::new(
             Box::new(provider),
             Model {
                 id: "mock",
@@ -1258,7 +1287,7 @@ mod tests {
         let path = dir.path().join("中文 file.md");
         tokio::fs::write(&path, "context").await.unwrap();
         let provider = MockProvider::text("reply");
-        let mut session = PromptSession::new(
+        let mut session = TestResourceOwner::new(
             Box::new(provider),
             Model {
                 id: "mock",
@@ -1469,10 +1498,10 @@ mod tests {
 
     #[test]
     fn slash_root_is_unknown_slash_not_an_agent_prompt() {
-        let session = session();
+        let _session = session();
         assert!(matches!(
-            resolve_input("/", &builtin_registry(), &session),
-            InputRoute::UnknownSlash { name } if name.is_empty()
+            resolve_input("/", &builtin_registry()),
+            InputRoute::AgentPrompt { original } if original == "/"
         ));
     }
 
@@ -1480,10 +1509,10 @@ mod tests {
     fn leading_skill_whitespace_is_normalized_by_shared_router() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("review.md"), "Review $1").unwrap();
-        let session = session_with_resources(vec![directory.path().join("review.md")], vec![]);
+        let _session = session_with_resources(vec![directory.path().join("review.md")], vec![]);
         assert!(matches!(
-            resolve_input("  /review src/", &builtin_registry(), &session),
-            InputRoute::AgentPrompt { expanded, .. } if expanded == "Review src/"
+            resolve_input("  /review src/", &builtin_registry()),
+            InputRoute::AgentPrompt { original } if original == "  /review src/"
         ));
     }
 
@@ -1516,7 +1545,7 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_missing_directory_is_a_message() {
         let directory = tempfile::tempdir().unwrap();
-        let mut session = PromptSession::new(
+        let mut session = TestResourceOwner::new(
             Box::new(MockProvider::text("reply")),
             Model {
                 id: "mock",
@@ -1687,7 +1716,7 @@ mod tests {
         tokio::fs::create_dir_all(directory.path().join("sessions"))
             .await
             .unwrap();
-        let mut session = PromptSession::new(
+        let mut session = TestResourceOwner::new(
             Box::new(MockProvider::text("reply")),
             Model {
                 id: "mock",
@@ -1719,7 +1748,7 @@ mod tests {
         tokio::fs::create_dir_all(directory.path().join("sessions"))
             .await
             .unwrap();
-        let mut session = PromptSession::new(
+        let mut session = TestResourceOwner::new(
             Box::new(MockProvider::text("reply")),
             Model {
                 id: "mock",
@@ -1764,7 +1793,7 @@ mod tests {
             ],
         );
         let captured = provider.captured_requests_arc();
-        let mut session = PromptSession::new(
+        let mut session = TestResourceOwner::new(
             Box::new(provider),
             Model {
                 id: "mock",
@@ -1792,7 +1821,7 @@ mod tests {
             let mut context = CommandContext::new(&mut session, &interaction, CancellationToken::new());
             let _ = registry.dispatch(&invocation, &mut context).await.unwrap();
         }
-        assert_eq!(session.session().count_messages().await.0, 0);
+        assert_eq!(session.message_count().await, 0);
         assert!(captured.lock().unwrap().is_empty());
     }
 }

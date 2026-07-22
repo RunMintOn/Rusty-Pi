@@ -10,4 +10,6 @@ pub mod coding_agent;
 pub mod format;
 pub mod frontends;
 pub mod orchestrator;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tui;
