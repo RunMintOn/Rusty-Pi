@@ -319,7 +319,6 @@ fn single_shot_tool_call_stderr_has_diagnostics() {
     }
 }
 
-#[test]
 /// Real single-shot SIGINT test: spawns the binary with a slow mock tool,
 /// sends a real SIGINT signal to the child PID, and verifies exit code 130.
 ///

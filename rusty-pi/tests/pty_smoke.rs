@@ -376,8 +376,10 @@ fn real_repl_pty_sigint_cancels_run_and_accepts_next_input() {
     let agent_dir = tempfile::tempdir().expect("temporary agent directory");
     let mut process = PtyProcess::spawn_repl_with_tool(agent_dir.path(), Some("sleep 30; echo should-not-finish"));
 
-    // Wait for the REPL banner and prompt.
-    process.wait_for("> ", Duration::from_secs(5));
+    // Wait for the REPL banner and prompt. The REPL process may take time to
+    // initialize the session controller and print the startup banner.
+    // Under parallel test execution, resource contention can slow startup.
+    process.wait_for("> ", Duration::from_secs(20));
 
     // Submit a slow task.
     process.send_bytes(b"run a slow tool\r");
