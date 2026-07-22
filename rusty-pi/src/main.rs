@@ -17,6 +17,10 @@ use rusty_pi::ai::providers::{Model, ProviderApi};
 use rusty_pi::coding_agent::command::{Command, CommandContext, CommandInvocation, CommandOutcome};
 use rusty_pi::coding_agent::prompt_session::PromptSession;
 use rusty_pi::coding_agent::repl::{self, RunConfig};
+use rusty_pi::coding_agent::session_controller::{
+    SessionController, SessionControllerConnection, SessionControllerEvent, SessionControllerEventReceiver,
+    SessionControllerHandle,
+};
 use rusty_pi::coding_agent::system_prompt::ContextFile;
 use rusty_pi::coding_agent::tools::bash::BashTool;
 use rusty_pi::coding_agent::tools::edit::EditTool;
@@ -352,20 +356,22 @@ async fn main() -> anyhow::Result<()> {
         context_files,
     );
 
+    let connection = SessionController::spawn(session);
+
     // Launch TUI or REPL
     if cli.tui {
-        run_tui(session).await
+        run_tui(connection).await
     } else {
         let config = RunConfig {
             prompt: cli.prompt,
-            session,
+            connection,
         };
         repl::run(config).await
     }
 }
 
 /// Launch the Ratatui TUI frontend.
-async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
+async fn run_tui(connection: SessionControllerConnection) -> anyhow::Result<()> {
     // TerminalGuard owns all terminal state transitions. Its Drop path also
     // restores the terminal if the event loop returns an error or panics.
     let mut guard =
@@ -374,52 +380,57 @@ async fn run_tui(session: PromptSession) -> anyhow::Result<()> {
     let mut terminal = ratatui::Terminal::new(backend)?;
 
     let size = terminal.size()?;
-    let mut session = session;
     let mut app_state = rusty_pi::tui::app::AppState::new((size.width, size.height));
-    let model = session.agent().model();
-    app_state.set_provider_model(model.api, model.id);
-
-    // Create agent and event channel
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
-    session.agent().set_event_sender(event_tx);
-    let mut current_token = tokio_util::sync::CancellationToken::new();
-    session.agent().set_abort_flag(current_token.clone());
+    let SessionControllerConnection {
+        handle,
+        mut events,
+        task,
+    } = connection;
+    let snapshot = handle
+        .snapshot()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    app_state.set_provider_model(&snapshot.model.api, &snapshot.model.id);
     let mut registry = rusty_pi::coding_agent::command::builtin_registry();
     if cfg!(debug_assertions) && std::env::var_os("RUSTY_PI_TUI_TEST_DELAYED_COMMAND").is_some() {
         registry.register(Box::new(DelayedTuiTestCommand));
     }
     let interaction = rusty_pi::coding_agent::command::UnavailableCommandInteraction;
 
-    // Run TUI loop — agent runs inline when a prompt is submitted
     let result = run_tui_loop(
         &mut terminal,
         &mut app_state,
-        &mut session,
+        &handle,
+        &mut events,
         &registry,
-        &mut current_token,
-        &mut event_rx,
         &interaction,
     )
     .await;
 
+    let shutdown = handle
+        .shutdown()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()));
+    let joined = task.join().await.map_err(|error| anyhow::anyhow!(error.to_string()));
+
     drop(terminal);
     let restore_result = guard.restore();
-    match (result, restore_result) {
+    match (result.and(shutdown).and(joined), restore_result) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error.into()),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
 
-/// TUI event loop.  An agent future is polled alongside terminal input so a
-/// running command can still be cancelled and the next draft can be edited.
+/// TUI event loop. Controller events are drained alongside terminal input so
+/// a running operation can be cancelled without moving run ownership into the
+/// frontend.
 async fn run_tui_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     state: &mut rusty_pi::tui::app::AppState,
-    session: &mut PromptSession,
+    controller: &SessionControllerHandle,
+    events: &mut SessionControllerEventReceiver,
     registry: &rusty_pi::coding_agent::command::CommandRegistry,
-    current_token: &mut tokio_util::sync::CancellationToken,
-    event_rx: &mut tokio::sync::mpsc::Receiver<rusty_pi::agent::events::AgentEvent>,
     interaction: &dyn rusty_pi::coding_agent::command::CommandInteraction,
 ) -> anyhow::Result<()> {
     use rusty_pi::tui::app::{Action, Effect};
@@ -441,38 +452,28 @@ async fn run_tui_loop(
             for effect in effects {
                 match effect {
                     Effect::SubmitInput(input) => {
-                        match rusty_pi::coding_agent::command::resolve_input(&input, registry, session) {
+                        match rusty_pi::coding_agent::command::resolve_input(&input, registry) {
                             rusty_pi::coding_agent::command::InputRoute::Command(invocation) => {
                                 state.update(Action::CommandStarted {
                                     name: invocation.name.clone(),
                                 });
-                                if drive_command_with_ui(terminal, state, session, registry, interaction, invocation)
+                                if drive_command_with_ui(terminal, state, controller, registry, interaction, invocation)
                                     .await?
                                 {
                                     return Ok(());
                                 }
                             }
-                            rusty_pi::coding_agent::command::InputRoute::AgentPrompt { original, expanded } => {
-                                let prompt_effects = state.update(Action::AgentPromptStarted { original, expanded });
-                                for prompt_effect in prompt_effects {
-                                    if let Effect::RunAgent(prompt) = prompt_effect {
-                                        let new_token = tokio_util::sync::CancellationToken::new();
-                                        session.agent().set_abort_flag(new_token.clone());
-                                        *current_token = new_token;
-                                        run_agent_with_ui(terminal, state, session, current_token, event_rx, prompt)
-                                            .await?;
-                                    }
+                            rusty_pi::coding_agent::command::InputRoute::AgentPrompt { original } => {
+                                if let Err(error) = controller.submit_prompt(original).await {
+                                    state.update(Action::InputRouteError(error.to_string()));
                                 }
-                            }
-                            rusty_pi::coding_agent::command::InputRoute::UnknownSlash { name } => {
-                                state.update(Action::InputRouteError(format!(
-                                    "Unknown command '/{name}'. Type '/help' for available commands."
-                                )));
                             }
                         }
                     }
-                    Effect::RunAgent(_) => {}
-                    Effect::CancelAgent => current_token.cancel(),
+                    Effect::SubmitControllerPrompt(_) => {}
+                    Effect::CancelAgent => {
+                        let _ = controller.cancel_current().await;
+                    }
                     Effect::CancelCommand => {}
                     Effect::Quit => return Ok(()),
                 }
@@ -480,9 +481,7 @@ async fn run_tui_loop(
         }
 
         // Process agent events
-        while let Ok(event) = event_rx.try_recv() {
-            state.update(Action::AgentEvent(event));
-        }
+        drain_controller_events(state, events);
 
         // Check if we should quit
         if state.quit {
@@ -497,13 +496,14 @@ async fn run_tui_loop(
 async fn drive_command_with_ui(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     state: &mut rusty_pi::tui::app::AppState,
-    session: &mut PromptSession,
+    controller: &SessionControllerHandle,
     registry: &rusty_pi::coding_agent::command::CommandRegistry,
     interaction: &dyn rusty_pi::coding_agent::command::CommandInteraction,
     invocation: rusty_pi::coding_agent::command::CommandInvocation,
 ) -> anyhow::Result<bool> {
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let mut context = rusty_pi::coding_agent::command::CommandContext::new(session, interaction, cancellation.clone());
+    let mut context =
+        rusty_pi::coding_agent::command::CommandContext::new(controller, interaction, cancellation.clone());
     let command = registry.dispatch(&invocation, &mut context);
     let events = rusty_pi::tui::command_driver::CrosstermCommandEventSource::default();
     let renderer = rusty_pi::tui::command_driver::RatatuiCommandRenderer::new(terminal);
@@ -515,66 +515,24 @@ async fn drive_command_with_ui(
     ))
 }
 
-/// Poll one agent turn while continuing to service keyboard and AgentEvent
-/// traffic.  The future still borrows the existing PromptSession, so session
-/// persistence and the established AgentEvent/CancellationToken boundaries
-/// remain unchanged.
-async fn run_agent_with_ui(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-    state: &mut rusty_pi::tui::app::AppState,
-    session: &mut PromptSession,
-    current_token: &mut tokio_util::sync::CancellationToken,
-    event_rx: &mut tokio::sync::mpsc::Receiver<rusty_pi::agent::events::AgentEvent>,
-    prompt: String,
-) -> anyhow::Result<()> {
-    use rusty_pi::tui::app::{Action, Effect};
-
-    let run = session.agent().run(&prompt);
-    tokio::pin!(run);
-
-    loop {
-        terminal.draw(|frame| rusty_pi::tui::app::view(frame, state))?;
-
-        // A short synchronous poll is intentional: crossterm is the terminal
-        // boundary, while the agent future remains cancellable between polls.
-        if crossterm::event::poll(std::time::Duration::from_millis(10))? {
-            let event = crossterm::event::read()?;
-            let effects = match event {
-                crossterm::event::Event::Key(key) => state.update(Action::KeyInput(key)),
-                crossterm::event::Event::Paste(text) => state.update(Action::Paste(text)),
-                crossterm::event::Event::Resize(width, height) => state.update(Action::Resize(width, height)),
-                _ => Vec::new(),
-            };
-            for effect in effects {
-                match effect {
-                    Effect::CancelAgent => current_token.cancel(),
-                    Effect::CancelCommand => {}
-                    Effect::Quit => return Ok(()),
-                    // Enter is deliberately unavailable while running, so a
-                    // second RunAgent effect cannot be produced here.
-                    Effect::RunAgent(_) | Effect::SubmitInput(_) => {}
-                }
+fn drain_controller_events(state: &mut rusty_pi::tui::app::AppState, events: &mut SessionControllerEventReceiver) {
+    while let Ok(event) = events.try_recv() {
+        match event {
+            SessionControllerEvent::PromptAccepted { original, run_id, .. } => {
+                state.update(rusty_pi::tui::app::Action::ControllerPromptAccepted { original, run_id });
             }
-        }
-
-        while let Ok(event) = event_rx.try_recv() {
-            state.update(Action::AgentEvent(event));
-        }
-        if state.quit {
-            return Ok(());
-        }
-
-        tokio::select! {
-            result = &mut run => {
-                if let Err(error) = result {
-                    state.update(Action::InputRouteError(format!("Run failed: {error}")));
-                }
-                while let Ok(event) = event_rx.try_recv() {
-                    state.update(Action::AgentEvent(event));
-                }
-                return Ok(());
+            SessionControllerEvent::PromptRejected { reason, .. } => {
+                state.update(rusty_pi::tui::app::Action::ControllerPromptRejected {
+                    reason: reason.to_string(),
+                });
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(40)) => {}
+            SessionControllerEvent::Agent { event, .. } => {
+                state.update(rusty_pi::tui::app::Action::AgentEvent(event));
+            }
+            SessionControllerEvent::ControllerError { message, .. } => {
+                state.update(rusty_pi::tui::app::Action::InputRouteError(message));
+            }
+            SessionControllerEvent::StateChanged(_) | SessionControllerEvent::Stopped => {}
         }
     }
 }

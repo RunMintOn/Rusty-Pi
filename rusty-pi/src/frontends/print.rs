@@ -9,11 +9,13 @@ use crate::agent::events::{AgentEvent, AgentRunError, RunId, ToolOutputStream};
 use crate::agent::types::AgentToolResult;
 use crate::ai::types::StopReason;
 use crate::coding_agent::command::CommandResult;
+use crate::coding_agent::session_controller::{
+    PromptRejection, PromptSubmission, SessionControllerEvent, SessionControllerEventReceiver, SessionControllerHandle,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Instant;
-use tokio_util::sync::CancellationToken;
 
 // ── Output Sink ─────────────────────────────────────────────────────────────
 
@@ -499,112 +501,108 @@ pub enum PrintRunOutcome {
     Aborted,
     /// Run failed with an internal error.
     Failed(AgentRunError),
+    /// Controller rejected the prompt before an Agent run was created.
+    Rejected(PromptRejection),
 }
 
-/// Drive a single agent run, coordinating:
-/// - Agent future execution
-/// - Event channel processing
-/// - Ctrl+C cancellation
-/// - PrintFrontend output
+/// Drive one controller-owned run and render its forwarded AgentEvents.
 ///
-/// Returns [`PrintRunOutcome`] indicating how the run ended. Output failures
-/// are returned after the agent future has settled.
+/// The controller remains the owner of the run future and cancellation token;
+/// this adapter only submits input and consumes the one event receiver.
 pub async fn drive_print_run<O: FrontendOutput>(
-    agent: &mut crate::agent::engine::Agent,
+    controller: &SessionControllerHandle,
+    events: &mut SessionControllerEventReceiver,
     prompt: &str,
     frontend: &mut PrintFrontend<O>,
-    run_token: CancellationToken,
 ) -> io::Result<PrintRunOutcome> {
-    // Set up event channel
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
-    agent.set_event_sender(event_tx);
-    agent.set_abort_flag(run_token.clone());
+    let submission = controller
+        .submit_prompt(prompt.to_string())
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let (request_id, _) = match submission {
+        PromptSubmission::Accepted { request_id, run_id, .. } => (request_id, run_id),
+        PromptSubmission::Rejected { request_id: _, reason } => {
+            // The rejection event is consumed below by the same adapter in
+            // normal operation. Render the reply immediately only when the
+            // controller event queue was closed before it could be observed.
+            let _ = frontend.handle_command_result(&CommandResult::Error(reason.to_string()));
+            return Ok(PrintRunOutcome::Rejected(reason));
+        }
+    };
 
     let mut outcome = None;
     let mut output_error: Option<io::Error> = None;
-
-    // Run the agent future
-    let run_future = agent.run(prompt);
-    tokio::pin!(run_future);
+    let mut terminal_seen = false;
+    let mut settled = false;
 
     loop {
-        tokio::select! {
-            result = &mut run_future => {
-                // Agent finished
-                // (errors are captured as RunFailed events by the agent)
-                // Drain remaining events
-                while let Ok(event) = event_rx.try_recv() {
-                    if output_error.is_none()
-                        && let Err(error) = frontend.handle_event(&event)
-                    {
-                        run_token.cancel();
-                        output_error = Some(error);
-                    }
-                    match &event {
-                        AgentEvent::RunFinished { stop_reason, .. } => {
-                            outcome = Some(PrintRunOutcome::Finished(stop_reason.clone()));
-                        }
-                        AgentEvent::RunAborted { .. } => {
-                            outcome = Some(PrintRunOutcome::Aborted);
-                        }
-                        AgentEvent::RunFailed { error, .. } => {
-                            outcome = Some(PrintRunOutcome::Failed(error.clone()));
-                        }
-                        _ => {}
-                    }
+        if settled {
+            break;
+        }
+        let Some(event) = events.recv().await else {
+            let error = crate::agent::events::AgentRunError {
+                phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                message: "controller event channel closed before run settlement".into(),
+            };
+            if output_error.is_none() {
+                output_error = frontend.report_run_error(&error).err();
+            }
+            outcome.get_or_insert(PrintRunOutcome::Failed(error));
+            break;
+        };
+        match event {
+            SessionControllerEvent::Agent {
+                request_id: event_request,
+                event,
+            } if event_request == request_id => {
+                if output_error.is_none()
+                    && let Err(error) = frontend.handle_event(&event)
+                {
+                    let _ = controller.cancel_current().await;
+                    output_error = Some(error);
                 }
-                // If no terminal event was seen, the agent failed before
-                // reaching one of its normal terminal-event paths.
-                // Report through the frontend output sink.
-                if outcome.is_none() {
-                    if let Err(e) = result {
-                        let error = crate::agent::events::AgentRunError {
-                            phase: crate::agent::events::AgentRunPhase::AgentLoop,
-                            message: e.to_string(),
-                        };
-                        if output_error.is_none()
-                            && let Err(output) = frontend.report_run_error(&error)
-                        {
-                            output_error = Some(output);
-                        }
-                        outcome = Some(PrintRunOutcome::Failed(error));
-                    } else {
-                        // Agent returned Ok but no terminal event — shouldn't happen
+                match event {
+                    AgentEvent::RunFinished { stop_reason, .. } => {
+                        terminal_seen = true;
+                        outcome = Some(PrintRunOutcome::Finished(stop_reason));
+                    }
+                    AgentEvent::RunAborted { .. } => {
+                        terminal_seen = true;
                         outcome = Some(PrintRunOutcome::Aborted);
                     }
-                }
-                break;
-            }
-            event = event_rx.recv() => {
-                if let Some(event) = event {
-                    if output_error.is_none()
-                        && let Err(error) = frontend.handle_event(&event)
-                    {
-                        // Keep the agent alive until it settles. Its provider
-                        // and tool tasks own their cleanup obligations.
-                        run_token.cancel();
-                        output_error = Some(error);
+                    AgentEvent::RunFailed { error, .. } => {
+                        terminal_seen = true;
+                        outcome = Some(PrintRunOutcome::Failed(error));
                     }
-                    match &event {
-                        AgentEvent::RunFinished { stop_reason, .. } => {
-                            outcome = Some(PrintRunOutcome::Finished(stop_reason.clone()));
-                        }
-                        AgentEvent::RunAborted { .. } => {
-                            outcome = Some(PrintRunOutcome::Aborted);
-                        }
-                        AgentEvent::RunFailed { error, .. } => {
-                            outcome = Some(PrintRunOutcome::Failed(error.clone()));
-                        }
-                        _ => {}
-                    }
+                    _ => {}
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                if !run_token.is_cancelled() {
-                    run_token.cancel();
-                    // Don't break — continue processing events until the agent settles
-                }
+            SessionControllerEvent::PromptRejected {
+                request_id: event_request,
+                reason,
+            } if event_request == request_id => {
+                outcome = Some(PrintRunOutcome::Rejected(reason));
             }
+            SessionControllerEvent::StateChanged(activity)
+                if terminal_seen
+                    && matches!(
+                        activity,
+                        crate::coding_agent::session_controller::ControllerActivity::Idle
+                    ) =>
+            {
+                settled = true;
+            }
+            SessionControllerEvent::ControllerError { message, .. } if !terminal_seen => {
+                let error = crate::agent::events::AgentRunError {
+                    phase: crate::agent::events::AgentRunPhase::AgentLoop,
+                    message,
+                };
+                if output_error.is_none() {
+                    output_error = frontend.report_run_error(&error).err();
+                }
+                outcome = Some(PrintRunOutcome::Failed(error));
+            }
+            _ => {}
         }
     }
 
@@ -620,6 +618,8 @@ mod tests {
     use super::*;
     use crate::agent::events::{AgentEvent, ProviderError, RunId};
     use crate::ai::types::{Content, StopReason};
+    use crate::test_support::drive_print_run;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn memory_output_captures_stdout_and_stderr() {

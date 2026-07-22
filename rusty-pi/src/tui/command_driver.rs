@@ -104,8 +104,8 @@ where
                             match effect {
                                 Effect::CancelCommand => cancellation.cancel(),
                                 Effect::Quit => cancellation.cancel(),
-                                Effect::SubmitInput(_)
-                                | Effect::RunAgent(_)
+        Effect::SubmitInput(_)
+        | Effect::SubmitControllerPrompt(_)
                                 | Effect::CancelAgent => {
                                     // AppState rejects Enter while a command
                                     // is active, so no nested command/agent

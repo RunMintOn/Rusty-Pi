@@ -454,7 +454,8 @@ pub enum Action {
     Resize(u16, u16),
     Submit,
     Cancel,
-    AgentPromptStarted { original: String, expanded: String },
+    ControllerPromptAccepted { original: String, run_id: RunId },
+    ControllerPromptRejected { reason: String },
     CommandStarted { name: String },
     CommandCompleted(CommandOutcome),
     CommandCancelled,
@@ -467,7 +468,7 @@ pub enum Action {
 #[derive(Debug)]
 pub enum Effect {
     SubmitInput(String),
-    RunAgent(String),
+    SubmitControllerPrompt(String),
     CancelAgent,
     CancelCommand,
     Quit,
@@ -520,7 +521,8 @@ impl AppState {
             }
             Action::Submit => self.submit(),
             Action::Cancel => self.cancel(),
-            Action::AgentPromptStarted { original, expanded } => self.agent_prompt_started(original, expanded),
+            Action::ControllerPromptAccepted { original, run_id } => self.controller_prompt_accepted(original, run_id),
+            Action::ControllerPromptRejected { reason } => self.command_failed(reason),
             Action::CommandStarted { name } => {
                 self.activity = ActivityState::CommandRunning;
                 self.error = None;
@@ -738,15 +740,16 @@ impl AppState {
         }
     }
 
-    fn agent_prompt_started(&mut self, original: String, expanded: String) -> Vec<Effect> {
+    fn controller_prompt_accepted(&mut self, original: String, run_id: RunId) -> Vec<Effect> {
         self.transcript.push(TranscriptBlock::User { text: original });
         self.enforce_block_limit();
+        self.current_run_id = Some(run_id);
         self.activity = ActivityState::AgentRunning;
         self.last_outcome = None;
         self.run_tool_error = None;
         self.status = "Agent running".into();
         self.note_new_lines(2);
-        vec![Effect::RunAgent(expanded)]
+        Vec::new()
     }
 
     fn apply_command_outcome(&mut self, outcome: CommandOutcome) -> Vec<Effect> {
@@ -1803,11 +1806,11 @@ mod tests {
         assert!(matches!(effects.as_slice(), [Effect::SubmitInput(prompt)] if prompt == "first\nsecond"));
         assert!(state.transcript.is_empty());
         assert_eq!(state.history.entries, vec!["first\nsecond"]);
-        let effects = state.update(Action::AgentPromptStarted {
+        let effects = state.update(Action::ControllerPromptAccepted {
             original: "first\nsecond".into(),
-            expanded: "expanded".into(),
+            run_id: RunId::new(1),
         });
-        assert!(matches!(effects.as_slice(), [Effect::RunAgent(prompt)] if prompt == "expanded"));
+        assert!(effects.is_empty());
         assert!(matches!(&state.transcript[0], TranscriptBlock::User { text } if text == "first\nsecond"));
     }
 
@@ -1846,9 +1849,9 @@ mod tests {
         let mut state = AppState::new((80, 24));
         state.input.set_text("first".into());
         assert_eq!(state.update(Action::Submit).len(), 1);
-        state.update(Action::AgentPromptStarted {
+        state.update(Action::ControllerPromptAccepted {
             original: "first".into(),
-            expanded: "first".into(),
+            run_id: RunId::new(1),
         });
         state.input.set_text("next".into());
         assert!(state.update(Action::KeyInput(key(KeyCode::Enter))).is_empty());
