@@ -1,3 +1,11 @@
+> Historical document
+>
+> This file records an earlier bare-terminal planning direction. Rusty-Pi now
+> uses Ratatui as its primary interactive frontend. Current behavior is
+> defined by source code, tests, [docs/capabilities.md](../docs/capabilities.md),
+> `SPEC.md`, and accepted ADRs. Do not use this file as the current
+> implementation specification.
+
 # Crate 参考索引 — 裸终端交互栈
 
 > 给新 agent 看的 API 速查 + 测试模式 + 参考链接

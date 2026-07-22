@@ -1,3 +1,10 @@
+> Historical document
+>
+> This file records an earlier MVP planning direction. Current behavior is
+> defined by source code, tests, [docs/capabilities.md](docs/capabilities.md),
+> `SPEC.md`, and accepted ADRs. Do not use this file as the current
+> implementation specification.
+
 # Tickets: rusty-pi MVP
 
 从零搭建 Rust 版 pi 的核心功能：agent loop + 两个 LLM provider + bash tool + REPL。完整 spec 见 `SPEC.md`。

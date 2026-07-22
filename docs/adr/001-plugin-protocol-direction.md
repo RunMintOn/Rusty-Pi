@@ -1,23 +1,27 @@
-# ADR 001: Extensions Compatibility Strategy
+# ADR 001: Rusty-Pi Plugin Protocol Direction
 
-**Status:** Proposed (not yet decided)
+Status: Accepted
+Date: 2026-07-22
 
-## Context
+Decision recorded from existing project direction.
 
-pi 的 extension 系统是一套深度集成的 TS 接口（~1700 行类型定义），rusty-pi 无法直接加载 TS 模块。
+Context:
 
-## Options
+Rusty-Pi is an independent Rust product and cannot treat TypeScript PI extensions as a native plugin ABI. A future plugin boundary must not couple the Agent core to a particular language runtime or give plugins implicit ownership of the host process.
 
-- **A. 嵌入 JS 运行时** — 最兼容，但复杂度和体积代价大。
-- **B. Rust 原生 API** — 最干净，但现有扩展全部重写。
-- **C. RPC sidecar** — rusty-pi 纯 Rust，extension 由独立 JS 进程通过 JSON-RPC 调用。
+Decision:
 
-## Decision (leaning)
+Rusty-Pi will define its own language-independent, out-of-process plugin protocol. The first SDK will be Rust, followed later by a TypeScript SDK. Direct PI extension compatibility is not promised. An optional PI adapter may be evaluated later, with lower priority, after the Rusty-Pi protocol is mature.
 
-**倾向 C。** Extension 支持是可选附件，不侵入核心代码。MVP 阶段跳过，后续通过 sidecar 进程增量添加。
+The protocol design must explicitly cover lifecycle, cancellation, process isolation, and capability negotiation. Protocol design precedes SDK implementation.
 
-## Consequences
+Consequences:
 
-- MVP 不含 extension 支持。
-- 核心必须暴露稳定的内部接口（tool 执行、事件通知、session 操作）供未来 RPC 层调用。
-- 如最终选择其他方案，核心代码无需重写，只需替换 RPC 适配层。
+- The Agent core remains independent of a TypeScript runtime.
+- Plugin failures and cancellation can be isolated at a process boundary.
+- Rust and TypeScript clients can share a stable protocol rather than a language-specific ABI.
+- Existing PI extensions will not load directly.
+- Protocol and SDK work are Planned capabilities, not current runtime behavior.
+
+Supersedes: None
+Superseded by: None

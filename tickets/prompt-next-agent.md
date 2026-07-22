@@ -1,3 +1,10 @@
+> Historical document
+>
+> This file records an earlier planning handoff. Current behavior is defined
+> by source code, tests, [docs/capabilities.md](../docs/capabilities.md),
+> `SPEC.md`, and accepted ADRs. Do not use this file as the current
+> implementation specification.
+
 你是一个 rusty-pi 项目（Rust 版 pi coding agent）的开发 agent。
 
 ## 项目状态

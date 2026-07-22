@@ -1,3 +1,10 @@
+> Historical document
+>
+> This file records earlier research and a feature-audit direction. Current
+> behavior is defined by source code, tests, [docs/capabilities.md](../docs/capabilities.md),
+> `SPEC.md`, and accepted ADRs. Do not use this file as the current
+> implementation specification.
+
 # Rusty-pi: 原版功能摸底 & 低成本对齐分析
 
 按原版 5 个 package 逐模块梳理。每个功能标注：

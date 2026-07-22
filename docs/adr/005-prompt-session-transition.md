@@ -1,11 +1,24 @@
-# 004 — PromptSession: 薄 Session 层而非完整 AgentSession
+# ADR 005: PromptSession as a Bounded Transition Layer
 
-Prompt Templates 和 Skills 的展开需要在 agent loop 之上加一层编排。原版 TS 有完整的 `AgentSession`（含事件系统、compaction、retry、extension hooks），但我们选择在 Rust 版中只实现一个薄 `PromptSession`，只做两件事：**模板展开 + skill 展开**，不做 session 管理、compaction、retry、extension。
+Status: Accepted
+Date: 2026-07-22
 
-选择薄层而非完整 AgentSession 的原因：
+Decision recorded from existing project direction.
 
-- **当前只需要展开**。其他功能（compaction、retry、steering/followUp 队列）有独立 ticket 跟踪，当前阶段没有它们的消费者。
-- **原版职责划分是好的，但不必一次全搬**。`prompt_templates.rs` + `skills.rs` + `system_prompt.rs` 都是从下往上建的底层模块，`PromptSession` 只是隔一层的编排者。后续可以把它越写越厚，最终等价于原版 `AgentSession`。
-- **避免阻塞其他工作**。等完整 AgentSession 再接入展开，意味着 templates/skills 在其他功能就绪前完全不可用。
+Context:
 
-没有选择在 REPL 层直接做展开，因为未来会有多个入口（RPC 模式、batch 模式），展开逻辑应该共享而非复制。
+`PromptSession` began as a shared prompt-expansion seam, but the current implementation also owns canonical prompt state, system-prompt rebuilding, context files, resource reload, model and Agent access, and selected Command-facing business operations. Treating it as only a template helper is no longer accurate.
+
+Decision:
+
+Keep `PromptSession` as the current transition business layer. It may continue to provide the shared prompt/resource seam needed by the existing REPL, single-shot path, TUI, and Command system, but it must not grow without a deliberate boundary decision. Future orchestration will move incrementally to `SessionController`/`AgentSession` rather than requiring a broad refactor in this milestone.
+
+Consequences:
+
+- Existing code can keep using PromptSession without a disruptive rewrite.
+- Documentation must describe its current responsibilities and its transitional status.
+- New lifecycle concerns such as steering, follow-up, retry, compaction orchestration, branching, and hooks belong in the future controller direction.
+- This ADR does not claim that SessionController exists or that those capabilities are Available.
+
+Supersedes: None
+Superseded by: ADR 006
